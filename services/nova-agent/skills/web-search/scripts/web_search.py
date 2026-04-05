@@ -6,13 +6,18 @@ Perplexity Sonar is the ONLY search engine used - it provides fast, grounded res
 with citations.
 
 Key Features:
-- Fast search (2-5 seconds typical)
+- Fast search with sonar (2-5 seconds typical)
+- Deep search with sonar-pro (5-10 seconds, more comprehensive)
 - Grounded results (no hallucination)
 - Structured citations
 - iOS integration for citation display
 
+Model Selection:
+- sonar: Fast mode - quick searches for immediate answers
+- sonar-pro: Deep mode - comprehensive research with deeper analysis
+
 Citation Flow:
-1. Query sent to AI Gateway with model="sonar"
+1. Query sent to AI Gateway with model="sonar" or "sonar-pro"
 2. AI Gateway routes to Perplexity API
 3. Perplexity returns content + citations array
 4. Nova extracts both content and citations
@@ -29,14 +34,16 @@ from loguru import logger
 AI_GATEWAY_URL = "http://127.0.0.1:8777/api/v1"
 AI_GATEWAY_API_KEY = "ai-gateway-api-key-2024"
 _server_msg_fn: Optional[Callable] = None
+_agent_mode: str = "fast"  # Default to fast mode
 
 
-async def handle_web_search(query: str) -> str:
+async def handle_web_search(query: str, deep_mode: bool = False) -> str:
     """
     Search the web using Perplexity Sonar via AI Gateway.
     
     Args:
         query: Search query string
+        deep_mode: If True, use sonar-pro for deeper research; if False, use sonar for fast results
         
     Returns:
         Search results with citation count appended
@@ -45,13 +52,17 @@ async def handle_web_search(query: str) -> str:
         - Sends citation URLs to iOS via _server_msg_fn
         - Logs search metrics
     """
+    # Select model based on agent mode
+    # Use global _agent_mode if deep_mode not explicitly set
+    model = "sonar-pro" if (deep_mode or _agent_mode == "deep") else "sonar"
+    
     url = f"{AI_GATEWAY_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {AI_GATEWAY_API_KEY}",
         "Content-Type": "application/json",
     }
     body = {
-        "model": "sonar",  # AI Gateway routes to Perplexity Sonar
+        "model": model,  # AI Gateway routes to Perplexity Sonar or Sonar Pro
         "messages": [
             {
                 "role": "system",
@@ -112,7 +123,7 @@ async def handle_web_search(query: str) -> str:
                 if citations:
                     content += f"\n\n({len(citations)} sources available — the user's device will display them.)"
 
-                logger.info(f"Web search OK: {len(content)} chars, {len(citations)} citations")
+                logger.info(f"Web search OK ({model}): {len(content)} chars, {len(citations)} citations")
                 return content
                 
     except asyncio.TimeoutError:
@@ -133,3 +144,23 @@ def set_config(gateway_url: str, api_key: str):
     global AI_GATEWAY_URL, AI_GATEWAY_API_KEY
     AI_GATEWAY_URL = gateway_url
     AI_GATEWAY_API_KEY = api_key
+
+
+def set_agent_mode(mode: str):
+    """Set agent mode for model selection.
+    
+    Args:
+        mode: "fast" for sonar, "deep" for sonar-pro
+    """
+    global _agent_mode
+    if mode not in ("fast", "deep"):
+        logger.warning(f"Invalid agent mode '{mode}', defaulting to 'fast'")
+        _agent_mode = "fast"
+    else:
+        _agent_mode = mode
+        logger.info(f"Web search agent mode set to: {mode} (model: {'sonar-pro' if mode == 'deep' else 'sonar'})")
+
+
+def get_agent_mode() -> str:
+    """Get current agent mode."""
+    return _agent_mode
