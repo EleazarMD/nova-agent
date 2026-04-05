@@ -13,10 +13,13 @@ Fast, grounded web search with citations using Perplexity Sonar API via AI Gatew
 
 - Looking up current information or recent events
 - Fact-checking claims or statements
-- Research queries requiring web sources
+- Quick research queries requiring web sources
 - Finding real-time data (weather, stocks, news)
 - Questions outside Nova's knowledge cutoff
 - Queries requiring authoritative citations
+- Any web search task (Nova handles ALL web searches directly)
+
+**Important**: Nova ALWAYS handles web search itself. Only long-horizon deep research tasks (multi-step analysis, comprehensive reports) are delegated to OpenClaw's Deep Research Studio.
 
 ## Model Selection
 
@@ -24,6 +27,8 @@ Search model is automatically selected based on Nova's operational mode:
 
 - **Fast Mode**: `sonar` - Quick searches (2-5 seconds)
 - **Deep Mode**: `sonar-pro` - Comprehensive research with deeper analysis
+
+Both modes are handled by Nova directly - no delegation to OpenClaw.
 
 ## Features
 
@@ -75,9 +80,11 @@ Search results include:
 
 ## Error Handling
 
-- Connection failures: Suggest using openclaw_delegate
-- Timeouts: Recommend simpler query or openclaw_delegate
+- Connection failures: Retry or inform user of AI Gateway connectivity issue
+- Timeouts: Recommend simpler query or retry
 - No results: Returns "Search returned no results"
+
+**Note**: Web search errors should NOT trigger OpenClaw delegation. Only delegate to OpenClaw for long-horizon deep research tasks that require multi-step analysis, synthesis, and comprehensive reporting.
 
 ## References
 

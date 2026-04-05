@@ -86,7 +86,7 @@ async def handle_web_search(query: str, deep_mode: bool = False) -> str:
                 if resp.status != 200:
                     text = await resp.text()
                     logger.error(f"Web search HTTP {resp.status}: {text[:200]}")
-                    return f"Search failed (HTTP {resp.status}). Try again or use openclaw_delegate."
+                    return f"Search failed (HTTP {resp.status}). The AI Gateway may be experiencing issues. Please try again."
 
                 data = await resp.json()
                 
@@ -127,7 +127,7 @@ async def handle_web_search(query: str, deep_mode: bool = False) -> str:
                 return content
                 
     except asyncio.TimeoutError:
-        return "Search timed out. Try a simpler query or use openclaw_delegate."
+        return "Search timed out after 15 seconds. Please try a simpler or more specific query."
     except Exception as e:
         logger.error(f"Web search error: {e}")
         return f"Search error: {str(e)}"

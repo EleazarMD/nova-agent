@@ -261,17 +261,19 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "openclaw_delegate",
             "description": (
-                "Execute complex or long-running tasks via OpenClaw. Use for ACTIONS: "
+                "Execute complex, long-horizon tasks via OpenClaw. Use for ACTIONS: "
                 "buying tickets, making reservations, placing orders, booking appointments, "
                 "searching/sending emails, creating calendar events, "
                 "running shell commands, editing files, filling out web forms. "
                 "Also use for STUDIO JOBS that create or generate content: "
-                "'start a deep research on X' → Research Lab, "
+                "'start a deep research on X' → Deep Research Studio (multi-step analysis, comprehensive reports), "
                 "'create a podcast about X' → Podcast Studio, "
                 "'generate an image of X' → Image Studio, "
                 "'write a news story about X' → News Studio, "
                 "'draft an email to X' → Email (via browser). "
-                "For simple web searches, use web_search instead — it's faster. "
+                "IMPORTANT: Nova handles ALL web searches directly via web_search (both fast and deep modes). "
+                "Only delegate to OpenClaw for long-horizon deep research requiring multi-step analysis, "
+                "synthesis, and comprehensive reporting beyond simple web queries. "
                 "For READING results (status, summaries, calendar), use check_studio — it's instant. "
                 "Describe the task clearly — OpenClaw will execute and stream progress back."
             ),
@@ -1579,7 +1581,7 @@ async def handle_web_search(query: str) -> str:
                 if resp.status != 200:
                     text = await resp.text()
                     logger.error(f"Web search HTTP {resp.status}: {text[:200]}")
-                    return f"Search failed (HTTP {resp.status}). Try again or use openclaw_delegate."
+                    return f"Search failed (HTTP {resp.status}). The AI Gateway may be experiencing issues. Please try again."
 
                 data = await resp.json()
                 content = (
@@ -1614,7 +1616,7 @@ async def handle_web_search(query: str) -> str:
                 logger.info(f"Web search OK: {len(content)} chars, {len(citations)} citations")
                 return content
     except asyncio.TimeoutError:
-        return "Search timed out. Try a simpler query or use openclaw_delegate."
+        return "Search timed out after 15 seconds. Please try a simpler or more specific query."
     except Exception as e:
         logger.error(f"Web search error: {e}")
         return f"Search error: {str(e)}"
