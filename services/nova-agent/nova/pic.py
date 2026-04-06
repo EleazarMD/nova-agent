@@ -18,6 +18,7 @@ Backed by: Neo4j (graph) + Redis (cache) at :8765
 import os
 import time
 import aiohttp
+import json
 from typing import Any, Optional
 from loguru import logger
 
@@ -198,12 +199,16 @@ async def record_observation(
     Invalidates the local cache so subsequent reads reflect the new data.
     """
     try:
-        body = {
+        # PIC API expects observation as a JSON-encoded string
+        observation_data = {
             "observation_type": observation_type,
             "category": category,
             "key": key,
             "value": value,
             "context": context,
+        }
+        body = {
+            "observation": json.dumps(observation_data),
             "source_agent": "nova-agent",
             "source_action": "voice_conversation",
         }

@@ -199,14 +199,16 @@ async def record_observation(
     Invalidates the local cache so subsequent reads reflect the new data.
     """
     try:
+        # PIC API expects observation as a JSON-encoded string
+        observation_data = {
+            "observation_type": observation_type,
+            "category": category,
+            "key": key,
+            "value": value,
+            "context": context,
+        }
         body = {
-            "observation": {
-                "observation_type": observation_type,
-                "category": category,
-                "key": key,
-                "value": value,
-                "context": context,
-            },
+            "observation": json.dumps(observation_data),
             "source_agent": "nova-agent",
             "source_action": "voice_conversation",
         }
