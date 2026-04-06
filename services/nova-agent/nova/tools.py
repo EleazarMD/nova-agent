@@ -232,31 +232,9 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # Search tool (fast, grounded web search via Perplexity Sonar)
+    # Search tool — definition loaded from skills/web-search/SKILL.md at bottom of file
+    # (see _merge_skill_definitions)
     # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web for current information using Perplexity Sonar. "
-                "Use this for: news, facts, current events, prices, reviews, "
-                "sports scores, stock prices, flight status, general knowledge questions. "
-                "Returns grounded results with citations. Fast (~2-5 seconds). "
-                "Do NOT use openclaw_delegate for simple searches — use this instead."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query (be specific and include dates/context when relevant)",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
     # -------------------------------------------------------------------------
     # Delegated tools (browser, email, calendar, shell — use for actions, not searches)
     # -------------------------------------------------------------------------
@@ -1343,6 +1321,21 @@ TOOL_DEFINITIONS = [
         },
     },
 ]
+
+# ---------------------------------------------------------------------------
+# Merge skill-based tool definitions from SKILL.md frontmatter
+# Skills with `tool_name` + `parameters` in their YAML frontmatter get their
+# tool definition generated programmatically — no hardcoding needed.
+# ---------------------------------------------------------------------------
+from nova.skill_loader import load_skill_tool_definitions as _load_skill_defs
+
+_skill_defs = _load_skill_defs()
+# Only add skills whose tool_name isn't already in TOOL_DEFINITIONS
+_existing_names = {d["function"]["name"] for d in TOOL_DEFINITIONS if "function" in d}
+for _sd in _skill_defs:
+    if _sd["function"]["name"] not in _existing_names:
+        TOOL_DEFINITIONS.append(_sd)
+        logger.info(f"Registered skill-based tool: {_sd['function']['name']}")
 
 
 # ---------------------------------------------------------------------------

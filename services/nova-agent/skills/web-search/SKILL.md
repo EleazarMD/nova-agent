@@ -1,8 +1,21 @@
 ---
 name: web-search
+tool_name: web_search
 description: >
-  Web search using Perplexity Sonar (fast mode) or Sonar Pro (deep mode) based on agent operational mode.
-  Use for real-time information, current events, fact-checking, and research queries.
+  Search the web for current information using Perplexity Sonar. Use for news, facts, current events,
+  prices, reviews, sports scores, stock prices, flight status, movie releases, and any general knowledge
+  question that may need up-to-date information. Returns grounded results with citations. Fast (~2-5s).
+  Do NOT use openclaw_delegate for simple searches — use this tool instead.
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: >
+        The search query. Be specific and include dates or context when relevant
+        (e.g. "Super Mario Bros Movie 2025 release date", "Tesla stock price today").
+  required:
+    - query
 ---
 
 # Web Search
@@ -11,83 +24,76 @@ Fast, grounded web search with citations using Perplexity Sonar API via AI Gatew
 
 ## When to Invoke
 
-- Looking up current information or recent events
-- Fact-checking claims or statements
-- Quick research queries requiring web sources
-- Finding real-time data (weather, stocks, news)
-- Questions outside Nova's knowledge cutoff
+- User asks about current events, news, or recent happenings
+- Fact-checking claims or verifying statements
+- Any question that may need information newer than training data
+- Finding real-time data (prices, scores, weather, flight status)
+- Movie releases, sports results, product launches
 - Queries requiring authoritative citations
-- Any web search task (Nova handles ALL web searches directly)
+- Any web search task — Nova handles ALL web searches directly
 
-**Important**: Nova ALWAYS handles web search itself. Only long-horizon deep research tasks (multi-step analysis, comprehensive reports) are delegated to OpenClaw's Deep Research Studio.
+**Important**: Nova ALWAYS handles web search itself. Only long-horizon deep research tasks
+(multi-step analysis, comprehensive reports) go to OpenClaw's Deep Research Studio.
+
+## Instructions
+
+### Step 1: Call web_search with a specific query
+Include relevant context in the query — dates, full names, specifics.
+
+### Step 2: Read the results
+The tool returns grounded text with citation count. Citations are automatically
+sent to iOS for display.
+
+### Step 3: Speak the results naturally
+Weave the search results into your spoken response. Never output raw tool syntax.
 
 ## Model Selection
 
-Search model is automatically selected based on Nova's operational mode:
-
-- **Fast Mode**: `sonar` - Quick searches (2-5 seconds)
-- **Deep Mode**: `sonar-pro` - Comprehensive research with deeper analysis
-
-Both modes are handled by Nova directly - no delegation to OpenClaw.
-
-## Features
-
-- **Grounded Results**: No hallucination, all answers cite sources
-- **Structured Citations**: URLs provided with each result
-- **iOS Integration**: Citations displayed in user interface
-- **Fast Response**: Typical 2-5 seconds for sonar, 5-10 seconds for sonar-pro
-
-## Citation Flow
-
-1. Query sent to AI Gateway with model selection
-2. AI Gateway routes to Perplexity API
-3. Perplexity returns content + citations array
-4. Nova extracts content and citations
-5. Citations sent to iOS via server message (type: "sources")
-6. iOS displays citations in UI
-
-## Parameters
-
-- `query` (required): Search query string
+Automatic based on Nova's operational mode (set at session start):
+- **Fast Mode** → `sonar` (2-5 seconds)
+- **Deep Mode** → `sonar-pro` (5-10 seconds, more comprehensive)
 
 ## Examples
 
-User: What's the weather in Houston today?
-Assistant: Invoking @web-search query="current weather Houston Texas"
+<example>
+User: "What's the new Super Mario movie?"
+Action: Call web_search(query="new Super Mario movie 2025 2026 release")
+Result: The tool returns search results with citations about the latest release.
+</example>
 
-User: Who won the latest Formula 1 race?
-Assistant: Invoking @web-search query="latest Formula 1 race winner"
+<example>
+User: "Tesla stock price?"
+Action: Call web_search(query="Tesla TSLA stock price today")
+Result: Current price and market data with source URLs.
+</example>
 
-User: What are the current Tesla stock prices?
-Assistant: Invoking @web-search query="Tesla stock price today"
+<example>
+User: "Who won the F1 race this weekend?"
+Action: Call web_search(query="Formula 1 race results this weekend")
+Result: Race winner and standings with citations.
+</example>
+
+<example>
+User: "Look up the best Italian restaurants near me"
+Action: Call web_search(query="best Italian restaurants Humble TX Houston area")
+Result: Restaurant recommendations with ratings and sources.
+</example>
 
 ## Response Format
 
-Search results include:
 - Concise, factual answer with specific data points
-- Source attribution
-- Citation count appended to response
-- Structured citation URLs sent to iOS
-
-## Technical Details
-
-- API: Perplexity Sonar via AI Gateway
-- Models: `sonar` (fast), `sonar-pro` (deep)
-- Endpoint: `/api/v1/chat/completions`
-- Timeout: 15 seconds
-- Max tokens: 1024
-- Citation limit: 5 URLs displayed in UI
+- Source attribution (citation count appended)
+- Structured citation URLs sent to iOS automatically
 
 ## Error Handling
 
-- Connection failures: Retry or inform user of AI Gateway connectivity issue
-- Timeouts: Recommend simpler query or retry
-- No results: Returns "Search returned no results"
-
-**Note**: Web search errors should NOT trigger OpenClaw delegation. Only delegate to OpenClaw for long-horizon deep research tasks that require multi-step analysis, synthesis, and comprehensive reporting.
+- Connection failures → inform user, suggest retry
+- Timeouts → recommend simpler/more specific query
+- No results → "Search returned no results"
+- Errors do NOT trigger OpenClaw delegation
 
 ## References
 
 - Script: `scripts/web_search.py`
-- AI Gateway: http://127.0.0.1:8777/api/v1
+- AI Gateway: `http://127.0.0.1:8777/api/v1`
 - Perplexity Docs: https://docs.perplexity.ai/
