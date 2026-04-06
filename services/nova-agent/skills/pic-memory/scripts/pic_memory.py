@@ -18,6 +18,7 @@ Backed by: Neo4j (graph) + Redis (cache) at :8765
 import os
 import time
 import aiohttp
+import json
 from typing import Any, Optional
 from loguru import logger
 
@@ -199,11 +200,13 @@ async def record_observation(
     """
     try:
         body = {
-            "observation_type": observation_type,
-            "category": category,
-            "key": key,
-            "value": value,
-            "context": context,
+            "observation": {
+                "observation_type": observation_type,
+                "category": category,
+                "key": key,
+                "value": value,
+                "context": context,
+            },
             "source_agent": "nova-agent",
             "source_action": "voice_conversation",
         }

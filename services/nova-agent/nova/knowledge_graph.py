@@ -327,7 +327,7 @@ class KnowledgeGraphClient:
         relationships = context.get("direct_relationships", [])
         dependents = context.get("dependents", [])
         
-        lines = [f"**{entity.get('name', 'Unknown')}**: {entity.get('type', 'Entity')}"")
+        lines = [f"**{entity.get('name', 'Unknown')}**: {entity.get('type', 'Entity')}"]
         
         if relationships:
             lines.append("  - Relationships:")
