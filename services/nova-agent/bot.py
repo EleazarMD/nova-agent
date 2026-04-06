@@ -335,6 +335,14 @@ async def run_bot(
     llm.register_function("get_time", make_tool_handler("get_time"))
     # Timers & alarms
     llm.register_function("manage_timer", make_tool_handler("manage_timer"))
+    # Context Bridge - link goals to knowledge graph
+    llm.register_function("link_goal_to_knowledge", make_tool_handler("link_goal_to_knowledge"))
+
+    # ── Personal Context Graph (PIC + KG-API via Context Bridge) ───────
+    llm.register_function("save_memory", make_tool_handler("save_memory"))
+    llm.register_function("recall_memory", make_tool_handler("recall_memory"))
+    llm.register_function("query_context", make_tool_handler("query_context"))
+    llm.register_function("kg_query", make_tool_handler("kg_query"))
     # Homelab infrastructure operations (Docker container management)
     llm.register_function("service_status", make_tool_handler("service_status"))
     llm.register_function("service_logs", make_tool_handler("service_logs"))
