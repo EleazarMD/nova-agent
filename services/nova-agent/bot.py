@@ -405,13 +405,31 @@ async def run_bot(
             TranscriptionFrame,
             TextFrame,
         )
+        import re as _re
+
+        # Regex to strip raw tool-call syntax the LLM may emit as text.
+        # Matches patterns like: [web_search query="..."], [get_weather location="..."]
+        _TOOL_CALL_TEXT_RE = _re.compile(
+            r'\[(?:web_search|get_weather|check_studio|recall_memory|save_memory|forget_memory'
+            r'|control_lights|get_workstation_status|set_reminder|openclaw_delegate'
+            r'|search_past_conversations|discover_skills|diagnose_network|get_time'
+            r'|manage_timer|manage_ticket|manage_workspace|manage_notes|exomind'
+            r'|service_status|service_logs|service_restart|service_start|service_stop'
+            r'|service_health_check|homelab_operations|homelab_diagnostics'
+            r'|ev_route_planner|tesla_location_refresh|tesla_control|youtube'
+            r'|knowledge_query|get_enriched_context|link_goal_to_knowledge'
+            r'|query_frameworks)\b[^\]]*\]',
+            _re.IGNORECASE,
+        )
 
         class NativeTextBridge(FrameProcessor):
-            """Logging bridge for native STT/TTS mode.
+            """Bridge for native STT/TTS mode with tool-syntax filtering.
 
             Pipecat's RTVI processor handles 'send-text' messages (user→LLM)
             and emits 'bot-llm-text' events (LLM→user) natively.
-            This processor logs both input and output for debugging.
+            This processor also strips any raw tool-call text the LLM may
+            accidentally emit (e.g. '[web_search query="..."]') so it is
+            never spoken or displayed on iOS.
             """
             async def process_frame(self, frame, direction):
                 await super().process_frame(frame, direction)
@@ -430,16 +448,18 @@ async def run_bot(
                         msg_type = msg.get("type", "")
                         logger.info(f"LLM → Client ({msg_type}): {str(msg)[:120]}")
 
-                # Log all frame types for debugging
-                frame_type = type(frame).__name__
-                if "LLM" in frame_type or "Response" in frame_type:
-                    logger.info(f"🔍 NativeTextBridge saw: {frame_type}")
-                
-                # Log LLMTextFrame to see response text flowing to transport
+                # Filter LLMTextFrames: strip raw tool-call syntax
                 if isinstance(frame, LLMTextFrame):
-                    logger.info(f"LLMTextFrame → transport: {frame.text[:80]}...")
-                
-                # Log LLMFullResponseStartFrame/EndFrame - needed for bot-llm-started/stopped signals
+                    original = frame.text
+                    cleaned = _TOOL_CALL_TEXT_RE.sub('', original)
+                    if cleaned != original:
+                        logger.warning(f"🧹 Stripped tool syntax from LLM text: {original[:120]}")
+                        if not cleaned.strip():
+                            # Entire frame was tool syntax — drop it
+                            return
+                        frame.text = cleaned
+
+                # Log LLMFullResponseStartFrame/EndFrame
                 if isinstance(frame, LLMFullResponseStartFrame):
                     logger.info(f"✅ LLMFullResponseStartFrame → triggers bot-llm-started")
                 if isinstance(frame, LLMFullResponseEndFrame):
