@@ -63,8 +63,10 @@ handle_manage_notes = _notes.handle_manage_notes
 
 from nova.exomind import handle_exomind
 
+# Tesla control (skill-based)
 _tesla = _load_skill_module("tesla-control", "tesla_control")
 handle_tesla_location_refresh = _tesla.handle_tesla_location_refresh
+handle_tesla_control = _tesla.handle_tesla_control
 
 # ---------------------------------------------------------------------------
 # AI Inferencing Service key fetcher (centralized API key vault, port 9000)
@@ -135,6 +137,8 @@ def set_server_msg_fn(fn: Callable):
     """Set the async function used to send server messages to iOS."""
     global _server_msg_fn
     _server_msg_fn = fn
+    # Wire server_msg_fn into skill modules that need it
+    _init_web_search_skill()
 
 
 # ---------------------------------------------------------------------------
@@ -1548,78 +1552,34 @@ async def handle_set_reminder(message: str, when: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Web Search via Perplexity Sonar (fast, grounded, cited)
+# Web Search via Perplexity Sonar (Claude Skill: web-search)
 # ---------------------------------------------------------------------------
+# Delegates to skills/web-search/scripts/web_search.py for mode-aware model
+# selection (sonar in fast mode, sonar-pro in deep mode).
 
-async def handle_web_search(query: str) -> str:
-    """Search the web using Perplexity Sonar via AI Gateway.
-    Returns grounded results with citations — no hallucination."""
-    url = f"{AI_GATEWAY_URL}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {AI_GATEWAY_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": "sonar",
-        "messages": [
-            {"role": "system", "content": (
-                "You are a research assistant. Provide concise, factual answers with "
-                "specific data points. Include source URLs when available. "
-                "If information is uncertain or unavailable, say so clearly."
-            )},
-            {"role": "user", "content": query},
-        ],
-        "max_tokens": 1024,
-    }
+import importlib as _importlib
+_ws_mod = _importlib.import_module("skills.web-search.scripts.web_search")
+handle_web_search = _ws_mod.handle_web_search
+_ws_set_config = _ws_mod.set_config
+_ws_set_server_msg_fn = _ws_mod.set_server_message_fn
+_ws_set_agent_mode = _ws_mod.set_agent_mode
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, headers=headers, json=body,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"Web search HTTP {resp.status}: {text[:200]}")
-                    return f"Search failed (HTTP {resp.status}). The AI Gateway may be experiencing issues. Please try again."
+# Configure the skill module with gateway credentials
+_ws_set_config(AI_GATEWAY_URL, AI_GATEWAY_API_KEY)
 
-                data = await resp.json()
-                content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
-                citations = data.get("citations", [])
+def _init_web_search_skill():
+    """Deferred init: wire server_msg_fn after bot.py sets it, and set agent mode."""
+    if _server_msg_fn:
+        _ws_set_server_msg_fn(_server_msg_fn)
 
-                if not content:
-                    return "Search returned no results."
-
-                # Send citations as structured server message for iOS UI
-                if citations and _server_msg_fn:
-                    source_items = [
-                        {"index": i + 1, "url": u}
-                        for i, u in enumerate(citations[:5])
-                    ]
-                    try:
-                        await _server_msg_fn({
-                            "type": "sources",
-                            "query": query,
-                            "citations": source_items,
-                        })
-                    except Exception as e:
-                        logger.warning(f"Could not send sources message: {e}")
-
-                # Give LLM a brief note about sources without full URLs
-                if citations:
-                    content += f"\n\n({len(citations)} sources available — the user's device will display them.)"
-
-                logger.info(f"Web search OK: {len(content)} chars, {len(citations)} citations")
-                return content
-    except asyncio.TimeoutError:
-        return "Search timed out after 15 seconds. Please try a simpler or more specific query."
-    except Exception as e:
-        logger.error(f"Web search error: {e}")
-        return f"Search error: {str(e)}"
+def set_web_search_agent_mode(mode: str):
+    """Set web search agent mode. Called when orchestration mode is determined.
+    
+    Args:
+        mode: "fast" for sonar, "deep" for sonar-pro
+    """
+    _ws_set_agent_mode(mode)
+    logger.info(f"Web search skill agent mode set to: {mode}")
 
 
 # ---------------------------------------------------------------------------
@@ -4000,54 +3960,41 @@ TESLA_TOOL_DEFINITIONS_LEGACY = [
 # These are kept for backward compatibility but should not be registered in bot.py
 
 # ---------------------------------------------------------------------------
-# Unified Tesla Tool Handler (import and register)
+# Unified Tesla Tool Handler (skill-based, loaded at top of file)
 # ---------------------------------------------------------------------------
-
-from nova.tesla_tools import handle_tesla_control
-
-# Register unified Tesla handler
+# Tesla handlers are now loaded from skills/tesla-control at line 67-69
+# Register unified Tesla handler (already imported from skill)
 TOOL_HANDLERS["tesla_control"] = handle_tesla_control
 
 # ---------------------------------------------------------------------------
-# Homelab Diagnostics Tool
+# Homelab Diagnostics Tool (skill-based)
 # ---------------------------------------------------------------------------
+
+_diagnostics = _load_skill_module("homelab-diagnostics", "diagnostics")
 
 async def handle_homelab_diagnostics(args: dict) -> dict:
     """Run homelab infrastructure diagnostics."""
     action = args.get("action", "full_diagnostics")
     
-    import subprocess
-    script_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),
-        "skills/homelab-diagnostics/scripts/diagnostics.py"
-    )
-    
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "python3", script_path, action,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        
-        if proc.returncode == 0:
-            result = json.loads(stdout.decode())
-            return result
-        else:
-            return {
-                "success": False,
-                "error": f"Diagnostic script failed: {stderr.decode()}"
-            }
-    except asyncio.TimeoutError:
-        return {
-            "success": False,
-            "error": "Diagnostic script timed out after 30 seconds"
+    # Call the skill's full_diagnostics function
+    if action == "full_diagnostics":
+        return await _diagnostics.full_diagnostics()
+    elif action == "openclaw_health":
+        return await _diagnostics.check_openclaw_health()
+    elif action == "ai_inferencing_health":
+        return await _diagnostics.check_ai_inferencing_health()
+    elif action == "hermes_health":
+        return await _diagnostics.check_hermes_health()
+    elif action == "hermy_score":
+        # For hermy_score, we need to gather components first
+        components = {
+            "openclaw": await _diagnostics.check_openclaw_health(),
+            "ai_inferencing": await _diagnostics.check_ai_inferencing_health(),
+            "hermes_core": await _diagnostics.check_hermes_health()
         }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to run diagnostics: {str(e)}"
-        }
+        return await _diagnostics.calculate_hermy_score(components)
+    else:
+        return {"success": False, "error": f"Unknown action: {action}"}
 
 # Homelab diagnostics tool definition
 HOMELAB_DIAGNOSTICS_TOOL = {

@@ -10,13 +10,12 @@ import json
 import sys
 from typing import Optional, Dict, Any
 
-# Import the fixed Tesla tools module
-sys.path.insert(0, '/home/eleazar/Projects/AIHomelab/services/nova-agent')
-from nova.tesla_tools import (
+# Import from local skill module (self-contained)
+from .tesla_control import (
     handle_tesla_status,
     handle_tesla_vehicles,
     handle_tesla_vehicle_status,
-    handle_tesla_charging_control,
+    handle_tesla_charge_control,
     handle_tesla_climate_control,
     handle_tesla_lock_control,
     handle_tesla_trunk_control,
@@ -76,15 +75,15 @@ async def execute_tesla_control(
         elif action == "charge":
             # Parse charge command
             if command == "start":
-                result = await handle_tesla_charging_control(user_id, "start", vehicle_identifier)
+                result = await handle_tesla_charge_control(user_id, "start", vehicle_identifier)
             elif command == "stop":
-                result = await handle_tesla_charging_control(user_id, "stop", vehicle_identifier)
+                result = await handle_tesla_charge_control(user_id, "stop", vehicle_identifier)
             elif command == "set_limit" and value:
                 limit = int(value)
-                result = await handle_tesla_charging_control(user_id, "set_limit", vehicle_identifier, limit)
+                result = await handle_tesla_charge_control(user_id, "set_limit", vehicle_identifier, limit=limit)
             elif command == "set_amps" and value:
                 amps = int(value)
-                result = await handle_tesla_charging_control(user_id, "set_amps", vehicle_identifier, None, amps)
+                result = await handle_tesla_charge_control(user_id, "set_amps", vehicle_identifier, amps=amps)
             else:
                 return {"success": False, "error": f"Invalid charge command: {command}"}
                 

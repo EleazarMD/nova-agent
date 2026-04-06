@@ -494,3 +494,106 @@ async def handle_tesla_navigation(
     
     location_str = f"{latitude}, {longitude}" if latitude and longitude else destination
     return f"Navigation sent to Tesla: {location_str}"
+
+
+# ---------------------------------------------------------------------------
+# Unified Tesla Control Handler (Claude Skills Format)
+# ---------------------------------------------------------------------------
+
+async def handle_tesla_control(
+    user_id: str,
+    action: str,
+    vehicle_identifier: Optional[str] = None,
+    destination: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    command: Optional[str] = None,
+    value: Optional[float] = None,
+    vin: Optional[str] = None,
+) -> str:
+    """
+    Unified Tesla control handler following Claude Skills pattern.
+    
+    Args:
+        action: Operation to perform (vehicles, status, climate, charge, lock, trunk, wake, honk_flash, navigation)
+        vehicle_identifier: Model name, display name, or VIN
+        destination: Address for navigation
+        latitude: GPS latitude for navigation
+        longitude: GPS longitude for navigation
+        command: Specific command (e.g., 'start', 'stop', 'lock', 'unlock')
+        value: Command parameter (temperature, charge limit, etc.)
+        vin: Vehicle VIN (alternative to vehicle_identifier)
+    """
+    # Query operations
+    if action == "vehicles":
+        return await handle_tesla_vehicles(user_id)
+    
+    elif action == "status":
+        return await handle_tesla_vehicle_status(user_id, vehicle_identifier or vin)
+    
+    # Control operations
+    elif action == "climate":
+        if not command:
+            return "Climate control requires a command: start, stop, or set_temp"
+        return await handle_tesla_climate_control(
+            user_id=user_id,
+            action=command,
+            vin=vin,
+            temp=value,
+        )
+    
+    elif action == "charge":
+        if not command:
+            return "Charge control requires a command: start, stop, set_limit, or set_amps"
+        limit = int(value) if value and command == "set_limit" else None
+        amps = int(value) if value and command == "set_amps" else None
+        return await handle_tesla_charge_control(
+            user_id=user_id,
+            action=command,
+            vin=vin,
+            limit=limit,
+            amps=amps,
+        )
+    
+    elif action == "lock":
+        if not command:
+            return "Lock control requires a command: lock or unlock"
+        return await handle_tesla_lock_control(
+            user_id=user_id,
+            action=command,
+            vin=vin,
+        )
+    
+    elif action == "trunk":
+        which = "front" if command == "open_frunk" else "rear"
+        return await handle_tesla_trunk_control(
+            user_id=user_id,
+            which=which,
+            vin=vin,
+        )
+    
+    elif action == "wake":
+        return await handle_tesla_wake(user_id, vin)
+    
+    elif action == "honk_flash":
+        if not command:
+            return "Honk/flash requires a command: honk or flash"
+        return await handle_tesla_honk_flash(
+            user_id=user_id,
+            action=command,
+            vin=vin,
+        )
+    
+    elif action == "navigation":
+        if not destination and (latitude is None or longitude is None):
+            return "Navigation requires either a destination address or GPS coordinates"
+        return await handle_tesla_navigation(
+            user_id=user_id,
+            destination=destination or "",
+            latitude=latitude,
+            longitude=longitude,
+            vin=vin,
+        )
+    
+    else:
+        return f"Unknown Tesla action: {action}. Valid actions: vehicles, status, climate, charge, lock, trunk, wake, honk_flash, navigation"

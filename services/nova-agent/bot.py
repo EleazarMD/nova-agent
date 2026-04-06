@@ -25,7 +25,7 @@ from pipecat.processors.frameworks.rtvi import (
     RTVIObserverParams,
     RTVIFunctionCallReportLevel,
 )
-from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -148,6 +148,19 @@ async def run_bot(
     class MiniMaxLLMService(OpenAILLMService):
         """Patches tool_call.index for MiniMax streaming compatibility."""
 
+        async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
+            """Log frame pushing to trace LLMFullResponseStartFrame/EndFrame emission."""
+            from pipecat.frames.frames import LLMFullResponseStartFrame, LLMFullResponseEndFrame, LLMTextFrame
+            
+            # Log outgoing frames
+            if isinstance(frame, (LLMFullResponseStartFrame, LLMFullResponseEndFrame)):
+                logger.info(f"🚀 MiniMaxLLMService.push_frame: {type(frame).__name__} → {direction}")
+            elif isinstance(frame, LLMTextFrame):
+                logger.info(f"📝 MiniMaxLLMService.push_frame: LLMTextFrame ({len(frame.text)} chars)")
+            
+            # Call parent to actually push
+            await super().push_frame(frame, direction)
+
         async def get_chat_completions(self, params_from_context):
             params = self.build_chat_completion_params(params_from_context)
             raw_stream = await self._client.chat.completions.create(**params)
@@ -216,9 +229,9 @@ async def run_bot(
     _ack_sent_this_turn: list[bool] = [False]
     # Tool iteration tracking — prevent runaway tool chains
     _tool_calls_this_turn: list[int] = [0]
-    _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 5
-    _MAX_TOOL_CALLS_BEFORE_WARN = 15
-    _MAX_TOOL_CALLS_HARD_LIMIT = 25
+    _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 3
+    _MAX_TOOL_CALLS_BEFORE_WARN = 6
+    _MAX_TOOL_CALLS_HARD_LIMIT = 10
 
     def _build_spoken_ack(tool_name: str, args: dict) -> str | None:
         """Generate a contextual spoken acknowledgment from tool name + args.
@@ -304,6 +317,8 @@ async def run_bot(
     llm.register_function("set_reminder", make_tool_handler("set_reminder"))
     # Search (fast, grounded via Perplexity Sonar)
     llm.register_function("web_search", make_tool_handler("web_search"))
+    # Conversation search (recall past discussions)
+    llm.register_function("search_past_conversations", make_tool_handler("search_past_conversations"))
     # Memory tools (PIC — Personal Integration Core)
     llm.register_function("save_memory", make_tool_handler("save_memory"))
     llm.register_function("recall_memory", make_tool_handler("recall_memory"))
@@ -415,6 +430,21 @@ async def run_bot(
                         msg_type = msg.get("type", "")
                         logger.info(f"LLM → Client ({msg_type}): {str(msg)[:120]}")
 
+                # Log all frame types for debugging
+                frame_type = type(frame).__name__
+                if "LLM" in frame_type or "Response" in frame_type:
+                    logger.info(f"🔍 NativeTextBridge saw: {frame_type}")
+                
+                # Log LLMTextFrame to see response text flowing to transport
+                if isinstance(frame, LLMTextFrame):
+                    logger.info(f"LLMTextFrame → transport: {frame.text[:80]}...")
+                
+                # Log LLMFullResponseStartFrame/EndFrame - needed for bot-llm-started/stopped signals
+                if isinstance(frame, LLMFullResponseStartFrame):
+                    logger.info(f"✅ LLMFullResponseStartFrame → triggers bot-llm-started")
+                if isinstance(frame, LLMFullResponseEndFrame):
+                    logger.info(f"✅ LLMFullResponseEndFrame → triggers bot-llm-stopped")
+
                 await self.push_frame(frame, direction)
 
         text_bridge = NativeTextBridge()
@@ -423,10 +453,10 @@ async def run_bot(
 
         pipeline = Pipeline([
             transport.input(),
-            text_bridge,
             user_aggregator,
             llm,
             assistant_aggregator,
+            text_bridge,  # Log output frames after assistant_aggregator
             transport.output(),
         ])
 
@@ -453,8 +483,10 @@ async def run_bot(
     _rtvi_ref[0] = task._rtvi
 
     # Let tools.py send server messages (e.g. citations from web_search)
-    from nova.tools import set_server_msg_fn
+    from nova.tools import set_server_msg_fn, set_web_search_agent_mode
     set_server_msg_fn(_send_server_msg)
+    # iOS sends "Deep (Verified)" orchestration mode — use sonar-pro for web search
+    set_web_search_agent_mode("deep")
 
     # ── Conversation persistence ─────────────────────────────────────────
     # Buffer assistant text chunks, persist complete turns on boundaries.
@@ -499,8 +531,10 @@ async def run_bot(
         if isinstance(frame, LLMTextFrame):
             _assistant_buffer.append(frame.text)
         elif isinstance(frame, LLMFullResponseStartFrame):
+            logger.info("🎯 LLMFullResponseStartFrame reached downstream → RTVI should send bot-llm-started")
             await ctx_watcher.check_and_persist()
         elif isinstance(frame, LLMFullResponseEndFrame):
+            logger.info("🎯 LLMFullResponseEndFrame reached downstream → RTVI should send bot-llm-stopped")
             if _assistant_buffer:
                 full_text = "".join(_assistant_buffer)
                 _assistant_buffer.clear()
