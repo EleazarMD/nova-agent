@@ -2,10 +2,10 @@
 name: web-search
 tool_name: web_search
 description: >
-  Search the web for current information using Perplexity Sonar. Use for news, facts, current events,
-  prices, reviews, sports scores, stock prices, flight status, movie releases, and any general knowledge
-  question that may need up-to-date information. Returns grounded results with citations. Fast (~2-5s).
-  Do NOT use openclaw_delegate for simple searches — use this tool instead.
+  DEFAULT TOOL for recent events, factual data, current information, news, prices, reviews,
+  sports scores, movie releases, and ANY question that may involve data newer than your training.
+  ALWAYS call this FIRST for recent/factual queries — do NOT check internal sources first,
+  do NOT ask permission, just search. Returns grounded results with citations. Fast (~2-5s).
 parameters:
   type: object
   properties:
@@ -20,25 +20,34 @@ parameters:
 
 # Web Search
 
+**DEFAULT BEHAVIOR**: When the user asks about recent events, current facts, or anything
+that may have changed since your training cutoff, call `web_search` IMMEDIATELY. Do NOT:
+- Check `check_studio` or `search_past_conversations` first
+- Ask permission to search
+- Say "I don't have internal data" and wait
+
+Just search. That's what this tool is for.
+
 Fast, grounded web search with citations using Perplexity Sonar API via AI Gateway.
 
-## When to Invoke
+## When to Invoke (DEFAULT FIRST)
 
-- User asks about current events, news, or recent happenings
-- Fact-checking claims or verifying statements
-- Any question that may need information newer than training data
-- Finding real-time data (prices, scores, weather, flight status)
+**Call web_search FIRST (no pre-checks, no permission) for:**
+- Recent events, news, or current happenings
 - Movie releases, sports results, product launches
-- Queries requiring authoritative citations
-- Any web search task — Nova handles ALL web searches directly
+- Current prices (stocks, products, flights)
+- Reviews, ratings, critic opinions
+- Weather, traffic, real-time status
+- Fact-checking claims
+- Any question involving data that may be newer than training
 
-**Important**: Nova ALWAYS handles web search itself. Only long-horizon deep research tasks
-(multi-step analysis, comprehensive reports) go to OpenClaw's Deep Research Studio.
+**The rule**: If the user's question involves "recent", "current", "latest", "today",
+"this week", or any temporal indicator suggesting up-to-date info → web_search immediately.
 
 ## Instructions
 
-### Step 1: Call web_search with a specific query
-Include relevant context in the query — dates, full names, specifics.
+### Step 1: Call web_search immediately
+Do not check internal sources first. Do not ask "want me to look that up?". Just call the tool.
 
 ### Step 2: Read the results
 The tool returns grounded text with citation count. Citations are automatically
