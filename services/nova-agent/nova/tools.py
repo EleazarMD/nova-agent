@@ -276,108 +276,11 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # Memory tools (PIC — Personal Integration Core)
-    # PIC is the centralized personal data service shared by all homelab agents.
-    # It stores identity, preferences, goals, and observations in a knowledge graph.
+    # PIC Memory tools are now loaded from SKILL.md files via skill_loader:
+    # - save_memory: skills/pic-save-memory/SKILL.md
+    # - recall_memory: skills/pic-recall-memory/SKILL.md
+    # - forget_memory: handled by existing handler, no SKILL.md yet
     # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "save_memory",
-            "description": (
-                "Save a user fact, preference, or important detail to PIC (Personal Integration Core) — "
-                "the user's persistent memory system shared across all AI agents in the homelab. "
-                "Use when the user states a preference, corrects you, or shares personal info "
-                "they'd want remembered across conversations. "
-                "Examples: food preferences, family details, work habits, communication style."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "fact": {
-                        "type": "string",
-                        "description": "The fact or preference to remember, written in third person (e.g. 'User prefers espresso on the rocks')",
-                    },
-                    "category": {
-                        "type": "string",
-                        "enum": ["communication", "work", "scheduling", "learning", "health", "social", "creative", "finance", "technology", "food", "family", "other"],
-                        "description": "Category for the preference (pick the best fit)",
-                    },
-                },
-                "required": ["fact"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "recall_memory",
-            "description": (
-                "Search PIC for stored preferences, facts, or personal details about the user. "
-                "Use when you need to check what you already know before asking the user. "
-                "Example queries: 'coffee order', 'kids names', 'work schedule', 'food preferences'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to look up (e.g. 'Starbucks order', 'family members', 'meeting preferences')",
-                    },
-                    "category": {
-                        "type": "string",
-                        "enum": ["communication", "work", "scheduling", "learning", "health", "social", "creative", "finance", "technology", "food", "family", "other"],
-                        "description": "Optional: narrow search to a specific category",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_past_conversations",
-            "description": (
-                "Search past conversations with the user to recall what was discussed previously. "
-                "Use when user asks 'what did we talk about yesterday', 'remember when I mentioned X', "
-                "'what was that thing we discussed last week', or when you need historical context. "
-                "Returns conversation snippets ranked by relevance. "
-                "Use a broad query like 'recent' to browse recent conversations. "
-                "Time intervals: use days_back for simple lookups, or from_days+to_days for windows "
-                "(e.g. from_days=90, to_days=7 means 'between 3 months ago and 1 week ago'). "
-                "ALWAYS use days_back=30 unless the user specifies a narrower range."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to search for. Use specific terms like 'road trip', 'email sync', 'hamburger'. Use 'recent' to browse all recent conversations.",
-                    },
-                    "days_back": {
-                        "type": "integer",
-                        "description": "How many days back from now to search. Default 30. Use this for simple 'last N days' lookups.",
-                        "default": 30,
-                    },
-                    "from_days": {
-                        "type": "integer",
-                        "description": "Far boundary in days ago (e.g. 90 = 3 months ago). Use with to_days for time windows.",
-                    },
-                    "to_days": {
-                        "type": "integer",
-                        "description": "Near boundary in days ago (e.g. 7 = 1 week ago). Use with from_days. Set to 0 for 'up to now'.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 5)",
-                        "default": 5,
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
     {
         "type": "function",
         "function": {
@@ -395,6 +298,43 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["keyword"],
+            },
+        },
+    },
+    # -------------------------------------------------------------------------
+    # Conversation history (not PIC - separate PostgreSQL store)
+    # -------------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "search_past_conversations",
+            "description": (
+                "Search past conversations with the user to recall what was discussed previously. "
+                "Use when user asks 'what did we talk about yesterday', 'remember when I mentioned X', "
+                "'what was that thing we discussed last week', or when you need historical context. "
+                "Returns conversation snippets ranked by relevance. "
+                "Use a broad query like 'recent' to browse recent conversations. "
+                "ALWAYS use days_back=30 unless the user specifies a narrower range."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for. Use specific terms like 'road trip', 'email sync'. Use 'recent' to browse all recent conversations.",
+                    },
+                    "days_back": {
+                        "type": "integer",
+                        "description": "How many days back from now to search. Default 30.",
+                        "default": 30,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default: 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -1950,6 +1890,91 @@ async def handle_forget_memory(keyword: str) -> str:
     if success:
         return f"Noted — I've recorded that correction about '{keyword}'."
     return f"I'll note that correction for this conversation."
+
+
+# ---------------------------------------------------------------------------
+# Context Bridge + Knowledge Graph handlers
+# ---------------------------------------------------------------------------
+
+async def handle_query_context(
+    query: str,
+    include_personal: bool = True,
+    include_knowledge: bool = True,
+    include_dimensions: bool = True,
+) -> str:
+    """Query Context Bridge for unified context across PIC, KG-API, and LIAM."""
+    from nova.context_bridge import query_knowledge
+    
+    result = await query_knowledge(
+        query=query,
+        include_personal=include_personal,
+        include_knowledge=include_knowledge,
+        include_dimensions=include_dimensions,
+    )
+    
+    if "error" in result:
+        return f"Context Bridge query failed: {result['error']}"
+    
+    # Build response from synthesis
+    synthesis = result.get("synthesis", "")
+    personal = result.get("personal", [])
+    knowledge = result.get("knowledge", [])
+    
+    parts = []
+    if synthesis:
+        parts.append(synthesis)
+    elif personal or knowledge:
+        # Build manual synthesis if no pre-formatted one
+        if personal:
+            parts.append("Personal context:")
+            for p in personal[:5]:
+                parts.append(f"  - {p.get('key', '?')}: {p.get('value', '')[:100]}")
+        if knowledge:
+            parts.append("Knowledge graph:")
+            for k in knowledge[:5]:
+                parts.append(f"  - {k.get('name', '?')}: {k.get('type', '')}")
+    
+    if not parts:
+        return f"No relevant context found for '{query}'."
+    
+    logger.info(f"Context Bridge query OK: '{query[:50]}' -> {len(personal)} personal, {len(knowledge)} knowledge")
+    return "\n".join(parts)
+
+
+async def handle_kg_query(query: str, entity_type: str = "Service") -> str:
+    """Query Knowledge Graph for infrastructure context."""
+    from nova.knowledge_graph import knowledge_graph_query, get_service_status_from_graph
+    
+    # Try to get structured service status first
+    if entity_type == "Service":
+        # Extract potential service name from query
+        query_lower = query.lower()
+        service_names = ["nova", "hermes", "ai gateway", "openclaw", "tesla"]
+        for name in service_names:
+            if name in query_lower:
+                status = await get_service_status_from_graph(name.replace(" ", "-"))
+                if "error" not in status:
+                    service = status.get("service", {})
+                    deps = status.get("dependencies", [])
+                    integrations = status.get("integrations", [])
+                    
+                    lines = [f"**{service.get('name', name)}** ({service.get('type', 'Service')})"]
+                    if deps:
+                        lines.append("Dependencies:")
+                        for d in deps:
+                            lines.append(f"  - {d.get('service_id', '?')}")
+                    if integrations:
+                        lines.append("Used by:")
+                        for i in integrations:
+                            lines.append(f"  - {i.get('service_id', '?')}")
+                    return "\n".join(lines)
+    
+    # Fall back to general knowledge graph query
+    context = await knowledge_graph_query(query)
+    if context:
+        return context
+    
+    return f"No knowledge graph context found for '{query}'."
 
 
 _conversation_search_count: dict[str, int] = {}
@@ -3610,6 +3635,8 @@ TOOL_HANDLERS = {
     # YouTube search and play
     "youtube": handle_youtube,
     # Context Bridge - Unified knowledge orchestration (PIC + KG-API)
+    "query_context": handle_query_context,
+    "kg_query": handle_kg_query,
     "knowledge_query": handle_knowledge_query,
     "get_enriched_context": handle_get_enriched_context,
     "link_goal_to_knowledge": handle_link_goal_to_knowledge,
