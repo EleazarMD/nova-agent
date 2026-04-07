@@ -1822,7 +1822,7 @@ async def handle_save_memory(fact: str, category: str = "other") -> str:
 
 async def handle_recall_memory(query: str, category: str = "") -> str:
     """Search PIC for stored preferences and observations matching a query."""
-    _pic = _load_skill_module("pic-memory", "pic_memory")
+    _pic = _load_skill_module("pcg-memory", "pic_memory")
     get_preferences = _pic.get_preferences
     get_identity = _pic.get_identity
 
