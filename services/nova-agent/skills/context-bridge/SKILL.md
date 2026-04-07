@@ -10,20 +10,18 @@ parameters:
   properties:
     query:
       type: string
-      description: >
-        Natural language query to search across PIC (personal data), KG-API (knowledge graph),
-        and LIAM frameworks. Be specific (e.g. "habit building frameworks given my schedule preferences").
+      description: "Natural language query to search across PIC, KG-API, and LIAM frameworks"
     include_personal:
       type: boolean
-      description: Include PIC personal data, preferences, goals (default: true)
+      description: "Include PIC personal data, preferences, goals (default: true)"
       default: true
     include_knowledge:
       type: boolean
-      description: Include KG-API entities and relationships (default: true)
+      description: "Include KG-API entities and relationships (default: true)"
       default: true
     include_dimensions:
       type: boolean
-      description: Include LIAM dimensions matching the query (default: true)
+      description: "Include LIAM dimensions matching the query (default: true)"
       default: true
   required:
     - query
