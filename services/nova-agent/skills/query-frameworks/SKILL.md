@@ -10,10 +10,10 @@ parameters:
   properties:
     problem_description:
       type: string
-      description: Natural language description of the decision, problem, or life question (e.g., 'Should I switch careers?', 'How to build sustainable habits?')
+      description: "Natural language description of the decision, problem, or life question"
     dimension_id:
       type: string
-      description: "Optional: Filter by LIAM dimension (e.g., 'habits', 'decision_fatigue', 'financial', 'metacognition')"
+      description: "Optional: Filter by LIAM dimension (habits, decision_fatigue, financial, metacognition)"
     category:
       type: string
       enum:
@@ -26,7 +26,7 @@ parameters:
       description: "Optional: Filter by framework category"
     limit:
       type: integer
-      description: Maximum number of frameworks to return (default: 5)
+      description: "Maximum number of frameworks to return (default: 5)"
       default: 5
   required:
     - problem_description
