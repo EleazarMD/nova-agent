@@ -1,18 +1,16 @@
 ---
-name: pic-recall-memory
+name: pcg-recall-memory
 tool_name: recall_memory
 description: >
-  Search PIC (Personal Identity Core) for stored preferences, facts, or personal details about the user.
+  Search PCG (Personal Context Graph) for stored preferences, facts, or personal details about the user.
   Use when you need to check what you already know before asking the user.
-  Port 8765, backed by Neo4j + ChromaDB for semantic search over personal data.
+  Port 8765, unified PIC + KG-API + LIAM service.
 parameters:
   type: object
   properties:
     query:
       type: string
-      description: >
-        What to look up (e.g. "coffee order", "kids names", "work schedule", "food preferences").
-        Use natural language — the search is semantic.
+      description: "What to look up (e.g. coffee order, kids names, work schedule, food preferences)"
     category:
       type: string
       enum:
@@ -33,9 +31,9 @@ parameters:
     - query
 ---
 
-# PIC Recall Memory
+# PCG Recall Memory
 
-Search the Personal Identity Core (PIC) for stored preferences, facts, and personal details about the user.
+Search the Personal Context Graph (PCG) for stored preferences, facts, and personal details about the user.
 
 ## When to Invoke
 

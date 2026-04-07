@@ -2,35 +2,26 @@
 name: knowledge-graph
 tool_name: kg_query
 description: >
-  Query the AI Homelab Knowledge Graph for infrastructure context, service dependencies,
-  and entity relationships. Use for questions about homelab services, integrations,
-  or "what depends on X" queries. Port 8765 (KG-API), backed by Neo4j + ChromaDB.
+  Query the AI Homelab Knowledge Graph (KG-API) for infrastructure context, service dependencies, and entity relationships.
+  Part of PCG (Personal Context Graph) on port 8765.
+  Use for questions about homelab services, their relationships, and infrastructure knowledge.
 parameters:
   type: object
   properties:
     query:
       type: string
-      description: >
-        Natural language query about infrastructure, services, or relationships
-        (e.g. "what services depend on AI Gateway", "Nova Agent integrations",
-        "Hermes Core dependencies").
+      description: "Natural language query about homelab infrastructure or services"
     entity_type:
       type: string
-      enum:
-        - Service
-        - Component
-        - Database
-        - Integration
-        - Agent
-      description: "Optional: narrow search to a specific category type"
-      default: Service
+      description: "Filter by entity type (Service, Component, Integration, DataStore)"
+      default: "Service"
   required:
     - query
 ---
 
 # Knowledge Graph
 
-Query the AI Homelab Knowledge Graph for infrastructure context, service dependencies, and entity relationships.
+Query the AI Homelab Knowledge Graph (KG-API) for infrastructure context, service dependencies, and entity relationships.
 
 ## When to Invoke
 

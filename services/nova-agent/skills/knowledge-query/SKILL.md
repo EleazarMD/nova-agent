@@ -2,10 +2,10 @@
 name: knowledge-query
 tool_name: knowledge_query
 description: >
-  Query across personal knowledge (PIC) and general knowledge (KG-API) through the Context Bridge.
-  Use for questions that might need both personal context AND general facts.
+  Query across PCG (Personal Context Graph) components through the Context Bridge.
+  Combines PIC (personal data), KG-API (knowledge), and LIAM (frameworks) in a single query.
   This is the PRIMARY tool for complex knowledge synthesis.
-  Port 8764 (Context Bridge), backed by Neo4j + ChromaDB.
+  Port 8764 (Context Bridge), backed by PCG (8765) with Neo4j + ChromaDB.
 parameters:
   type: object
   properties:
@@ -30,7 +30,7 @@ parameters:
 
 # Knowledge Query
 
-Query across personal knowledge (PIC) and general knowledge (KG-API) through the Context Bridge.
+Query across PCG components through the Context Bridge for unified knowledge synthesis.
 
 ## When to Invoke
 

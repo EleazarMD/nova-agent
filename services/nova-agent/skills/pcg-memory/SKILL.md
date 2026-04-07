@@ -1,13 +1,14 @@
 ---
-name: pic-memory
+name: pcg-memory
 description: >
-  Personal Identity Core (PIC) client for reading and writing personal data, preferences, and goals.
+  Personal Context Graph (PCG) client for reading and writing personal data, preferences, and goals.
   Single source of truth for user identity across all homelab agents.
+  Port 8765, unified PIC + KG-API + LIAM service.
 ---
 
-# PIC Memory
+# PCG Memory
 
-Access and manage personal identity data, preferences, and goals through the Personal Identity Core (PIC).
+Access and manage personal identity data, preferences, and goals through the Personal Context Graph (PCG).
 
 ## When to Invoke
 

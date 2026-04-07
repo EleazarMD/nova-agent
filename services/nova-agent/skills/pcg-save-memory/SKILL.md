@@ -1,19 +1,16 @@
 ---
-name: pic-save-memory
+name: pcg-save-memory
 tool_name: save_memory
 description: >
-  Save a user fact, preference, or important detail to PIC (Personal Identity Core) —
-  the user's persistent memory system shared across all AI agents in the homelab.
-  Use when the user explicitly states a preference, corrects you, or shares personal info
-  they want remembered across conversations. Port 8765, backed by Neo4j + ChromaDB.
+  Save user facts, preferences, or important details to PCG (Personal Context Graph).
+  Use when the user explicitly tells you something you should remember.
+  Port 8765, unified PIC + KG-API + LIAM service.
 parameters:
   type: object
   properties:
-    fact:
+    content:
       type: string
-      description: >
-        The fact or preference to remember, written in third person
-        (e.g. "User prefers espresso on the rocks", "User's daughter is named Sofia").
+      description: "The fact or preference to save (natural language)"
     category:
       type: string
       enum:
@@ -29,15 +26,17 @@ parameters:
         - food
         - family
         - other
-      description: Category for the preference (pick the best fit)
-      default: other
+      description: "Category for organizing the memory"
+    metadata:
+      type: object
+      description: "Optional metadata (source, confidence, tags)"
   required:
-    - fact
+    - content
 ---
 
-# PIC Save Memory
+# PCG Save Memory
 
-Save user facts and preferences to the Personal Identity Core (PIC) for persistent memory across all homelab agents.
+Save user facts, preferences, or important details to the Personal Context Graph (PCG) for persistent memory across all homelab agents.
 
 ## When to Invoke
 

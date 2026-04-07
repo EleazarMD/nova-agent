@@ -2,15 +2,15 @@
 name: context-bridge
 tool_name: query_context
 description: >
-  Unified context retrieval across personal memory (PIC), knowledge graphs (KG-API), and LIAM frameworks.
+  Unified context retrieval across PCG (Personal Context Graph) components: PIC, KG-API, and LIAM.
   Use for complex queries requiring multiple context sources. Returns synthesized results from all sources.
-  Port 8764 orchestrates PIC (8765) and KG-API (8765) with shared Neo4j + ChromaDB backend.
+  Port 8764 orchestrates PCG (8765) with shared Neo4j + ChromaDB backend.
 parameters:
   type: object
   properties:
     query:
       type: string
-      description: "Natural language query to search across PIC, KG-API, and LIAM frameworks"
+      description: "Natural language query to search across PCG components"
     include_personal:
       type: boolean
       description: "Include PIC personal data, preferences, goals (default: true)"
@@ -29,7 +29,7 @@ parameters:
 
 # Context Bridge
 
-Unified context retrieval service that bridges personal memory (PIC), knowledge graphs (KG-API), and LIAM frameworks.
+Unified context retrieval service that bridges PCG components: PIC (personal data), KG-API (knowledge graph), and LIAM (life intelligence).
 
 ## When to Invoke
 

@@ -5,7 +5,7 @@ description: >
   Get enriched personal context for the current conversation from the Context Bridge.
   Returns identity, goals with applicable frameworks, and relevant knowledge entities.
   Use at conversation start or when you need comprehensive personal context.
-  Port 8764 (Context Bridge), backed by Neo4j + ChromaDB.
+  Port 8764 (Context Bridge), backed by PCG (8765) with Neo4j + ChromaDB.
 parameters:
   type: object
   properties:
