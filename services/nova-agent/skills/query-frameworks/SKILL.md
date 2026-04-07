@@ -1,8 +1,35 @@
 ---
 name: query-frameworks
+tool_name: query_frameworks
 description: >
-  Query LIAM (Life Intelligence Augmentation Matrix) for scientific frameworks applicable to decisions, problems, or life questions.
-  Use for finding mental models, decision-making frameworks, and cognitive tools.
+  Query LIAM (Life Intelligence Augmentation Matrix) for scientific frameworks applicable to a decision, problem, or life question.
+  Returns framework names, when to use them, key concepts, limitations, and a synthesis of how they apply.
+  Use this to dynamically discover frameworks as they are added to the knowledge graph.
+parameters:
+  type: object
+  properties:
+    problem_description:
+      type: string
+      description: Natural language description of the decision, problem, or life question (e.g., 'Should I switch careers?', 'How to build sustainable habits?')
+    dimension_id:
+      type: string
+      description: "Optional: Filter by LIAM dimension (e.g., 'habits', 'decision_fatigue', 'financial', 'metacognition')"
+    category:
+      type: string
+      enum:
+        - decision_making
+        - behavioral
+        - cognitive
+        - probabilistic
+        - computational
+        - systems
+      description: "Optional: Filter by framework category"
+    limit:
+      type: integer
+      description: Maximum number of frameworks to return (default: 5)
+      default: 5
+  required:
+    - problem_description
 ---
 
 # Query Frameworks
