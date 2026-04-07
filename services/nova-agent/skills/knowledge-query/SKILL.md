@@ -11,18 +11,18 @@ parameters:
   properties:
     query:
       type: string
-      description: Natural language query. Be specific about what you need.
+      description: "Natural language query. Be specific about what you need."
     include_personal:
       type: boolean
-      description: Include PIC identity, goals, preferences. Default: true
+      description: "Include PIC identity, goals, preferences. Default: true"
       default: true
     include_knowledge:
       type: boolean
-      description: Include KG-API entities, facts, documents. Default: true
+      description: "Include KG-API entities, facts, documents. Default: true"
       default: true
     include_dimensions:
       type: boolean
-      description: Include LIAM dimension matches and frameworks. Default: true
+      description: "Include LIAM dimension matches and frameworks. Default: true"
       default: true
   required:
     - query

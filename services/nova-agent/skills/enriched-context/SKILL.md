@@ -11,11 +11,11 @@ parameters:
   properties:
     include_goals:
       type: boolean
-      description: Include active goals with applicable LIAM frameworks (default: true)
+      description: "Include active goals with applicable LIAM frameworks (default: true)"
       default: true
     include_relationships:
       type: boolean
-      description: Include knowledge graph relationships (default: false)
+      description: "Include knowledge graph relationships (default: false)"
       default: false
 ---
 
