@@ -343,6 +343,8 @@ async def run_bot(
     llm.register_function("recall_memory", make_tool_handler("recall_memory"))
     llm.register_function("query_context", make_tool_handler("query_context"))
     llm.register_function("kg_query", make_tool_handler("kg_query"))
+    llm.register_function("knowledge_query", make_tool_handler("knowledge_query"))
+    llm.register_function("get_enriched_context", make_tool_handler("get_enriched_context"))
     # Homelab infrastructure operations (Docker container management)
     llm.register_function("service_status", make_tool_handler("service_status"))
     llm.register_function("service_logs", make_tool_handler("service_logs"))
