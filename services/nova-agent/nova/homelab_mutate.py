@@ -40,8 +40,9 @@ from nova.operational_mode import (
 # ---------------------------------------------------------------------------
 
 DASHBOARD_URL = os.environ.get("ECOSYSTEM_URL", "http://localhost:8404")
-APPROVAL_SERVICE_URL = os.environ.get("APPROVAL_SERVICE_URL", "http://localhost:8407")
-APPROVAL_SERVICE_API_KEY = os.environ.get("APPROVAL_SERVICE_API_KEY", "approval-service-internal-key-2024")
+# Use dashboard approval API directly (port 8404) - standalone approval-service removed
+APPROVAL_SERVICE_URL = os.environ.get("APPROVAL_SERVICE_URL", DASHBOARD_URL)
+APPROVAL_SERVICE_API_KEY = os.environ.get("APPROVAL_SERVICE_API_KEY", "ai-gateway-api-key-2024")
 _AGENT_JWT = os.environ.get("HERMES_JWT_TOKEN", "")
 APPROVAL_POLL_INTERVAL = 3  # seconds between status polls
 APPROVAL_TIMEOUT = 600      # max seconds to wait for a decision
@@ -69,13 +70,12 @@ async def _request_approval(
     risk_level: str,
     context: str,
 ) -> dict:
-    """Submit an approval request to the standalone approval-service (port 8407).
+    """Submit an approval request to the dashboard approval API (port 8404).
     
-    Routes to approval-service which has working APNs push notification delivery.
-    The dashboard endpoint (/api/security/approvals/request) has a stubbed push
-    function that never delivers to iOS — do NOT use it.
+    Uses the unified dashboard endpoint which stores approvals in PostgreSQL
+    and delivers push notifications via APNs to iOS.
     """
-    url = f"{APPROVAL_SERVICE_URL}/api/v1/approvals"
+    url = f"{APPROVAL_SERVICE_URL}/api/approvals"
     expiry_hours = _APPROVAL_EXPIRY_HOURS.get(tool_name, 1 / 60)  # default: 1 minute
     payload = {
         "action_type": tool_name,
@@ -119,8 +119,8 @@ async def _request_approval(
 
 
 async def _poll_approval_status(approval_id: str) -> dict:
-    """Poll the standalone approval-service until a decision is made or timeout."""
-    url = f"{APPROVAL_SERVICE_URL}/api/v1/approvals/{approval_id}"
+    """Poll the dashboard approval API until a decision is made or timeout."""
+    url = f"{APPROVAL_SERVICE_URL}/api/approvals/{approval_id}"
     elapsed = 0
 
     async with aiohttp.ClientSession() as session:

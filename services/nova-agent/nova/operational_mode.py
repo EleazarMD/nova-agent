@@ -30,8 +30,9 @@ from loguru import logger
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Use dashboard approval API (port 8404) - standalone approval-service removed
 APPROVAL_SERVICE_URL = os.environ.get(
-    "APPROVAL_SERVICE_URL", "http://localhost:8407"
+    "APPROVAL_SERVICE_URL", "http://localhost:8404"
 )
 DASHBOARD_API_URL = os.environ.get(
     "DASHBOARD_API_URL", "http://localhost:8404"
@@ -121,7 +122,8 @@ async def check_approval_engine_health() -> bool:
     try:
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(f"{APPROVAL_SERVICE_URL}/health") as resp:
+            # Use dashboard health endpoint - it serves approvals
+            async with session.get(f"{APPROVAL_SERVICE_URL}/api/health") as resp:
                 if resp.status == 200:
                     logger.debug("Approval engine health check: OK")
                     return True
