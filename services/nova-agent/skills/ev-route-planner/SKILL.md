@@ -1,8 +1,47 @@
 ---
 name: ev-route-planner
+tool_name: ev_route_planner
 description: >
-  EV charging station finder and route planner using NREL API.
-  Use for finding Tesla Superchargers, planning EV trips, and locating charging stations.
+  Find EV charging stations and plan charging stops for road trips.
+  Uses NREL Alternative Fuel Stations API. Supports Tesla Superchargers and all major networks.
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      enum:
+        - nearest
+        - route
+        - networks
+      description: "Action to perform"
+    location:
+      type: string
+      description: "Address, city/state, or ZIP (for nearest). E.g. 'Humble, TX' or '77346'"
+    latitude:
+      type: number
+      description: "Latitude (alternative to location, for nearest)"
+    longitude:
+      type: number
+      description: "Longitude (alternative to location, for nearest)"
+    waypoints:
+      type: string
+      description: "Semicolon-separated route locations (for route). E.g. 'Houston,TX;San Antonio,TX;Austin,TX'"
+    radius:
+      type: number
+      description: "Search radius in miles (default 25 for nearest, 10 for route; max 500)"
+    network:
+      type: string
+      description: "Filter by network: tesla, chargepoint, electrify_america, evgo, blink"
+    limit:
+      type: integer
+      description: "Max results (default 10 for nearest, 20 for route; max 50)"
+      default: 10
+    dc_fast_only:
+      type: boolean
+      description: "Only show DC fast chargers"
+      default: false
+  required:
+    - action
 ---
 
 # EV Route Planner

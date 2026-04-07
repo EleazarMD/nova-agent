@@ -1,8 +1,38 @@
 ---
 name: tesla-control
+tool_name: tesla_control
 description: >
-  Tesla vehicle control via Fleet API. Use for vehicle status, charging control,
-  climate control, and vehicle commands.
+  Control Tesla vehicles via Tesla Relay Service with approval-gated commands.
+  Supports listing vehicles, getting status, controlling climate, charging, locks, trunk, navigation, and more.
+  All commands follow tiered approval system (Tier 0-4) for security.
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      enum:
+        - status
+        - vehicles
+        - vehicle_status
+        - wake
+        - climate_on
+        - climate_off
+        - set_temperature
+        - start_charge
+        - stop_charge
+        - open_frunk
+        - open_trunk
+        - lock
+        - unlock
+      description: "Action to perform"
+    vehicle_id:
+      type: integer
+      description: "Vehicle ID from vehicles list (required for vehicle-specific commands)"
+    temperature:
+      type: number
+      description: "Climate temperature in degrees (for set_temperature)"
+  required:
+    - action
 ---
 
 # Tesla Control

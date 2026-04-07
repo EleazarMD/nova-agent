@@ -1,8 +1,50 @@
 ---
 name: workspace-manager
+tool_name: manage_workspace
 description: >
   Manage development workspaces, projects, and coding environments.
   Use for workspace setup, project management, and development environment control.
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      enum:
+        - create
+        - list
+        - activate
+        - configure
+        - install_dependencies
+      description: "Action to perform"
+    name:
+      type: string
+      description: "Workspace name"
+    type:
+      type: string
+      description: "Project type (python, node, rust, etc.)"
+    template:
+      type: string
+      description: "Template to use"
+    path:
+      type: string
+      description: "Workspace path"
+    workspace_id:
+      type: string
+      description: "Workspace identifier"
+    settings:
+      type: object
+      description: "Configuration object"
+    package_manager:
+      type: string
+      description: "Package manager to use (pip, npm, cargo, etc.)"
+    status:
+      type: string
+      enum:
+        - active
+        - archived
+      description: "Filter by status"
+  required:
+    - action
 ---
 
 # Workspace Manager

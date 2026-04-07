@@ -1,8 +1,61 @@
 ---
 name: ticket-manager
+tool_name: manage_ticket
 description: >
-  Manage tickets, issues, and tasks in the homelab project management system.
-  Use for creating tickets, tracking issues, and managing project tasks.
+  Create, list, read, update, or delegate tickets in the homelab ticket tracker.
+  Use this when you encounter bugs, issues, or feature gaps during conversations.
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      enum:
+        - create
+        - list
+        - get
+        - update
+        - delegate
+      description: "Action to perform"
+    ticket_id:
+      type: string
+      description: "Ticket ID (for get/update/delegate actions)"
+    title:
+      type: string
+      description: "Ticket title (for create)"
+    description:
+      type: string
+      description: "Detailed description (for create)"
+    priority:
+      type: string
+      enum:
+        - critical
+        - high
+        - medium
+        - low
+      description: "Ticket priority (for create/update)"
+    category:
+      type: string
+      enum:
+        - bug
+        - feature
+        - improvement
+        - investigation
+        - maintenance
+      description: "Ticket category (for create)"
+    status:
+      type: string
+      description: "Ticket status (for update)"
+    delegate_to:
+      type: string
+      enum:
+        - openclaw
+        - windsurf
+      description: "Delegate ticket to OpenClaw (minor fixes) or Windsurf (structural) (for delegate)"
+    limit:
+      type: string
+      description: "Max tickets to return (for list, default 10)"
+  required:
+    - action
 ---
 
 # Ticket Manager

@@ -1,8 +1,16 @@
 ---
 name: homelab-operations
+tool_name: service_status
 description: >
   Docker container management and infrastructure health checks for AI Homelab.
   Use for container status, logs, health checks, and controlled restart operations.
+parameters:
+  type: object
+  properties:
+    container:
+      type: string
+      description: "Specific container name (e.g. 'hermes-core', 'openclaw'). Leave empty for all."
+  required: []
 ---
 
 # Homelab Operations

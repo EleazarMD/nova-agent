@@ -1,8 +1,27 @@
 ---
 name: studio-reader
+tool_name: check_studio
 description: >
   Read and analyze content from Studio (Apple Notes-like knowledge base).
   Use for accessing stored notes, documents, and knowledge base content.
+parameters:
+  type: object
+  properties:
+    studio:
+      type: string
+      description: "Studio name to read from"
+    action:
+      type: string
+      description: "Action to perform: recent, search, item"
+      default: "recent"
+    item_id:
+      type: string
+      description: "Specific item ID to retrieve"
+    query:
+      type: string
+      description: "Search query for studio content"
+  required:
+    - studio
 ---
 
 # Studio Reader

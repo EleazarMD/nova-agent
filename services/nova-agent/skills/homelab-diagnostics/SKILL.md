@@ -1,8 +1,22 @@
 ---
 name: homelab-diagnostics
+tool_name: diagnose_network
 description: >
   Comprehensive homelab infrastructure health monitoring and diagnostics.
   Use for checking service health, calculating Hermy score, and investigating errors.
+parameters:
+  type: object
+  properties:
+    check:
+      type: string
+      description: "Type of diagnostic check: full, dns, latency, port, service"
+      default: "full"
+    target:
+      type: string
+      description: "Target host or service to check"
+    port:
+      type: integer
+      description: "Port number for port checks"
 ---
 
 # Homelab Diagnostics

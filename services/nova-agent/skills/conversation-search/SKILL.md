@@ -1,8 +1,31 @@
 ---
 name: conversation-search
+tool_name: search_past_conversations
 description: >
   Search Nova's conversation history in PostgreSQL and ChromaDB.
   Use for finding past conversations, retrieving context, or recalling previous discussions.
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: "Search query string"
+    days_back:
+      type: integer
+      description: "How many days back to search (default: 30, max: 365)"
+      default: 30
+    limit:
+      type: integer
+      description: "Maximum results to return (default: 5, max: 20)"
+      default: 5
+    from_days:
+      type: integer
+      description: "Start of date range (days ago)"
+    to_days:
+      type: integer
+      description: "End of date range (days ago)"
+  required:
+    - query
 ---
 
 # Conversation Search

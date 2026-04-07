@@ -1,8 +1,50 @@
 ---
 name: notes-manager
+tool_name: manage_notes
 description: >
   Meeting notes, action items, and productivity document management via Dashboard Notes API.
   Use for creating notes, tracking action items, and organizing meeting documentation.
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      enum:
+        - create
+        - list
+        - get
+        - update
+        - search
+        - add_action
+        - complete_action
+        - list_actions
+      description: "Action to perform"
+    note_id:
+      type: string
+      description: "Note ID (for get, update, add_action, complete_action, list_actions)"
+    title:
+      type: string
+      description: "Note title (for create, update)"
+    content:
+      type: string
+      description: "Note content/body text (for create, update). Supports markdown."
+    note_type:
+      type: string
+      enum:
+        - meeting
+        - quick
+        - project
+        - journal
+        - reference
+      description: "Type of note (for create, list filter). Default: quick"
+    tags:
+      type: string
+      description: "Comma-separated tags (for create, update, list filter)"
+    query:
+      type: string
+      description: "Search query (for search action)"
+  required:
+    - action
 ---
 
 # Notes Manager
