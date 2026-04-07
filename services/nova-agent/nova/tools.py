@@ -68,6 +68,10 @@ _tesla = _load_skill_module("tesla-control", "tesla_control")
 handle_tesla_location_refresh = _tesla.handle_tesla_location_refresh
 handle_tesla_control = _tesla.handle_tesla_control
 
+# Tesla stream monitor (skill-based)
+_tesla_stream = _load_skill_module("tesla-stream-monitor", "tesla_stream_monitor")
+handle_tesla_stream_monitor = _tesla_stream.handle_tesla_stream_monitor
+
 # ---------------------------------------------------------------------------
 # AI Inferencing Service key fetcher (centralized API key vault, port 9000)
 # Constitutional rule: ALL API keys fetched via AI Inferencing, never hardcoded.
@@ -3985,6 +3989,9 @@ TESLA_TOOL_DEFINITIONS_LEGACY = [
 # Tesla handlers are now loaded from skills/tesla-control at line 67-69
 # Register unified Tesla handler (already imported from skill)
 TOOL_HANDLERS["tesla_control"] = handle_tesla_control
+
+# Tesla stream monitor handler (skill-based)
+TOOL_HANDLERS["tesla_stream_monitor"] = handle_tesla_stream_monitor
 
 # ---------------------------------------------------------------------------
 # Homelab Diagnostics Tool (skill-based)
