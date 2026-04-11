@@ -100,7 +100,7 @@ async def handle_tesla_vehicle_status(user_id: str, vehicle_identifier: Optional
     target_vin = await _resolve_vehicle_identifier(vehicles, vehicle_identifier)
     if not target_vin:
         available = [f"{v.get('display_name', 'Unknown')} ({_get_model_from_vin(v.get('vin', ''))})" for v in vehicles]
-        return f"Could not find vehicle matching '{vehicle_identifier}'. Available vehicles: {', '.join(available)}"
+        return f"VEHICLE NOT FOUND: No vehicle matching '{vehicle_identifier}'. You have these vehicles: {', '.join(available)}. Please ask about one of these specific vehicles."
     
     return await _get_single_vehicle_status(target_vin)
 
