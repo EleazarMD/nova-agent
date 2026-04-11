@@ -225,7 +225,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"openclaw_delegate", "web_search"}
+    _SLOW_TOOLS = {"openclaw_delegate", "web_search", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -250,21 +250,14 @@ async def run_bot(
             return "Searching the web."
         return None
 
-    def _build_tool_description(tool_name: str, args: dict) -> str:
+    def _build_thinking_text(tool_name: str, args: dict) -> str:
         """Generate a thinking description for the UI progress indicator."""
         desc_map = {
+            "openclaw_delegate": f"🔧 Delegating to OpenClaw: {args.get('task', '')[:80]}...",
             "tesla_control": "Checking Tesla vehicle status...",
             "tesla_stream_monitor": "Monitoring Tesla data stream...",
             "tesla_location_refresh": "Getting Tesla vehicle location...",
-            "service_status": f"Checking service status: {args.get('container', 'system')}...",
-            "service_logs": f"Fetching logs for {args.get('container', 'service')}...",
-            "service_restart": f"Restarting {args.get('container', 'service')}...",
-            "service_health_check": "Running health diagnostics...",
-            "homelab_diagnostics": "Running homelab diagnostics...",
-            "homelab_operations": f"Managing homelab: {args.get('operation', 'operation')}...",
             "web_search": f"Searching for {args.get('query', 'information')[:40]}...",
-            "ev_route_planner": "Planning EV charging route...",
-            "check_studio": "Checking studio calendar...",
         }
         return desc_map.get(tool_name, f"Executing {tool_name}...")
 
@@ -302,28 +295,21 @@ async def run_bot(
                     await _send_server_msg({"type": "heartbeat", "text": ack})
                     logger.info(f"Dual-path ack: '{ack}'")
 
-            # ── Send thinking update to UI for ALL tools ──
-            if tool_name == "openclaw_delegate":
-                task_desc = args.get("task", "")[:120]
-                await _send_server_msg({"phase": "delegating"})
-                await _send_server_msg({
-                    "type": "thinking",
-                    "text": f"🔧 Delegating to OpenClaw: {task_desc}",
-                })
-            else:
-                # Show thinking indicator for other long-running tools
-                tool_desc = _build_tool_description(tool_name, args)
+            # For slow tools, populate the ThinkingCard with progress
+            if tool_name in _SLOW_TOOLS:
+                thinking_text = _build_thinking_text(tool_name, args)
                 await _send_server_msg({"phase": "thinking"})
                 await _send_server_msg({
                     "type": "thinking",
-                    "text": tool_desc,
+                    "text": thinking_text,
                 })
 
             # ── Background path: tool executes ──
             result = await dispatch_tool(tool_name, args)
 
-            # ── Clear ThinkingCard phase so next response is spoken ──
-            await _send_server_msg({"phase": "done"})
+            # Clear ThinkingCard phase so the LLM's next response is spoken, not swallowed
+            if tool_name in _SLOW_TOOLS:
+                await _send_server_msg({"phase": "done"})
 
             # ── Inject wrap-up hint at soft limit ──
             if call_num >= _MAX_TOOL_CALLS_BEFORE_WARN:
