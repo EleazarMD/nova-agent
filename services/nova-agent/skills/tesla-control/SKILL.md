@@ -2,9 +2,10 @@
 name: tesla-control
 tool_name: tesla_control
 description: >
-  Control Tesla vehicles via Dashboard Fleet API proxy with approval-gated commands.
-  Supports listing vehicles, status, climate, charging, locks, trunk, navigation, honk/flash, and wake.
-  All commands follow tiered approval system (Tier 0-4) for security.
+  Control physical Tesla electric vehicles (Model S, 3, X, Y, Cybertruck) via Tesla Fleet API.
+  This tool queries and controls ACTUAL TESLA CARS - not Docker containers, not services.
+  Use for: battery status, vehicle location, door locks, climate control, charging, trunk/frunk, navigation.
+  Query operations (vehicles, status) are instant. Control operations require user approval.
 parameters:
   type: object
   properties:
@@ -20,7 +21,7 @@ parameters:
         - wake
         - honk_flash
         - navigation
-      description: "Action category to perform"
+      description: "Vehicle action: 'vehicles' lists cars, 'status' gets battery/location/climate (use for 'where is my Tesla'), 'climate' controls AC, 'charge' for charging, 'lock' for doors, 'trunk' for trunk/frunk, 'wake' wakes car, 'honk_flash' to find car, 'navigation' sends destination"
     vehicle_identifier:
       type: string
       description: "Vehicle identifier: VIN, model name (Model 3, Model X), or display name (e.g., Black Panther)"
