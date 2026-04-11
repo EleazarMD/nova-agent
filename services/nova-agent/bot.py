@@ -250,6 +250,24 @@ async def run_bot(
             return "Searching the web."
         return None
 
+    def _build_tool_description(tool_name: str, args: dict) -> str:
+        """Generate a thinking description for the UI progress indicator."""
+        desc_map = {
+            "tesla_control": "Checking Tesla vehicle status...",
+            "tesla_stream_monitor": "Monitoring Tesla data stream...",
+            "tesla_location_refresh": "Getting Tesla vehicle location...",
+            "service_status": f"Checking service status: {args.get('container', 'system')}...",
+            "service_logs": f"Fetching logs for {args.get('container', 'service')}...",
+            "service_restart": f"Restarting {args.get('container', 'service')}...",
+            "service_health_check": "Running health diagnostics...",
+            "homelab_diagnostics": "Running homelab diagnostics...",
+            "homelab_operations": f"Managing homelab: {args.get('operation', 'operation')}...",
+            "web_search": f"Searching for {args.get('query', 'information')[:40]}...",
+            "ev_route_planner": "Planning EV charging route...",
+            "check_studio": "Checking studio calendar...",
+        }
+        return desc_map.get(tool_name, f"Executing {tool_name}...")
+
     def make_tool_handler(tool_name: str):
         async def handler(params: FunctionCallParams):
             args = dict(params.arguments)
@@ -284,7 +302,7 @@ async def run_bot(
                     await _send_server_msg({"type": "heartbeat", "text": ack})
                     logger.info(f"Dual-path ack: '{ack}'")
 
-            # For OpenClaw, also populate the ThinkingCard
+            # ── Send thinking update to UI for ALL tools ──
             if tool_name == "openclaw_delegate":
                 task_desc = args.get("task", "")[:120]
                 await _send_server_msg({"phase": "delegating"})
@@ -292,13 +310,20 @@ async def run_bot(
                     "type": "thinking",
                     "text": f"🔧 Delegating to OpenClaw: {task_desc}",
                 })
+            else:
+                # Show thinking indicator for other long-running tools
+                tool_desc = _build_tool_description(tool_name, args)
+                await _send_server_msg({"phase": "thinking"})
+                await _send_server_msg({
+                    "type": "thinking",
+                    "text": tool_desc,
+                })
 
             # ── Background path: tool executes ──
             result = await dispatch_tool(tool_name, args)
 
-            # Clear ThinkingCard phase so the LLM's next response is spoken, not swallowed
-            if tool_name == "openclaw_delegate":
-                await _send_server_msg({"phase": "done"})
+            # ── Clear ThinkingCard phase so next response is spoken ──
+            await _send_server_msg({"phase": "done"})
 
             # ── Inject wrap-up hint at soft limit ──
             if call_num >= _MAX_TOOL_CALLS_BEFORE_WARN:
