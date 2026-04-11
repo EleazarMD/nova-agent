@@ -46,7 +46,7 @@ AI_INFERENCING_ADMIN_KEY = os.environ.get("AI_INFERENCING_ADMIN_KEY", "ai-infere
 # Managed Docker containers (aligned with component-registry.json)
 MANAGED_CONTAINERS = {
     # Hermes Intelligence
-    "hermes-core",
+    "cig",
     "hermes-chromadb",
     "hermes-neo4j",
     
@@ -181,6 +181,17 @@ def _validate_container(container: str, allowlist: set[str] | None = None) -> st
 async def handle_service_status(container: str = "") -> str:
     """Get status of homelab containers. No approval needed (read-only)."""
     if container:
+        if container in ["cig", "pcg", "tesla-relay", "openclaw-browser"]:
+            import subprocess
+            try:
+                # Use --user flag for user services like openclaw-browser
+                user_flag = ["--user"] if container == "openclaw-browser" else []
+                res = subprocess.run(["systemctl"] + user_flag + ["is-active", container], capture_output=True, text=True, timeout=2)
+                st = "Up (healthy)" if res.returncode == 0 else "Exited (down)"
+                return f"{container}: {st} [systemd]"
+            except:
+                return f"{container}: unknown [systemd]"
+
         if container in PROTECTED_CONTAINERS:
             return f"{container} is a protected system container. Status check not available through this tool."
         status = await _container_status(container)
@@ -215,7 +226,19 @@ async def handle_service_status(container: str = "") -> str:
             marker = " [managed]"
         lines.append(f"- {name}: {st}{marker}")
 
-    return f"{len(lines)} containers:\n" + "\n".join(sorted(lines))
+    # Add systemd services
+    for svc in ["cig", "pcg", "tesla-relay", "openclaw-browser"]:
+        import subprocess
+        try:
+            # Use --user flag for user services like openclaw-browser
+            user_flag = ["--user"] if svc == "openclaw-browser" else []
+            res = subprocess.run(["systemctl"] + user_flag + ["is-active", svc], capture_output=True, text=True, timeout=2)
+            st = "Up (healthy)" if res.returncode == 0 else "Exited (down)"
+            lines.append(f"- {svc}: {st} [systemd]")
+        except:
+            pass
+
+    return f"{len(lines)} containers/services:\n" + "\n".join(sorted(lines))
 
 
 async def handle_service_logs(container: str, lines: int = 50) -> str:
@@ -353,6 +376,15 @@ async def handle_service_health_check(container: str = "") -> str:
     health to report email/calendar/database status alongside container state.
     """
     if container:
+        if container in ["cig", "pcg", "tesla-relay"]:
+            import subprocess
+            try:
+                res = subprocess.run(["systemctl", "is-active", container], capture_output=True, text=True, timeout=2)
+                st = "Up (healthy)" if res.returncode == 0 else "Exited (down)"
+                return f"{container}: {st} [systemd]"
+            except:
+                return f"{container}: unknown [systemd]"
+
         if container in PROTECTED_CONTAINERS:
             return f"{container} is protected. Use standard monitoring."
 
@@ -373,7 +405,7 @@ async def handle_service_health_check(container: str = "") -> str:
             parts.append(f"  Ports: {stdout.replace(chr(10), ', ')}")
 
         # If checking a Hermes container, also probe application health
-        if container == "hermes-core":
+        if container == "cig":
             hermes = await _probe_hermes_health()
             if hermes.get("reachable"):
                 comps = hermes.get("components", {})

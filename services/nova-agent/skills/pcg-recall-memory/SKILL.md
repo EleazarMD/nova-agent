@@ -4,7 +4,7 @@ tool_name: recall_memory
 description: >
   Search PCG (Personal Context Graph) for stored preferences, facts, or personal details about the user.
   Use when you need to check what you already know before asking the user.
-  Port 8765, unified PIC + KG-API + LIAM service.
+  Unified PIC + KG-API + LIAM service.
 parameters:
   type: object
   properties:
@@ -13,19 +13,7 @@ parameters:
       description: "What to look up (e.g. coffee order, kids names, work schedule, food preferences)"
     category:
       type: string
-      enum:
-        - communication
-        - work
-        - scheduling
-        - learning
-        - health
-        - social
-        - creative
-        - finance
-        - technology
-        - food
-        - family
-        - other
+      enum: [communication, work, scheduling, learning, health, social, creative, finance, technology, food, family, other]
       description: "Optional: narrow search to a specific category"
   required:
     - query

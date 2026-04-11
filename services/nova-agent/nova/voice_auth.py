@@ -236,7 +236,7 @@ def parse_voice_confirmation(
     Args:
         transcript: Voice transcript text
         expected_action: Expected action (e.g., "restart")
-        expected_target: Expected target (e.g., "hermes-core")
+        expected_target: Expected target (e.g., "cig")
         
     Returns:
         True if confirmation detected, False otherwise

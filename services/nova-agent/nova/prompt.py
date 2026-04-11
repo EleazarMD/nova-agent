@@ -258,7 +258,7 @@ def build_system_prompt(
             "**Homelab infra** (do NOT web_search for these — use the appropriate tool):\n"
             "- Email/calendar/workspace → check_studio\n"
             "- Docker containers → homelab_operations\n"
-            "- Managed containers: hermes-core, hermes-chromadb, hermes-neo4j, openclaw, "
+            "- Managed containers: cig, hermes-chromadb, hermes-neo4j, openclaw, "
             "openclaw-novnc, openclaw-inference, ai-gateway-postgres, ai-gateway-redis, "
             "ai-inferencing, comfyui, nim-embeddings, story-intelligence, story-neo4j, story-pgvector. "
             "Only report services that homelab_operations actually returns.\n\n"

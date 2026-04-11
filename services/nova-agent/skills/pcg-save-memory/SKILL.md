@@ -4,7 +4,7 @@ tool_name: save_memory
 description: >
   Save user facts, preferences, or important details to PCG (Personal Context Graph).
   Use when the user explicitly tells you something you should remember.
-  Port 8765, unified PIC + KG-API + LIAM service.
+  Unified PIC + KG-API + LIAM service.
 parameters:
   type: object
   properties:
@@ -13,23 +13,8 @@ parameters:
       description: "The fact or preference to save (natural language)"
     category:
       type: string
-      enum:
-        - communication
-        - work
-        - scheduling
-        - learning
-        - health
-        - social
-        - creative
-        - finance
-        - technology
-        - food
-        - family
-        - other
+      enum: [communication, work, scheduling, learning, health, social, creative, finance, technology, food, family, other]
       description: "Category for organizing the memory"
-    metadata:
-      type: object
-      description: "Optional metadata (source, confidence, tags)"
   required:
     - content
 ---

@@ -26,7 +26,7 @@ def generate_hermes_jwt(user_id: str | None = None, user_email: str | None = Non
     """
     jwt_secret = os.getenv("HERMES_JWT_SECRET", "uJ4+zxl0TxA+KifORrMIVZItAPEX+I9WEL9VbSkZC3k=")
     jwt_algorithm = os.getenv("HERMES_JWT_ALGORITHM", "HS256")
-    jwt_issuer = os.getenv("HERMES_JWT_ISSUER", "hermes-core")
+    jwt_issuer = os.getenv("HERMES_JWT_ISSUER", "cig")
     
     # Use provided user_id or fall back to environment/default
     # CRITICAL: Default must match the userId used during email ingestion

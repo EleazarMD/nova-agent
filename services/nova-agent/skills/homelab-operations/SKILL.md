@@ -9,7 +9,7 @@ parameters:
   properties:
     container:
       type: string
-      description: "Specific container name (e.g. 'hermes-core', 'openclaw'). Leave empty for all."
+      description: "Specific container name (e.g. 'cig', 'openclaw'). Leave empty for all."
   required: []
 ---
 
@@ -41,7 +41,7 @@ Manage Docker containers and infrastructure services with tiered safety controls
 
 ## Managed Containers
 
-- Hermes Intelligence: hermes-core, hermes-chromadb, hermes-neo4j
+- Hermes Intelligence: cig, hermes-chromadb, hermes-neo4j
 - OpenClaw: openclaw-novnc, openclaw-inference
 - PIC/PKB: pkb-api, pkb-neo4j, pkb-redis
 - AI Inferencing: ai-inferencing
@@ -52,8 +52,8 @@ Manage Docker containers and infrastructure services with tiered safety controls
 User: Check the status of all containers
 Assistant: Invoking @homelab-operations with action=status
 
-User: Show me logs from hermes-core
-Assistant: Invoking @homelab-operations with action=logs, container=hermes-core
+User: Show me logs from cig
+Assistant: Invoking @homelab-operations with action=logs, container=cig
 
 User: Restart the dashboard container
 Assistant: Invoking @homelab-operations with action=restart. This requires approval.

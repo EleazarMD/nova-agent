@@ -13,6 +13,16 @@ import json
 import os
 import aiohttp
 import jwt
+
+# Load .env file early to ensure environment variables are available
+# This handles cases where tools.py is imported before bot.py loads dotenv
+try:
+    from dotenv import load_dotenv
+    _dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if os.path.exists(_dotenv_path):
+        load_dotenv(dotenv_path=_dotenv_path, override=True)
+except Exception:
+    pass  # dotenv not available or .env doesn't exist
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
@@ -280,33 +290,7 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # PIC Memory tools are now loaded from SKILL.md files via skill_loader:
-    # - save_memory: skills/pic-save-memory/SKILL.md
-    # - recall_memory: skills/pic-recall-memory/SKILL.md
-    # - forget_memory: handled by existing handler, no SKILL.md yet
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "forget_memory",
-            "description": (
-                "Record a correction in PIC when the user says to forget something "
-                "or when a stored fact is no longer true."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {
-                        "type": "string",
-                        "description": "Keyword to match against stored memories (e.g. 'Sonos', 'morning')",
-                    },
-                },
-                "required": ["keyword"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Conversation history (not PIC - separate PostgreSQL store)
+    # Delegated tools (browser, email, calendar, shell — use for actions, not searches)
     # -------------------------------------------------------------------------
     {
         "type": "function",
@@ -520,7 +504,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "container": {
                         "type": "string",
-                        "description": "Specific container name (e.g. 'hermes-core', 'openclaw'). Leave empty for all.",
+                        "description": "Specific container name (e.g. 'cig', 'openclaw'). Leave empty for all.",
                     },
                 },
                 "required": [],
@@ -541,7 +525,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "container": {
                         "type": "string",
-                        "description": "Container name (e.g. 'hermes-core', 'openclaw')",
+                        "description": "Container name (e.g. 'cig', 'openclaw')",
                     },
                     "lines": {
                         "type": "integer",
@@ -558,7 +542,7 @@ TOOL_DEFINITIONS = [
             "name": "service_restart",
             "description": (
                 "Restart a homelab Docker container. Use for: "
-                "'restart hermes', 'hermes-core is unhealthy restart it', "
+                "'restart hermes', 'cig is unhealthy restart it', "
                 "'openclaw seems stuck'. "
                 "Auto-approved for allowlisted containers. Logged and audited."
             ),
@@ -567,7 +551,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "container": {
                         "type": "string",
-                        "description": "Container name to restart (e.g. 'hermes-core')",
+                        "description": "Container name to restart (e.g. 'cig')",
                     },
                     "intent": {
                         "type": "string",
@@ -584,7 +568,7 @@ TOOL_DEFINITIONS = [
             "name": "service_start",
             "description": (
                 "Start a stopped homelab Docker container. Use for: "
-                "'start hermes-core', 'bring up openclaw'. "
+                "'start cig', 'bring up openclaw'. "
                 "Auto-approved for allowlisted containers. Logged and audited."
             ),
             "parameters": {
@@ -592,7 +576,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "container": {
                         "type": "string",
-                        "description": "Container name to start (e.g. 'hermes-core')",
+                        "description": "Container name to start (e.g. 'cig')",
                     },
                     "intent": {
                         "type": "string",
@@ -618,7 +602,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "container": {
                         "type": "string",
-                        "description": "Container name to stop (e.g. 'hermes-core')",
+                        "description": "Container name to stop (e.g. 'cig')",
                     },
                     "intent": {
                         "type": "string",
@@ -678,7 +662,7 @@ TOOL_DEFINITIONS = [
                     },
                     "container": {
                         "type": "string",
-                        "description": "Docker container name (e.g. 'hermes-core', 'openclaw-inference'). Required for restart/start/stop/logs.",
+                        "description": "Docker container name (e.g. 'cig', 'openclaw-inference'). Required for restart/start/stop/logs.",
                     },
                     "service": {
                         "type": "string",
@@ -744,7 +728,7 @@ TOOL_DEFINITIONS = [
                     },
                     "component": {
                         "type": "string",
-                        "description": "Affected component (e.g. 'nova-agent', 'openclaw', 'hermes-core', 'dashboard')",
+                        "description": "Affected component (e.g. 'nova-agent', 'openclaw', 'cig', 'dashboard')",
                     },
                     "tags": {
                         "type": "string",
@@ -1606,10 +1590,26 @@ async def handle_openclaw_delegate(
     if AI_GATEWAY_BUDGET_OVERRIDE:
         headers["X-Budget-Override"] = AI_GATEWAY_BUDGET_OVERRIDE
 
+    # Detect if this is a web browsing task
+    task_lower = task.lower()
+    web_keywords = ['website', 'web', 'browse', 'navigate', 'go to', 'order from', 
+                    'login', 'sign in', 'cart', 'checkout', '.com', 'url', 'page',
+                    'starbucks', 'amazon', 'google', 'search for', 'fill out', 'form']
+    is_web_task = any(kw in task_lower for kw in web_keywords)
+    
     system_msg = (
         "Execute this task efficiently. Narrate your progress naturally as you work. "
         "Keep status updates brief (one sentence). Report final results concisely."
     )
+    
+    if is_web_task:
+        system_msg += (
+            "\n\n--- Browser Tools Required ---\n"
+            "This task requires web browser automation. You MUST use the web fetch/navigate tools "
+            "to interact with websites. Do NOT rely on general knowledge. "
+            "Actually navigate to the website, interact with elements, and report what you see. "
+            "If authentication is needed, explain that the user needs to sign in via the browser."
+        )
     # Inject caller identity so OpenClaw can authenticate to downstream APIs
     # Resolve real user ID: iOS sends "default" but workspace ops need the actual owner
     resolved_user_id = user_id
@@ -1803,25 +1803,25 @@ async def handle_openclaw_delegate(
 # Memory tool handlers (PIC-backed)
 # ---------------------------------------------------------------------------
 
-async def handle_save_memory(fact: str, category: str = "other") -> str:
+async def handle_save_memory(content: str, category: str = "other") -> str:
     """Save a user preference/fact to PIC as an observation."""
     from nova.pic import record_observation
     
     # Derive a short key from the fact
-    key = fact.split()[:4]  # first few words
+    key = content.split()[:4]  # first few words
     key_str = "_".join(w.lower().strip(".,!?'\"") for w in key if w.isalpha())[:40] or "user_stated"
     
     success = await record_observation(
         observation_type="preference",
         category=category,
         key=key_str,
-        value=fact,
+        value=content,
         context="User explicitly stated this during voice conversation with Nova",
     )
     if success:
-        logger.info(f"PIC save_memory OK: [{category}] {fact[:80]}")
-        return f"Saved to PIC ({category}): {fact}"
-    return f"I'll remember that for this conversation, but couldn't save to long-term memory."
+        logger.info(f"PIC save_memory OK: [{category}] {content[:80]}")
+        return f"Saved to PIC ({category}): {content}"
+    return f"I'll remember that for this conversation, but couldn't save to long-term memory."""
 
 
 async def handle_recall_memory(query: str, category: str = "") -> str:

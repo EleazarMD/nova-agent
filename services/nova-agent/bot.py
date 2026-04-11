@@ -40,7 +40,9 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.services.whisper.stt import WhisperSTTService
 from nova.qwen_tts_pipecat import QwenTTSService
 
-load_dotenv(override=True)
+import os as _os
+_dotenv_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".env")
+load_dotenv(dotenv_path=_dotenv_path, override=True)
 
 from nova.events import event_bus
 from nova.notify import create_event_handler

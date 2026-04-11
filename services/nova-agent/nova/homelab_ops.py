@@ -44,7 +44,7 @@ AI_INFERENCING_ADMIN_KEY = os.environ.get("AI_INFERENCING_ADMIN_KEY", "ai-infere
 # ---------------------------------------------------------------------------
 
 MANAGED_CONTAINERS = {
-    "hermes-core",
+    "cig",
     "hermes-chromadb",
     "hermes-neo4j",
     "openclaw",
@@ -58,6 +58,12 @@ MANAGED_CONTAINERS = {
     "story-intelligence",
     "story-neo4j",
     "story-pgvector",
+    "openclaw-browser",  # systemd user service (not Docker)
+}
+
+# Systemd user services that need --user flag
+SYSTEMD_USER_SERVICES = {
+    "openclaw-browser",
 }
 
 # Containers that should NEVER be touched by any agent
@@ -95,7 +101,18 @@ async def _docker_exec(*args: str, timeout: int = 30) -> tuple[str, str, int]:
 
 
 async def _container_exists(name: str) -> bool:
-    """Check if a container exists (running or stopped)."""
+    """Check if a container exists (running or stopped) or if it's a systemd service."""
+    # Check systemd user services first
+    if name in SYSTEMD_USER_SERVICES:
+        import subprocess
+        # Check if service exists (load-state will be 'loaded' if it exists)
+        result = subprocess.run(
+            ["systemctl", "--user", "show", name, "--property=LoadState"],
+            capture_output=True, text=True, timeout=5
+        )
+        return "loaded" in result.stdout.lower()
+    
+    # Check Docker containers
     stdout, _, rc = await _docker_exec(
         "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Names}}"
     )
@@ -103,7 +120,36 @@ async def _container_exists(name: str) -> bool:
 
 
 async def _container_status(name: str) -> dict[str, Any]:
-    """Get detailed status of a container."""
+    """Get detailed status of a container or systemd service."""
+    # Handle systemd user services
+    if name in SYSTEMD_USER_SERVICES:
+        import subprocess
+        # Check if active
+        active_result = subprocess.run(
+            ["systemctl", "--user", "is-active", name],
+            capture_output=True, text=True, timeout=5
+        )
+        state = "running" if active_result.returncode == 0 else "exited"
+        
+        # Get additional info
+        show_result = subprocess.run(
+            ["systemctl", "--user", "show", name, "--property=ActiveEnterTimestamp,LoadState"],
+            capture_output=True, text=True, timeout=5
+        )
+        started = "unknown"
+        for line in show_result.stdout.split("\n"):
+            if line.startswith("ActiveEnterTimestamp="):
+                started = line.split("=", 1)[1] if "=" in line else "unknown"
+                break
+        
+        return {
+            "state": state,
+            "health": "none",
+            "started": started,
+            "image": f"systemd-user-service:{name}"
+        }
+    
+    # Handle Docker containers
     stdout, stderr, rc = await _docker_exec(
         "inspect", "--format",
         '{"state":"{{.State.Status}}","health":"{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}","started":"{{.State.StartedAt}}","image":"{{.Config.Image}}"}',
@@ -329,7 +375,7 @@ async def handle_service_health_check(container: str = "") -> str:
             parts.append(f"  Ports: {stdout.replace(chr(10), ', ')}")
 
         # If checking a Hermes container, also probe application health
-        if container == "hermes-core":
+        if container == "cig":
             hermes = await _probe_hermes_health()
             if hermes.get("reachable"):
                 comps = hermes.get("components", {})

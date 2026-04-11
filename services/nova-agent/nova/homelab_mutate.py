@@ -23,6 +23,7 @@ from loguru import logger
 from nova.homelab_ops import (
     MANAGED_CONTAINERS,
     PROTECTED_CONTAINERS,
+    SYSTEMD_USER_SERVICES,
     _container_exists,
     _container_status,
     _docker_exec,
@@ -228,10 +229,49 @@ async def handle_service_start(
     intent: str = "",
     user_id: str = "default",
 ) -> str:
-    """Start a stopped container. Requires homelab approval (medium risk)."""
+    """Start a stopped container or systemd service. Requires homelab approval (medium risk)."""
     err = _validate_container(container)
     if err:
         return err
+    
+    # Handle systemd user services (like openclaw-browser)
+    if container in SYSTEMD_USER_SERVICES:
+        import subprocess
+        # Check if already running
+        check = subprocess.run(["systemctl", "--user", "is-active", container], capture_output=True, text=True)
+        if check.returncode == 0:
+            return f"{container} is already running."
+        
+        context = intent or f"Start {container} (currently stopped)"
+        try:
+            approval = await _request_approval(
+                tool_name="service_start",
+                arguments={"container": container, "intent": context},
+                risk_level="medium",
+                context=context,
+            )
+        except Exception as e:
+            return f"DENIED: Could not reach homelab approval engine: {e}"
+        
+        result = await _poll_approval_status(approval["id"])
+        status = result.get("status", "error")
+        if status != "approved":
+            reason = result.get("decisionReason") or result.get("reason") or status
+            return f"Start of {container} was {status}. {reason}"
+        
+        # Start the systemd user service
+        start = subprocess.run(["systemctl", "--user", "start", container], capture_output=True, text=True)
+        if start.returncode != 0:
+            return f"Start failed after approval: {start.stderr}"
+        
+        await asyncio.sleep(3)
+        verify = subprocess.run(["systemctl", "--user", "is-active", container], capture_output=True, text=True)
+        state = "running" if verify.returncode == 0 else "failed"
+        
+        logger.info(f"Service start completed (approval {approval['id']}): {container} → {state}")
+        return f"Started {container} (approved). State: {state} [systemd]"
+    
+    # Handle Docker containers
     if not await _container_exists(container):
         return f"Container '{container}' not found."
 

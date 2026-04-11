@@ -12,22 +12,27 @@ from loguru import logger
 from nova.events import Event, event_bus
 
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:8404")
-DASHBOARD_AUTH_TOKEN = os.environ.get("NOVA_AUTH_TOKEN", "")
+# Use AI_GATEWAY_API_KEY for the dashboard's X-API-Key auth (matches ecosystem-dashboard)
+DASHBOARD_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
 
 
 async def send_push(user_id: str, title: str, body: str, data: dict | None = None):
     """Send a push notification via the Dashboard APNs proxy."""
-    url = f"{DASHBOARD_URL}/api/push/send"
-    headers = {"Content-Type": "application/json"}
-    if DASHBOARD_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {DASHBOARD_AUTH_TOKEN}"
+    # Correct endpoint is /api/notifications/send (not /api/push/send)
+    url = f"{DASHBOARD_URL}/api/notifications/send"
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": DASHBOARD_API_KEY,
+    }
 
+    # Dashboard API uses camelCase field names
     payload = {
-        "user_id": user_id,
+        "userId": user_id,  # camelCase per dashboard API spec
         "title": title,
         "body": body,
         "data": data or {},
         "category": "NOVA_NOTIFICATION",
+        "priority": "high",
     }
 
     try:

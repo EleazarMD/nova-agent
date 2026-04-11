@@ -96,8 +96,8 @@ class KnowledgeGraphClient:
                 },
                 "labels": ["Service", "Voice", "AI"],
             },
-            "hermes-core": {
-                "id": "hermes-core-001",
+            "cig": {
+                "id": "cig-001",
                 "type": "Service",
                 "name": "Hermes Core",
                 "properties": {
@@ -143,7 +143,7 @@ class KnowledgeGraphClient:
                     },
                     {
                         "source_id": entity_id,
-                        "target_id": "hermes-core-001",
+                        "target_id": "cig-001",
                         "type": "USES",
                         "properties": {"purpose": "email/calendar queries"},
                     },
@@ -166,7 +166,7 @@ class KnowledgeGraphClient:
             })
         if "hermes" in query or "email" in query:
             results.append({
-                "id": "hermes-core-001",
+                "id": "cig-001",
                 "type": "Service",
                 "name": "Hermes Core",
                 "score": 0.92,
