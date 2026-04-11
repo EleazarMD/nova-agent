@@ -359,6 +359,7 @@ async def run_bot(
     # ── Tesla vehicle control (unified tool + legacy compatibility) ───────
     llm.register_function("tesla_control", make_tool_handler("tesla_control"))
     llm.register_function("tesla_stream_monitor", make_tool_handler("tesla_stream_monitor"))
+    llm.register_function("tesla_location_refresh", make_tool_handler("tesla_location_refresh"))
 
     # ── Context with history restoration ─────────────────────────────────
     messages = [{"role": "system", "content": system_prompt}]
