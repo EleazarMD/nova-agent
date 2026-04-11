@@ -356,6 +356,9 @@ async def run_bot(
     llm.register_function("service_stop", make_tool_handler("service_stop"))
     llm.register_function("service_health_check", make_tool_handler("service_health_check"))
 
+    # ── Tesla vehicle control (unified tool + legacy compatibility) ───────
+    llm.register_function("tesla_control", make_tool_handler("tesla_control"))
+
     # ── Context with history restoration ─────────────────────────────────
     messages = [{"role": "system", "content": system_prompt}]
 
