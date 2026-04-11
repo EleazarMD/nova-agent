@@ -3773,8 +3773,8 @@ TESLA_CONTROL_TOOL = {
     },
 }
 
-# Append unified Tesla tool to TOOL_DEFINITIONS
-TOOL_DEFINITIONS.append(TESLA_CONTROL_TOOL)
+# NOTE: TESLA_CONTROL_TOOL is loaded from skills/tesla-control/SKILL.md by skill_loader
+# to avoid duplication. The handler is registered at the bottom of this file.
 
 # ---------------------------------------------------------------------------
 # Legacy Tesla Tool Definitions (DEPRECATED - kept for backward compatibility)
