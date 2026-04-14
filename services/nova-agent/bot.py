@@ -58,7 +58,7 @@ from nova.tools import TOOL_DEFINITIONS, dispatch_tool, set_progress_context
 
 AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1")
 AI_GATEWAY_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
-LLM_MODEL = os.environ.get("LLM_MODEL", "minimax-m2.5")
+LLM_MODEL = os.environ.get("LLM_MODEL", "minimax-m2.7")
 
 # Tool names for prompt builder
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS if "function" in t]
@@ -200,6 +200,9 @@ async def run_bot(
         params=OpenAILLMService.InputParams(
             temperature=0.1,
             max_tokens=8192,
+            # Thinking level: low (fast initial responses), high for complex tool chains
+            # Gateway maps: low=no thinking (~85 tok/s), high=extended thinking (16K tokens)
+            extra_body={"thinking": "low"},  # Default to fast responses
         ),
         function_call_timeout_secs=600.0,  # OpenClaw tasks can take minutes
     )
