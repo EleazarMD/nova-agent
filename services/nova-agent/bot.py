@@ -207,6 +207,10 @@ async def run_bot(
         model=LLM_MODEL,
         params=OpenAILLMService.InputParams(
             temperature=0.1,
+            max_tokens=8192,
+            # Thinking level: low (fast initial responses), high for complex tool chains
+            # Gateway maps: low=no thinking (~85 tok/s), high=extended thinking (16K tokens)
+            extra_body={"thinking": "low"},  # Default to fast responses
         ),
         function_call_timeout_secs=600.0,  # OpenClaw tasks can take minutes
     )
