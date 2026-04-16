@@ -121,7 +121,7 @@ class ToolResultCache:
         "get_weather": 600,           # 10 min - weather changes slowly
         "get_time": 1,                # 1 sec - always fresh
         "check_studio": 120,          # 2 min - email/calendar reasonably stable
-        "recall_memory": 300,         # 5 min - PIC data stable
+        "recall_memory": 300,         # 5 min - PCG data stable
         "web_search": 3600,           # 1 hour - external data, expensive
         "service_status": 30,         # 30 sec - infra can change
         "service_health_check": 30,   # 30 sec
@@ -130,6 +130,16 @@ class ToolResultCache:
         "tesla_vehicle_status": 30,   # 30 sec - more dynamic
         "discover_skills": 300,       # 5 min - skill catalog stable
         "diagnose_network": 60,       # 1 min
+        "search_past_conversations": 120,  # 2 min - conversation history stable
+        "query_cig": 180,             # 3 min - CIG analytics semi-stable
+        "query_frameworks": 1800,     # 30 min - LIAM frameworks very stable
+        "homelab_diagnostics": 60,    # 1 min - infra state
+        "homelab_operations": 30,     # 30 sec - mutating but status reads cached briefly
+        "tesla_control": 60,          # 1 min - vehicle state
+        "get_reminders": 120,         # 2 min - reminders semi-stable
+        "list_timers": 30,            # 30 sec - timers change
+        "check_studio": 120,          # 2 min - email/calendar
+        "recall_memory": 300,         # 5 min - PCG preferences stable
     }
     
     # TTL bounds for adaptive learning (min/max multipliers of base TTL)

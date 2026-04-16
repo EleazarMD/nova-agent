@@ -336,9 +336,9 @@ async def chat_completions(request: Request):
         
         # Save user turn (SQLite + PostgreSQL)
         await append_turn(session.session_id, "user", user_message)
-        asyncio.create_task(_sync_message_to_backend(
+        await _sync_message_to_backend(
             conversation_id, user_id, "user", user_message
-        ))
+        )
         
         # Call AI Gateway
         response_text, tool_calls, usage = await _call_llm(
@@ -368,9 +368,9 @@ async def chat_completions(request: Request):
         
         # Save assistant turn (SQLite + PostgreSQL)
         await append_turn(session.session_id, "assistant", response_text)
-        asyncio.create_task(_sync_message_to_backend(
+        await _sync_message_to_backend(
             conversation_id, user_id, "assistant", response_text
-        ))
+        )
         
         # Return OpenAI-compatible response
         return {
@@ -438,9 +438,9 @@ async def simple_chat(req: ChatRequest):
         
         # Save user turn (SQLite + PostgreSQL)
         await append_turn(session.session_id, "user", req.message)
-        asyncio.create_task(_sync_message_to_backend(
+        await _sync_message_to_backend(
             conversation_id, req.user_id, "user", req.message
-        ))
+        )
         
         # Call AI Gateway with tools
         response_text, tool_calls, usage = await _call_llm(
@@ -474,9 +474,9 @@ async def simple_chat(req: ChatRequest):
         
         # Save assistant turn (SQLite + PostgreSQL)
         await append_turn(session.session_id, "assistant", response_text)
-        asyncio.create_task(_sync_message_to_backend(
+        await _sync_message_to_backend(
             conversation_id, req.user_id, "assistant", response_text
-        ))
+        )
         
         return ChatResponse(
             response=response_text,

@@ -1,15 +1,15 @@
 """
-OpenClaw Cache Orchestrator.
+Nova Cache Orchestrator.
 
-Exposes cache management capabilities to OpenClaw, allowing it to:
+Manages cache warming, eviction, and TTL optimization:
 1. Analyze query patterns and adjust warming schedules
 2. Make intelligent eviction decisions based on context
 3. Adjust TTLs based on cross-domain reasoning
 4. Pre-warm cache based on calendar/email analysis
 5. Provide cache health reports and recommendations
 
-This module provides an HTTP API that OpenClaw can call, plus a periodic
-analysis task that delegates pattern analysis to OpenClaw.
+This module provides an HTTP API for cache management, plus a periodic
+analysis task for pattern-driven optimization.
 """
 
 import asyncio

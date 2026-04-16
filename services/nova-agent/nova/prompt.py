@@ -1,12 +1,12 @@
 """
 Voice-optimized system prompt builder for Nova Agent.
 
-Generates a dynamic system prompt shaped by PIC (Personal Integration Core)
+Generates a dynamic system prompt shaped by PCG (Personal Context Graph)
 preferences. The user's communication style, personality traits, and personal
-context are pulled from PIC at session start and woven into the prompt so
+context are pulled from PCG at session start and woven into the prompt so
 Nova's voice naturally adapts to the user over time.
 
-PIC is the single source of truth for personal data. Nova reads/writes
+PCG is the single source of truth for personal data. Nova reads/writes
 directly; Hub agents consume PCG as downstream readers.
 """
 
@@ -67,7 +67,7 @@ def _build_personality_section(
 
     if not lines:
         return ""
-    return "## Who You're Talking To (from PIC)\n" + "\n".join(f"- {l}" for l in lines)
+    return "## Who You're Talking To (from PCG)\n" + "\n".join(f"- {l}" for l in lines)
 
 
 def build_system_prompt(
@@ -105,7 +105,24 @@ def build_system_prompt(
         "You speak naturally and concisely through iOS text-to-speech. The user talks to you by voice.\n"
         "You are warm, present, and analytically sharp. You serve the user's goals — not your own preferences.\n"
         "You help through action, not filler words. Never say you are 'text-based' — you are a voice assistant.\n"
-        "You have persistent memory across conversations via PIC (Personal Integration Core).\n\n"
+        "You have persistent memory across conversations via PCG (Personal Context Graph).\n\n"
+        "**Systems Map** (know what each system does and when to use it):\n"
+        "- **PCG** (Personal Context Graph, port 8765): Your long-term memory. Stores identity, preferences, goals, observations.\n"
+        "  READ: recall_memory → fetches preferences/identity from PCG.\n"
+        "  WRITE: save_memory → stores confirmed facts as preferences in PCG (requires user confirmation).\n"
+        "  WRITE: forget_memory → removes preferences from PCG.\n"
+        "  PCG also hosts LIAM framework data and knowledge graph.\n"
+        "- **Dashboard** (Ecosystem Dashboard, port 8404): Conversation history + analytics.\n"
+        "  READ: search_past_conversations → searches PostgreSQL + ChromaDB for past talks.\n"
+        "  All conversations are auto-synced to Dashboard for persistent history.\n"
+        "- **LIAM** (via PCG): 48 scientific frameworks across 16 life dimensions for decision-making.\n"
+        "  READ: query_frameworks → discovers relevant frameworks for any decision/problem.\n"
+        "  ALWAYS call this for decisions — never reason from memory alone.\n"
+        "- **CIG** (Communication Intelligence Graph): Email/calendar/contact analytics.\n"
+        "  READ: query_cig → urgency, patterns, relationship health.\n"
+        "  WRITE: Use hub_delegate(agent='hermes') for drafting/scheduling.\n"
+        "- **Hub Agents**: Specialized background agents (atlas=research, hermes=comms, argus=browser, infra=ops, coder=code, tesla=vehicle).\n"
+        "  Access via hub_delegate. May require push approval for sensitive actions.\n\n"
         "**LIAM (Life Intelligence Augmentation Matrix) is your reasoning engine.** You do not wait to be asked.\n"
         "Every decision, goal, or life question the user raises — you automatically call query_frameworks to\n"
         "discover the relevant scientific frameworks from LIAM's 48 frameworks across 16 life dimensions.\n"
@@ -340,9 +357,9 @@ def build_system_prompt(
             task_lines.append(f"- [{status}] {message}")
         sections.append("## Active Tasks\n" + "\n".join(task_lines))
 
-    # Memory — all PIC-sourced snippets (identity, preferences, goals)
+    # Memory — all PCG-sourced snippets (identity, preferences, goals)
     if memory_snippets:
         mem_text = "\n".join(f"- {s[:200]}" for s in memory_snippets[:15])
-        sections.append(f"## Memory (from PIC)\n{mem_text}")
+        sections.append(f"## Memory (from PCG)\n{mem_text}")
 
     return "\n\n".join(sections)

@@ -10,6 +10,7 @@ user_id, and syncs to backend for RFI retention policy.
 
 import aiohttp
 import aiosqlite
+import asyncio
 import json
 import os
 import time
@@ -202,8 +203,13 @@ async def _sync_message_to_backend(
     model: str = None,
     tokens_used: int = 0,
     tool_calls: list = None,
+    _retry: int = 0,
 ):
-    """Sync a message to PostgreSQL via Dashboard API (fire-and-forget)."""
+    """Sync a message to PostgreSQL via Dashboard API.
+    
+    Retries once on transient failures. Called via await (bot.py) or
+    asyncio.create_task (text_chat.py) — errors are logged prominently.
+    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -220,15 +226,29 @@ async def _sync_message_to_backend(
                     "tokens_used": tokens_used,
                     "tool_calls": tool_calls,
                 },
-                timeout=aiohttp.ClientTimeout(total=5),
+                timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 if resp.status in (200, 201):
-                    logger.debug(f"Synced message to backend: {conversation_id}")
+                    logger.info(f"✅ Synced {role} message to backend: {conversation_id[:16]}... ({len(content)} chars)")
                 else:
                     text = await resp.text()
+                    if _retry < 1 and resp.status >= 500:
+                        logger.warning(f"Backend sync retryable ({resp.status}), retrying: {text[:80]}")
+                        await asyncio.sleep(1)
+                        return await _sync_message_to_backend(
+                            conversation_id, user_id, role, content,
+                            model, tokens_used, tool_calls, _retry=_retry + 1,
+                        )
                     logger.warning(f"Backend sync failed: {resp.status} {text[:100]}")
     except Exception as e:
-        logger.warning(f"Backend sync error (non-fatal): {e}")
+        if _retry < 1:
+            logger.warning(f"Backend sync error, retrying: {e}")
+            await asyncio.sleep(1)
+            return await _sync_message_to_backend(
+                conversation_id, user_id, role, content,
+                model, tokens_used, tool_calls, _retry=_retry + 1,
+            )
+        logger.error(f"❌ Backend sync failed after retry: {e}")
 
 
 async def ensure_backend_conversation(
@@ -292,12 +312,15 @@ async def search_past_conversations(
     from_days: int | None = None,
     to_days: int | None = None,
 ) -> list[dict]:
-    """Search past conversations via Dashboard API.
+    """Search past conversations via Dashboard API with SQLite fallback.
     
     Time intervals:
       days_back=7          → last 7 days from now
       from_days=90, to_days=7  → between 3 months ago and 1 week ago
     """
+    results = []
+    
+    # Try Dashboard API first (PostgreSQL + ChromaDB vector search)
     try:
         params: dict = {"q": query, "limit": limit}
         if from_days is not None and to_days is not None:
@@ -318,12 +341,69 @@ async def search_past_conversations(
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("results", [])
+                    results = data.get("results", [])
                 else:
                     logger.warning(f"Conversation search failed: {resp.status}")
-                    return []
     except Exception as e:
         logger.warning(f"Conversation search error: {e}")
+    
+    # If backend returned nothing, fall back to local SQLite search
+    if not results:
+        results = await _search_local_conversations(user_id, query, days_back, limit)
+    
+    return results
+
+
+async def _search_local_conversations(
+    user_id: str,
+    query: str,
+    days_back: int,
+    limit: int,
+) -> list[dict]:
+    """Fallback: search recent conversations in local SQLite."""
+    try:
+        terms = [t.lower() for t in query.split() if len(t) >= 2]
+        if not terms:
+            return []
+        
+        cutoff = time.time() - (days_back * 86400)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            # Search turns for matching content
+            placeholders = " OR ".join(["LOWER(t.content) LIKE ?" for _ in terms])
+            params = [f"%{t}%" for t in terms]
+            
+            rows = await db.execute_fetchall(
+                f"""SELECT DISTINCT s.conversation_id, s.session_id,
+                           MIN(CASE WHEN t.role='user' THEN t.content END) as first_user_msg,
+                           COUNT(*) as match_count
+                    FROM turns t
+                    JOIN sessions s ON t.session_id = s.session_id
+                    WHERE s.user_id = ?
+                      AND t.timestamp >= ?
+                      AND ({placeholders})
+                    GROUP BY s.conversation_id
+                    ORDER BY match_count DESC, MAX(t.timestamp) DESC
+                    LIMIT ?""",
+                [user_id, cutoff] + params + [limit],
+            )
+            
+            results = []
+            for r in rows:
+                snippet = r["first_user_msg"] or ""
+                results.append({
+                    "conversation_id": r["conversation_id"],
+                    "title": f"Conversation {r['conversation_id'][:8]}",
+                    "snippet": snippet[:200],
+                    "relevance_score": min(r["match_count"] / 10.0, 1.0),
+                    "source": "sqlite_fallback",
+                })
+            
+            if results:
+                logger.info(f"Local SQLite fallback found {len(results)} conversations for '{query}'")
+            return results
+    except Exception as e:
+        logger.warning(f"Local conversation search error: {e}")
         return []
 
 

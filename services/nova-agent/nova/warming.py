@@ -114,6 +114,35 @@ class ContextualWarmingService:
         """Set up default warming schedules based on common patterns."""
         
         # =====================================================================
+        # PCG CONTEXT (Always warm — this is Nova's core memory)
+        # =====================================================================
+        
+        # Pre-warm PCG identity + preferences every 5 min (very stable, cheap)
+        self._schedules.extend([
+            WarmingSchedule(
+                name="pcg_identity",
+                tool_name="recall_memory",
+                args={"query": "user identity name roles"},
+                hours=list(range(24)),  # Every hour
+                minutes_before=0,
+            ),
+            WarmingSchedule(
+                name="pcg_preferences",
+                tool_name="recall_memory",
+                args={"query": "preferences communication work health"},
+                hours=list(range(24)),
+                minutes_before=0,
+            ),
+            WarmingSchedule(
+                name="pcg_goals",
+                tool_name="recall_memory",
+                args={"query": "goals current projects"},
+                hours=[7, 12, 18],  # 3x daily
+                minutes_before=0,
+            ),
+        ])
+        
+        # =====================================================================
         # CIRCADIAN PATTERNS (Time of Day)
         # =====================================================================
         
@@ -487,7 +516,36 @@ async def init_warming_service(dispatch_fn: Callable):
     
     _warming_service = ContextualWarmingService(dispatch_fn)
     await _warming_service.start()
+    
+    # Immediately pre-warm critical data on startup
+    await prewarm_on_startup(dispatch_fn)
+    
     return _warming_service
+
+
+async def prewarm_on_startup(dispatch_fn: Callable):
+    """Pre-warm cache with critical data immediately on service startup.
+    
+    This ensures Nova can respond instantly to basic queries without
+    waiting for the first scheduled warming cycle.
+    """
+    startup_warms = [
+        ("recall_memory", {"query": "user identity name roles"}),
+        ("recall_memory", {"query": "preferences communication work health"}),
+        ("get_weather", {"location": USER_LOCATION}),
+        ("service_health_check", {"container": "all"}),
+    ]
+    
+    logger.info(f"[Startup Pre-warm] Warming {len(startup_warms)} critical cache entries...")
+    
+    for tool_name, args in startup_warms:
+        try:
+            result = await dispatch_fn(tool_name, args)
+            logger.info(f"[Startup Pre-warm] ✅ {tool_name} cached")
+        except Exception as e:
+            logger.warning(f"[Startup Pre-warm] ❌ {tool_name} failed: {e}")
+    
+    logger.info("[Startup Pre-warm] Complete — cache ready for instant responses")
 
 
 def get_warming_service() -> Optional[ContextualWarmingService]:
