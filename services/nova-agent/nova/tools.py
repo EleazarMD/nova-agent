@@ -5,7 +5,7 @@ Tools are registered with Pipecat's LLM function calling system.
 Each tool is an OpenAI-format function definition + an async handler.
 
 Native tools: casual/fast (weather, lights, workstation, reminders)
-Delegated tools: complex tasks via OpenClaw with SSE streaming for progress
+Delegated tools: complex tasks via Pi Agent Hub with WebSocket RPC
 """
 
 import asyncio
@@ -124,8 +124,7 @@ async def _fetch_provider_key(provider: str) -> str | None:
     return None
 
 # Environment configuration
-OPENCLAW_URL = os.environ.get("OPENCLAW_URL", "http://127.0.0.1:18793")
-OPENCLAW_TOKEN = os.environ.get("OPENCLAW_TOKEN", "")
+# OpenClaw removed — all delegation now goes through hub_delegate
 AI_GATEWAY_BUDGET_OVERRIDE = os.environ.get("AI_GATEWAY_BUDGET_OVERRIDE", "")
 WORKSTATION_MONITOR_URL = os.environ.get("WORKSTATION_MONITOR_URL", "http://localhost:8404")
 NETDIAG_URL = os.environ.get("NETDIAG_URL", "http://localhost:8405")
@@ -254,46 +253,6 @@ TOOL_DEFINITIONS = [
     # (see _merge_skill_definitions)
     # -------------------------------------------------------------------------
     # -------------------------------------------------------------------------
-    # Delegated tools (browser, email, calendar, shell — use for actions, not searches)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "openclaw_delegate",
-            "description": (
-                "Execute complex, long-horizon tasks via OpenClaw. Use for ACTIONS: "
-                "buying tickets, making reservations, placing orders, booking appointments, "
-                "searching/sending emails, creating calendar events, "
-                "running shell commands, editing files, filling out web forms. "
-                "Also use for STUDIO JOBS that create or generate content: "
-                "'start a deep research on X' → Deep Research Studio (multi-step analysis, comprehensive reports), "
-                "'create a podcast about X' → Podcast Studio, "
-                "'generate an image of X' → Image Studio, "
-                "'write a news story about X' → News Studio, "
-                "'draft an email to X' → Email (via browser). "
-                "IMPORTANT: Nova handles ALL web searches directly via web_search (both fast and deep modes). "
-                "Only delegate to OpenClaw for long-horizon deep research requiring multi-step analysis, "
-                "synthesis, and comprehensive reporting beyond simple web queries. "
-                "For READING results (status, summaries, calendar), use check_studio — it's instant. "
-                "Describe the task clearly — OpenClaw will execute and stream progress back."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "Specific task to execute, including all relevant details (dates, names, locations, preferences)",
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "Background context from the conversation that helps OpenClaw understand the request",
-                    },
-                },
-                "required": ["task"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
     # Hub Agent Delegation (Pi Agent Hub — specialized background agents)
     # -------------------------------------------------------------------------
     {
@@ -413,20 +372,20 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # Studio quick-reads (direct dashboard API, no OpenClaw needed)
+    # Studio quick-reads (direct dashboard API)
     # -------------------------------------------------------------------------
     {
         "type": "function",
         "function": {
             "name": "check_studio",
             "description": (
-                "Quickly read status or results from homelab studios WITHOUT going through OpenClaw. "
+                "Quickly read status or results from homelab studios. "
                 "Use for fast lookups: 'what's on my calendar', 'check research status', "
                 "'how's the podcast coming', 'any new news stories', 'show recent research', "
                 "'give me my daily briefing', 'any emails need attention'. "
                 "Calendar supports: events (today/tomorrow/this_week), briefing, intelligence. "
                 "Email supports: briefing with action items, contact highlights, metrics, attachment reading. "
-                "For CREATING or GENERATING content, use openclaw_delegate instead."
+                "For CREATING or GENERATING content, use hub_delegate(agent='hermes') or hub_delegate(agent='argus') instead."
             ),
             "parameters": {
                 "type": "object",
@@ -455,7 +414,7 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # Skill Discovery (dynamic skill catalog from OpenClaw)
+    # Skill Discovery (dynamic skill catalog)
     # -------------------------------------------------------------------------
     {
         "type": "function",
@@ -546,7 +505,7 @@ TOOL_DEFINITIONS = [
                 "Set, list, or cancel timers and alarms. Timers fire a push notification when done. "
                 "Use for: 'set a 5 minute timer', 'timer for 30 minutes', 'remind me in 1 hour', "
                 "'cancel my timer', 'what timers are running'. "
-                "For calendar-based reminders at specific times, use openclaw_delegate instead."
+                "For calendar-based reminders at specific times, use hub_delegate(agent='hermes', method='calendar-briefing') instead."
             ),
             "parameters": {
                 "type": "object",
@@ -583,14 +542,14 @@ TOOL_DEFINITIONS = [
             "description": (
                 "Get status of homelab Docker containers. Use for: "
                 "'is hermes running', 'what containers are up', 'docker status', "
-                "'check if openclaw is healthy'. Read-only, no approval needed."
+                "'check if argus is healthy'. Read-only, no approval needed."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "container": {
                         "type": "string",
-                        "description": "Specific container name (e.g. 'cig', 'openclaw'). Leave empty for all.",
+                        "description": "Specific container name (e.g. 'cig', 'argus'). Leave empty for all.",
                     },
                 },
                 "required": [],
@@ -603,7 +562,7 @@ TOOL_DEFINITIONS = [
             "name": "service_logs",
             "description": (
                 "Get recent logs from a homelab Docker container. Use for: "
-                "'show hermes logs', 'what errors in openclaw', 'why did the container crash'. "
+                "'show hermes logs', 'what errors in argus', 'why did the container crash'. "
                 "Read-only, no approval needed."
             ),
             "parameters": {
@@ -611,7 +570,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "container": {
                         "type": "string",
-                        "description": "Container name (e.g. 'cig', 'openclaw')",
+                        "description": "Container name (e.g. 'cig', 'argus')",
                     },
                     "lines": {
                         "type": "integer",
@@ -628,8 +587,7 @@ TOOL_DEFINITIONS = [
             "name": "service_restart",
             "description": (
                 "Restart a homelab Docker container. Use for: "
-                "'restart hermes', 'cig is unhealthy restart it', "
-                "'openclaw seems stuck'. "
+                "'restart hermes', 'cig is unhealthy restart it', 'argus seems stuck'. "
                 "Auto-approved for allowlisted containers. Logged and audited."
             ),
             "parameters": {
@@ -654,7 +612,7 @@ TOOL_DEFINITIONS = [
             "name": "service_start",
             "description": (
                 "Start a stopped homelab Docker container. Use for: "
-                "'start cig', 'bring up openclaw'. "
+                "'start cig', 'bring up argus'. "
                 "Auto-approved for allowlisted containers. Logged and audited."
             ),
             "parameters": {
@@ -734,7 +692,7 @@ TOOL_DEFINITIONS = [
                 "Manage homelab Docker containers and systemd services with approval gating. "
                 "Unified tool for all infrastructure operations — read-only actions need no approval, "
                 "mutating actions (restart/start/stop) require user approval via Dashboard or iOS. "
-                "Use for: 'restart hermes', 'check status of openclaw', 'get logs from container', "
+                "Use for: 'restart hermes', 'check status of argus', 'get logs from container', "
                 "'health check all services', 'start/stop containers'. "
                 "Read-only actions: status, logs, health_check. Mutating actions: restart, start, stop."
             ),
@@ -748,11 +706,11 @@ TOOL_DEFINITIONS = [
                     },
                     "container": {
                         "type": "string",
-                        "description": "Docker container name (e.g. 'cig', 'openclaw-inference'). Required for restart/start/stop/logs.",
+                        "description": "Docker container name (e.g. 'cig', 'argus'). Required for restart/start/stop/logs.",
                     },
                     "service": {
                         "type": "string",
-                        "description": "Systemd service name (e.g. 'openclaw-gateway.service'). Alternative to container for restart/start/stop.",
+                        "description": "Systemd service name (e.g. 'pi-agent-hub.service'). Alternative to container for restart/start/stop.",
                     },
                     "lines": {
                         "type": "integer",
@@ -764,7 +722,7 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # Ticket tracker (homelab issue tracking — Nova creates, OpenClaw/Windsurf fix)
+    # Ticket tracker (homelab issue tracking — Nova creates, Coder/Windsurf fix)
     # -------------------------------------------------------------------------
     {
         "type": "function",
@@ -774,8 +732,8 @@ TOOL_DEFINITIONS = [
                 "Create, list, read, update, or delegate tickets in the homelab ticket tracker. "
                 "Use this when you encounter bugs, issues, or feature gaps during conversations. "
                 "Actions: create (new ticket), list (browse tickets), get (full detail), "
-                "update (change status/priority/analysis), delegate (assign to openclaw or windsurf). "
-                "OpenClaw handles minor code fixes (with approval). Windsurf handles structural work."
+                "update (change status/priority/analysis), delegate (assign to Coder or Windsurf). "
+                "Coder agent handles minor code fixes (with approval). Windsurf handles structural work."
             ),
             "parameters": {
                 "type": "object",
@@ -814,7 +772,7 @@ TOOL_DEFINITIONS = [
                     },
                     "component": {
                         "type": "string",
-                        "description": "Affected component (e.g. 'nova-agent', 'openclaw', 'cig', 'dashboard')",
+                        "description": "Affected component (e.g. 'nova-agent', 'argus', 'cig', 'dashboard')",
                     },
                     "tags": {
                         "type": "string",
@@ -831,12 +789,12 @@ TOOL_DEFINITIONS = [
                     },
                     "assigned_to": {
                         "type": "string",
-                        "description": "Assign to agent: 'openclaw', 'windsurf', or user (for update/create)",
+                        "description": "Assign to agent: 'coder', 'windsurf', or user (for update/create)",
                     },
                     "delegate_to": {
                         "type": "string",
-                        "enum": ["openclaw", "windsurf"],
-                        "description": "Delegate ticket to OpenClaw (minor fixes) or Windsurf (structural) (for delegate)",
+                        "enum": ["coder", "windsurf"],
+                        "description": "Delegate ticket to Coder (minor fixes) or Windsurf (structural) (for delegate)",
                     },
                     "analysis": {
                         "type": "string",
@@ -864,7 +822,7 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # Workspace management (fast direct API calls, no OpenClaw needed)
+    # Workspace management (fast direct API calls)
     # -------------------------------------------------------------------------
     {
         "type": "function",
@@ -872,7 +830,7 @@ TOOL_DEFINITIONS = [
             "name": "manage_workspace",
             "description": (
                 "Manage workspace pages, permissions, share links, and AI templates. "
-                "Fast operations (~10-50ms) that don't need OpenClaw. "
+                "Fast operations (~10-50ms). "
                 "Actions: "
                 "generate_template (create page structure from description), "
                 "infer_schema (suggest database columns), "
@@ -880,7 +838,7 @@ TOOL_DEFINITIONS = [
                 "revoke_permission (remove access), "
                 "create_share_link (public link), "
                 "list_permissions, list_share_links. "
-                "For creating/editing actual page CONTENT, use openclaw_delegate instead."
+                "For creating/editing actual page CONTENT, use hub_delegate(agent='argus') instead."
             ),
             "parameters": {
                 "type": "object",
@@ -1587,343 +1545,6 @@ def set_web_search_agent_mode(mode: str):
     """
     _ws_set_agent_mode(mode)
     logger.info(f"Web search skill agent mode set to: {mode}")
-
-
-# ---------------------------------------------------------------------------
-# SSE Streaming OpenClaw Delegation with Progress Updates
-# ---------------------------------------------------------------------------
-
-async def handle_openclaw_delegate(
-    task: str,
-    context: str = "",
-    progress_callback: Optional[Callable[[str, str], None]] = None,
-    user_id: Optional[str] = None,
-) -> str:
-    """
-    Delegate a task to OpenClaw with SSE streaming for progress updates.
-    
-    - Streams SSE events from OpenClaw
-    - Calls progress_callback with (status_type, message) for each update
-    - If user is inactive (phone locked), sends push notifications instead
-    """
-    from nova.push import is_user_active, send_push
-    
-    if not OPENCLAW_TOKEN:
-        return "OpenClaw delegation not configured."
-
-    # ── Skill enrichment gate ─────────────────────────────────────────────
-    # Auto-fetch skill catalog and match task to a known skill so OpenClaw
-    # always receives structured execution instructions, even if the LLM
-    # skipped discover_skills.
-    skill_context = ""
-    try:
-        import time as _time
-        now = _time.time()
-        if not _skill_cache.get("data") or (now - _skill_cache.get("fetched_at", 0)) >= _SKILL_CACHE_TTL:
-            async with aiohttp.ClientSession() as _sess:
-                async with _sess.get(
-                    f"{SKILL_DISCOVERY_URL}/api/v1/skills",
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as _resp:
-                    _skill_cache["data"] = await _resp.json()
-                    _skill_cache["fetched_at"] = now
-
-        catalog = _skill_cache.get("data", {})
-        task_lower = task.lower()
-        matched_skill = None
-        for skill in catalog.get("active", []) + catalog.get("available", []):
-            triggers = skill.get("triggers", [])
-            name = skill.get("name", "")
-            desc = (skill.get("description") or "").lower()
-            if any(t.lower() in task_lower for t in triggers if t):
-                matched_skill = skill
-                break
-            if name.replace("_", " ").replace("-", " ") in task_lower:
-                matched_skill = skill
-                break
-            # keyword match on description fragments
-            keywords = [w for w in desc.split() if len(w) > 4][:6]
-            if sum(1 for kw in keywords if kw in task_lower) >= 2:
-                matched_skill = skill
-                break
-
-        if matched_skill:
-            parts = [f"\n\n--- Matched Skill: {matched_skill['name']} ---"]
-            if matched_skill.get("description"):
-                parts.append(f"Description: {matched_skill['description']}")
-            ri = matched_skill.get("required_inputs")
-            if ri and isinstance(ri, dict):
-                for action, fields in ri.items():
-                    if isinstance(fields, dict):
-                        field_list = ", ".join(f"{k}: {v}" for k, v in fields.items())
-                    elif isinstance(fields, list):
-                        field_list = ", ".join(str(f) for f in fields)
-                    else:
-                        field_list = str(fields)
-                    parts.append(f"Required inputs for '{action}': {field_list}")
-            if matched_skill.get("gather_requirements"):
-                parts.append(f"Pre-requisites: {matched_skill['gather_requirements'][:300]}")
-            skill_context = "\n".join(parts)
-            logger.info(f"openclaw_delegate: auto-matched skill '{matched_skill['name']}' for task")
-    except Exception as e:
-        logger.debug(f"Skill enrichment lookup failed (non-fatal): {e}")
-
-    url = f"{OPENCLAW_URL}/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENCLAW_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    if AI_GATEWAY_BUDGET_OVERRIDE:
-        headers["X-Budget-Override"] = AI_GATEWAY_BUDGET_OVERRIDE
-
-    # Detect if this is a web browsing task
-    task_lower = task.lower()
-    web_keywords = ['website', 'web', 'browse', 'navigate', 'go to', 'order from', 
-                    'login', 'sign in', 'cart', 'checkout', '.com', 'url', 'page',
-                    'starbucks', 'amazon', 'google', 'search for', 'fill out', 'form']
-    is_web_task = any(kw in task_lower for kw in web_keywords)
-    
-    system_msg = (
-        "Execute this task efficiently. Narrate your progress naturally as you work. "
-        "Keep status updates brief (one sentence). Report final results concisely."
-    )
-    
-    if is_web_task:
-        system_msg += (
-            "\n\n--- Browser Automation Rules (MANDATORY) ---\n"
-            "This task requires web browser automation. You MUST use the browser tool to interact with websites.\n"
-            "Do NOT rely on general knowledge — actually navigate and report what you see.\n\n"
-            "TAB MANAGEMENT:\n"
-            "1. First check existing tabs: browser(action=tabs)\n"
-            "2. Reuse existing tabs: browser(action=navigate, targetUrl=..., targetId=<from tabs>)\n"
-            "3. ONLY open new tabs when comparing pages: browser(action=open, targetUrl=...)\n"
-            "4. After snapshot/act, ALWAYS pass the returned targetId in subsequent calls\n"
-            "5. Close unused tabs when done: browser(action=close, targetId=...)\n"
-            "6. NEVER open more than 3 tabs simultaneously\n\n"
-            "VERIFICATION & ESCALATION:\n"
-            "1. If you encounter an anti-bot challenge (CAPTCHA, Cloudflare, reCAPTCHA, hCaptcha, bot detection), "
-            "STOP immediately. Do NOT attempt to solve it.\n"
-            "2. If you are confused about what to click, or the page looks unexpected, STOP and ask for guidance.\n"
-            "3. If a form has ambiguous fields or you are unsure what to enter, ask rather than guessing.\n"
-            "4. When escalating, tell the user: (a) what you were trying to do, (b) what blocked you, "
-            "(c) they can view/interact with the browser via the noVNC viewer.\n"
-            "5. The noVNC viewer runs 24/7: https://rtx-workstation.tailb64e64.ts.net:6081/vnc.html?autoconnect=1&resize=remote\n"
-            "6. After the user intervenes, take a new snapshot before continuing.\n\n"
-            "AUTHENTICATION:\n"
-            "If a site requires login, tell the user to sign in via the noVNC viewer above. "
-            "Wait for them to confirm, then take a snapshot to verify the authenticated state before proceeding."
-        )
-    # Inject caller identity so OpenClaw can authenticate to downstream APIs
-    # Resolve real user ID: iOS sends "default" but workspace ops need the actual owner
-    resolved_user_id = user_id
-    if not user_id or user_id == "default":
-        resolved_user_id = ECOSYSTEM_USER_ID
-    if resolved_user_id:
-        system_msg += (
-            f"\n\n--- Caller Identity ---\n"
-            f"User ID: {resolved_user_id}\n"
-            f"When making API calls that require authentication headers, use:\n"
-            f"  X-User-Id: {resolved_user_id}\n"
-            f"  X-Internal-Service-Key: $INTERNAL_SERVICE_KEY (from environment)\n"
-            f"All workspace operations MUST use this user_id. Do NOT use hardcoded or default user IDs.\n"
-            f"The user's primary workspace is 'Dr. Eleazar\\'s Workspace' (ID: 36e84af0-e52b-4bed-9a8f-01797e20792a)."
-        )
-    if context:
-        system_msg += f"\n\nContext from conversation:\n{context}"
-    if skill_context:
-        system_msg += skill_context
-
-    body = {
-        "model": "openclaw",
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": task},
-        ],
-        "stream": True,
-        "stream_options": {
-            "channels": ["spoken"],
-            "format": "openclaw.v1",
-        },
-    }
-
-    final_result = ""
-    spoken_result = ""  # Track spoken channel separately to avoid doubling
-    last_status = ""
-    has_spoken_channel = False  # If OpenClaw sends spoken deltas, prefer those over choices
-    last_activity = asyncio.get_event_loop().time()
-    heartbeat_task = None
-
-    async def _heartbeat():
-        """Send periodic 'still working' messages during long silences."""
-        nonlocal last_activity
-        _msgs = [
-            "Still working on it...",
-            "Almost there...",
-            "Still searching...",
-            "Hang tight, still processing...",
-        ]
-        idx = 0
-        while True:
-            await asyncio.sleep(8)
-            elapsed = asyncio.get_event_loop().time() - last_activity
-            if elapsed >= 7 and progress_callback:
-                msg = _msgs[idx % len(_msgs)]
-                idx += 1
-                try:
-                    await progress_callback("status", msg)
-                except Exception:
-                    pass
-    
-    try:
-        heartbeat_task = asyncio.create_task(_heartbeat())
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    return f"OpenClaw returned HTTP {resp.status}: {text[:200]}"
-
-                # Parse SSE stream line-by-line
-                async for line in resp.content:
-                    line_str = line.decode("utf-8").strip()
-                    if not line_str or line_str.startswith(":"):
-                        continue
-                    if not line_str.startswith("data: "):
-                        continue
-                    
-                    data_str = line_str[6:]  # Remove "data: " prefix
-                    if data_str == "[DONE]":
-                        break
-                    
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    
-                    event_type = data.get("type", "")
-                    last_activity = asyncio.get_event_loop().time()
-                    
-                    # Handle OpenClaw status events → ThinkingCard + phase label
-                    if event_type == "openclaw.status":
-                        phase = data.get("phase", "")
-                        tool_name = data.get("tool", "")
-                        phase_label = None  # If set, also send {phase: ...}
-                        
-                        if phase == "tool_start" and tool_name:
-                            thinking_msg = f"🔧 Using {tool_name}"
-                            phase_label = "tool_call"
-                        elif phase == "tool_complete" and tool_name:
-                            thinking_msg = f"✅ Finished {tool_name}"
-                            phase_label = "thinking"
-                        elif phase == "thinking":
-                            thinking_msg = "💭 Analyzing results..."
-                            phase_label = "thinking"
-                        elif phase == "delegating":
-                            thinking_msg = "🔄 Working on it..."
-                            phase_label = "delegating"
-                        else:
-                            continue
-                        
-                        # Avoid duplicate status messages
-                        if thinking_msg == last_status:
-                            continue
-                        last_status = thinking_msg
-                        logger.info(f"OpenClaw progress: {thinking_msg}")
-                        
-                        if progress_callback:
-                            # Update phase label on ThinkingCard
-                            if phase_label:
-                                await progress_callback("phase", phase_label)
-                            # Append thinking content to ThinkingCard
-                            await progress_callback("thinking", thinking_msg)
-                    
-                    # Handle spoken channel deltas (narration from OpenClaw)
-                    elif event_type == "openclaw.channel.delta":
-                        channel = data.get("channel", "")
-                        delta = data.get("delta", "")
-                        
-                        if channel == "spoken" and delta:
-                            has_spoken_channel = True
-                            spoken_result += delta
-                            
-                            # Stream narration to user if active
-                            if progress_callback:
-                                await progress_callback("narration", delta)
-                    
-                    # Handle standard OpenAI-style content deltas
-                    # Only use if we haven't received spoken channel data (avoid doubling)
-                    elif "choices" in data and not has_spoken_channel:
-                        choices = data.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                final_result += content
-                    
-                    # Handle approval requests
-                    if event_type == "openclaw.approval_required":
-                        desc = data.get("description", "Action needs approval")
-                        if user_id:
-                            await send_push(
-                                user_id=user_id,
-                                title="Approval Needed",
-                                body=desc,
-                                data={"type": "approval_request", "action_id": data.get("action_id")},
-                            )
-                        return f"I need your approval: {desc}. Check your notifications."
-                    
-                    # Handle browser verification/escalation requests (anti-bot, CAPTCHA, confusion)
-                    if event_type == "openclaw.browser_verification_needed":
-                        reason = data.get("reason", "Browser interaction requires your attention")
-                        site = data.get("site", "the website")
-                        novnc_url = "https://rtx-workstation.tailb64e64.ts.net:6081/vnc.html?autoconnect=1&resize=remote"
-                        if user_id:
-                            await send_push(
-                                user_id=user_id,
-                                title="Browser Needs You",
-                                body=f"{reason} on {site}. Open noVNC to intervene.",
-                                data={
-                                    "type": "browser_verification",
-                                    "reason": reason,
-                                    "site": site,
-                                    "novnc_url": novnc_url,
-                                    "url": novnc_url,
-                                },
-                            )
-                        return (
-                            f"I need your help: {reason} on {site}. "
-                            f"Please view/interact with the browser at {novnc_url} "
-                            f"and let me know when you've resolved it."
-                        )
-
-        # Prefer spoken channel result if available (avoids doubling)
-        result = (spoken_result if has_spoken_channel else final_result).strip()
-        
-        # Task complete - send push if user inactive
-        if user_id and not is_user_active(user_id) and result:
-            summary = result[:100] + "..." if len(result) > 100 else result
-            await send_push(
-                user_id=user_id,
-                title="Task Complete",
-                body=summary,
-                data={"type": "task_complete", "task": task[:50]},
-            )
-        
-        return result or "Task completed."
-        
-    except asyncio.TimeoutError:
-        return "Task timed out after 10 minutes."
-    except Exception as e:
-        logger.error(f"OpenClaw delegation error: {e}")
-        return f"Delegation error: {str(e)}"
-    finally:
-        if heartbeat_task:
-            heartbeat_task.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -3230,7 +2851,7 @@ async def handle_check_studio(
 
 
 # ---------------------------------------------------------------------------
-# Skill Discovery handler (queries OpenClaw Skill Discovery API)
+# Skill Discovery handler (queries Skill Discovery API)
 # ---------------------------------------------------------------------------
 
 _skill_cache: dict[str, Any] = {}  # {"data": ..., "fetched_at": float}
@@ -3622,7 +3243,7 @@ async def handle_manage_ticket(
     source_context: str = "",
     status: str = "",
     assigned_to: str = "",
-    delegate_to: str = "openclaw",
+    delegate_to: str = "coder",
     analysis: str = "",
     proposed_fix: str = "",
     resolution: str = "",
@@ -3978,7 +3599,6 @@ TOOL_HANDLERS = {
     "forget_memory": handle_forget_memory,
     "search_past_conversations": handle_search_past_conversations,
     # Delegated (actions requiring browser/email/calendar/shell)
-    "openclaw_delegate": handle_openclaw_delegate,
     # Hub Agent delegation (Pi Agent Hub background agents)
     "hub_delegate": handle_hub_delegate,
     # CIG analytics (Communication Intelligence Graph)
@@ -4050,7 +3670,6 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         "service_restart", "service_start", "service_stop",  # Mutating (legacy)
         "homelab_operations",  # Mutating actions (restart/start/stop)
         "save_memory", "forget_memory",  # Mutating PIC
-        "openclaw_delegate",  # Long-running, unique tasks
         "hub_delegate",  # Long-running, approval-gated Hub tasks
         "query_cig",  # User-specific CIG analytics
         "set_reminder", "manage_timer",  # Mutating
@@ -4070,8 +3689,8 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
             return cached_result
     
     try:
-        # Inject progress context for openclaw_delegate
-        if name == "openclaw_delegate":
+        # Inject progress context for hub_delegate
+        if name == "hub_delegate":
             args["progress_callback"] = _current_progress_callback
             args["user_id"] = _current_user_id
         
@@ -4487,8 +4106,8 @@ async def handle_homelab_diagnostics(**kwargs) -> dict:
     # Call the skill's full_diagnostics function
     if action == "full_diagnostics":
         return await _diagnostics.full_diagnostics()
-    elif action == "openclaw_health":
-        return await _diagnostics.check_openclaw_health()
+    elif action == "argus_health":
+        return await _diagnostics.check_argus_health()
     elif action == "ai_inferencing_health":
         return await _diagnostics.check_ai_inferencing_health()
     elif action == "hermes_health":
@@ -4496,7 +4115,7 @@ async def handle_homelab_diagnostics(**kwargs) -> dict:
     elif action == "hermy_score":
         # For hermy_score, we need to gather components first
         components = {
-            "openclaw": await _diagnostics.check_openclaw_health(),
+            "argus": await _diagnostics.check_argus_health(),
             "ai_inferencing": await _diagnostics.check_ai_inferencing_health(),
             "hermes_core": await _diagnostics.check_hermes_health()
         }
@@ -4509,14 +4128,14 @@ HOMELAB_DIAGNOSTICS_TOOL = {
     "type": "function",
     "function": {
         "name": "homelab_diagnostics",
-        "description": "Run comprehensive AI Homelab infrastructure diagnostics. Check OpenClaw status, AI Inferencing health, Hermes Core connectivity, and calculate Hermy score (overall health 0-100). Use for system health queries, error investigations, or component status checks.",
+        "description": "Run comprehensive AI Homelab infrastructure diagnostics. Check Argus status, AI Inferencing health, Hermes Core connectivity, and calculate Hermy score (overall health 0-100). Use for system health queries, error investigations, or component status checks.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["full_diagnostics", "openclaw_health", "ai_inferencing_health", "hermes_health", "hermy_score"],
-                    "description": "Diagnostic action: full_diagnostics (complete report), openclaw_health (gateway status), ai_inferencing_health (key vault), hermes_health (email/calendar), hermy_score (0-100 health score)",
+                    "enum": ["full_diagnostics", "argus_health", "ai_inferencing_health", "hermes_health", "hermy_score"],
+                    "description": "Diagnostic action: full_diagnostics (complete report), argus_health (browser agent status), ai_inferencing_health (key vault), hermes_health (email/calendar), hermy_score (0-100 health score)",
                 },
             },
             "required": ["action"],

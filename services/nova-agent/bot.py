@@ -212,7 +212,7 @@ async def run_bot(
             # Gateway maps: low=no thinking (~85 tok/s), high=extended thinking (16K tokens)
             extra_body={"thinking": "low"},  # Default to fast responses
         ),
-        function_call_timeout_secs=600.0,  # OpenClaw tasks can take minutes
+        function_call_timeout_secs=600.0,  # Hub delegation tasks can take minutes
     )
 
     # Register tool handlers (Pipecat 0.0.104 FunctionCallParams API)
@@ -236,7 +236,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"openclaw_delegate", "hub_delegate", "web_search", "query_cig", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -246,26 +246,21 @@ async def run_bot(
     _MAX_TOOL_CALLS_BEFORE_WARN = 6
     _MAX_TOOL_CALLS_HARD_LIMIT = 10
     # Track recent tool calls to detect duplicates
-    # Note: openclaw_delegate is excluded from dedup because each delegation
+    # Note: hub_delegate is excluded from dedup because each delegation
     # is a unique long-running task — even if args look similar, the context
-    # and browser state differ between calls.
-    _DEDUP_EXCLUDED_TOOLS = {"openclaw_delegate", "hub_delegate"}
+    # and state differ between calls.
+    _DEDUP_EXCLUDED_TOOLS = {"hub_delegate"}
     _last_tool_call: dict = {"name": None, "args": None, "result": None}
 
     def _build_spoken_ack(tool_name: str, args: dict) -> str | None:
         """Generate a contextual spoken acknowledgment from tool name + args.
         Returns None for fast tools that don't need an ack."""
-        if tool_name == "openclaw_delegate":
-            task = args.get("task", "")[:80]
-            if task:
-                return f"On it — {task.rstrip('.')}."
-            return "Working on that for you."
-        elif tool_name == "hub_delegate":
+        if tool_name == "hub_delegate":
             agent = args.get("agent", "")
             method = args.get("method", "")
             if agent:
-                return f"Delegating to {agent} — {method}."
-            return "Delegating to background agent."
+                return f"On it — delegating to {agent} for {method}."
+            return "Working on that for you."
         elif tool_name == "web_search":
             query = args.get("query", "")[:60]
             if query:
@@ -276,7 +271,6 @@ async def run_bot(
     def _build_thinking_text(tool_name: str, args: dict) -> str:
         """Generate a thinking description for the UI progress indicator."""
         desc_map = {
-            "openclaw_delegate": f"🔧 Delegating to OpenClaw: {args.get('task', '')[:80]}...",
             "hub_delegate": f"🔧 Delegating to {args.get('agent', 'Hub')} agent: {args.get('method', '')}...",
             "query_cig": f"📊 Querying CIG {args.get('domain', 'analytics')} analytics...",
             "tesla_control": "Checking Tesla vehicle status...",
@@ -354,7 +348,6 @@ async def run_bot(
                 import asyncio
                 # Slow delegation tools need much longer timeouts
                 _SLOW_TOOL_TIMEOUTS = {
-                    "openclaw_delegate": 600,   # 10 min — OpenClaw tasks can be long
                     "hub_delegate": 300,        # 5 min — Hub RPC with approval flow
                     "web_search": 30,           # 30s — Perplexity Sonar
                     "service_status": 30,       # 30s — Docker API
@@ -423,14 +416,13 @@ async def run_bot(
     llm.register_function("recall_memory", make_tool_handler("recall_memory"))
     llm.register_function("forget_memory", make_tool_handler("forget_memory"))
     # Delegated (actions requiring browser/email/calendar/shell)
-    llm.register_function("openclaw_delegate", make_tool_handler("openclaw_delegate"))
     # Hub Agent delegation (Pi Agent Hub background agents)
     llm.register_function("hub_delegate", make_tool_handler("hub_delegate"))
     # CIG analytics (Communication Intelligence Graph)
     llm.register_function("query_cig", make_tool_handler("query_cig"))
     # Studio quick-reads (direct dashboard API)
     llm.register_function("check_studio", make_tool_handler("check_studio"))
-    # Skill discovery (dynamic skill catalog from OpenClaw)
+    # Skill discovery (dynamic skill catalog)
     llm.register_function("discover_skills", make_tool_handler("discover_skills"))
     # Network diagnostics
     llm.register_function("diagnose_network", make_tool_handler("diagnose_network"))
@@ -532,7 +524,7 @@ async def run_bot(
         # Matches patterns like: [web_search query="..."], [get_weather location="..."]
         _TOOL_CALL_TEXT_RE = _re.compile(
             r'\[(?:web_search|get_weather|check_studio|recall_memory|save_memory|forget_memory'
-            r'|control_lights|get_workstation_status|set_reminder|openclaw_delegate'
+            r'|control_lights|get_workstation_status|set_reminder|hub_delegate'
             r'|search_past_conversations|discover_skills|diagnose_network|get_time'
             r'|manage_timer|manage_ticket|manage_workspace|manage_notes|exomind'
             r'|service_status|service_logs|service_restart|service_start|service_stop'
@@ -618,7 +610,7 @@ async def run_bot(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        # Don't kill the connection during long tool calls (OpenClaw can take 30-60s).
+        # Don't kill the connection during long tool calls (Hub delegation can take 30-60s).
         # The idle observer only watches BotSpeaking/UserSpeaking frames, which aren't
         # emitted during tool execution, so it fires prematurely.
         cancel_on_idle_timeout=False,
@@ -627,7 +619,7 @@ async def run_bot(
             # onLLMFunctionCallStarted / InProgress / Stopped callbacks
             function_call_report_level={
                 "*": RTVIFunctionCallReportLevel.NAME,
-                "openclaw_delegate": RTVIFunctionCallReportLevel.FULL,
+                "hub_delegate": RTVIFunctionCallReportLevel.FULL,
             },
         ),
     )
@@ -733,9 +725,9 @@ async def run_bot(
     # Event bus: proactive notifications while user is connected
     event_handler = create_event_handler(task, user_id)
 
-    # Progress callback for OpenClaw streaming updates
-    async def on_openclaw_progress(status_type: str, message: str):
-        """Send OpenClaw progress to iOS ThinkingCard via server messages.
+    # Progress callback for Hub delegation streaming updates
+    async def on_hub_progress(status_type: str, message: str):
+        """Send Hub delegation progress to iOS ThinkingCard via server messages.
         
         Uses custom message types so they don't pollute the LLM response:
         - phase     → {phase: ...}      — sets processingStatus label on ThinkingCard
@@ -743,7 +735,7 @@ async def run_bot(
         - thinking  → {type: thinking}   — tool/reasoning updates for ThinkingCard
         - narration → {type: thinking}   — spoken channel deltas for ThinkingCard
         """
-        logger.info(f"OpenClaw progress ({status_type}): {message[:80]}")
+        logger.info(f"Hub progress ({status_type}): {message[:80]}")
         if status_type == "phase":
             await _send_server_msg({"phase": message})
         elif status_type == "status":
@@ -770,7 +762,7 @@ async def run_bot(
         logger.info(f"Client connected (user={user_id}), session={session.session_id}")
         mark_user_active(user_id)
         event_bus.subscribe_user(user_id, event_handler)
-        set_progress_context(on_openclaw_progress, user_id)
+        set_progress_context(on_hub_progress, user_id)
         # Start keepalive to prevent iOS from closing idle connections
         _keepalive_task[0] = asyncio.create_task(_keepalive_loop())
         # Skip LLM-generated greeting (MiniMax calls tools unprompted on

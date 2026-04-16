@@ -7,7 +7,7 @@ context are pulled from PIC at session start and woven into the prompt so
 Nova's voice naturally adapts to the user over time.
 
 PIC is the single source of truth for personal data. Nova reads/writes
-directly; OpenClaw consumes PIC as a downstream reader.
+directly; Hub agents consume PCG as downstream readers.
 """
 
 from datetime import datetime, timezone
@@ -250,7 +250,7 @@ def build_system_prompt(
             "**Routing principles** (pick the fastest path):\n"
             "- Recent/factual/current data → web_search (no pre-checks)\n"
             "- Single-step lookups (memory, status, calendar, email) → call the tool directly\n"
-            "- Multi-step investigations or browser actions → openclaw_delegate\n"
+            "- Multi-step investigations or browser actions → hub_delegate(agent='argus')\n"
             "- For decisions/problems, call query_frameworks FIRST to discover LIAM frameworks\n\n"
             "**Hub Agent delegation** (long-running, specialized, approval-gated tasks):\n"
             "Use hub_delegate for tasks that need specialized background agents:\n"
@@ -274,9 +274,8 @@ def build_system_prompt(
             "- Contact relationship health → query_cig(domain='contacts')\n"
             "- Search people/orgs in CIG → query_cig(domain='search', query='...')\n"
             "For DRAFTING emails or scheduling meetings, use hub_delegate(agent='hermes') instead.\n\n"
-            "**When to use hub_delegate vs openclaw_delegate vs direct tools**:\n"
+            "**When to use hub_delegate vs direct tools**:\n"
             "- hub_delegate → ALL specialized tasks (research, communications, browser, infrastructure, code, vehicle)\n"
-            "- openclaw_delegate → LEGACY ONLY (being replaced by hub_delegate + Argus for browser tasks)\n"
             "- Direct tools → quick lookups (query_cig, weather, lights, memory, search_past_conversations)\n\n"
             "**Approval tiers**:\n"
             "- Read/search/lookup → auto-execute\n"
@@ -288,8 +287,8 @@ def build_system_prompt(
             "**Homelab infra** (do NOT web_search for these — use the appropriate tool):\n"
             "- Email/calendar/workspace → check_studio\n"
             "- Docker containers → homelab_operations\n"
-            "- Managed containers: cig, hermes-chromadb, hermes-neo4j, openclaw, "
-            "openclaw-novnc, openclaw-inference, ai-gateway-postgres, ai-gateway-redis, "
+            "- Managed containers: cig, hermes-chromadb, hermes-neo4j, argus, "
+            "ai-gateway-postgres, ai-gateway-redis, "
             "ai-inferencing, comfyui, nim-embeddings, story-intelligence, story-neo4j, story-pgvector. "
             "Only report services that homelab_operations actually returns.\n\n"
             "**Tesla Vehicle** (do NOT use homelab_operations or service_status for these):\n"
