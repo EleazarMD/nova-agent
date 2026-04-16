@@ -306,11 +306,15 @@ TOOL_DEFINITIONS = [
                 "deep research → Atlas (atlas.research), "
                 "CIG analytics → Atlas (atlas.analytics), "
                 "fact-checking → Atlas (atlas.factCheck), "
+                "email drafting/briefing → Hermes (hermes.draft, hermes.inbox-briefing), "
+                "calendar/meeting prep → Hermes (hermes.calendar-briefing, hermes.meeting-prep), "
+                "follow-up tracking → Hermes (hermes.follow-up), "
+                "morning briefing → Hermes (hermes.morning-briefing), "
+                "browser automation → Argus (argus.browse), "
                 "service operations → Infra (health, agents.run), "
                 "code fixes → Coder (agents.run), "
                 "vehicle monitoring → Tesla (tesla.status, tesla.command). "
-                "For QUICK lookups (weather, status, calendar, email read), use direct tools. "
-                "For BROWSER automation (ordering, forms, web browsing), use openclaw_delegate. "
+                "For QUICK lookups (weather, status, single email read), use direct tools. "
                 "Hub tasks are asynchronous and may require approval via Hyperspace iOS push notification."
             ),
             "parameters": {
@@ -318,12 +322,12 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "enum": ["atlas", "infra", "coder", "tesla", "orchestrator"],
+                        "enum": ["atlas", "infra", "coder", "tesla", "hermes", "argus", "orchestrator"],
                         "description": "Which Hub agent to delegate to",
                     },
                     "method": {
                         "type": "string",
-                        "description": "RPC method to call (e.g., atlas.research, atlas.analytics, atlas.factCheck, health, tesla.status, tesla.command, agents.run)",
+                        "description": "RPC method to call (e.g., atlas.research, hermes.draft, hermes.inbox-briefing, hermes.calendar-briefing, hermes.meeting-prep, hermes.follow-up, hermes.morning-briefing, argus.browse, health, tesla.status, tesla.command, agents.run)",
                     },
                     "params": {
                         "type": "object",
@@ -1922,6 +1926,27 @@ async def handle_hub_delegate(
             "analytics": "atlas.analytics",
             "factCheck": "atlas.factCheck",
             "fact_check": "atlas.factCheck",
+        },
+        "hermes": {
+            "inbox-briefing": "hermes.inbox-briefing",
+            "inbox": "hermes.inbox-briefing",
+            "draft": "hermes.draft",
+            "email": "hermes.draft",
+            "calendar-briefing": "hermes.calendar-briefing",
+            "calendar": "hermes.calendar-briefing",
+            "meeting-prep": "hermes.meeting-prep",
+            "meeting": "hermes.meeting-prep",
+            "follow-up": "hermes.follow-up",
+            "followup": "hermes.follow-up",
+            "morning-briefing": "hermes.morning-briefing",
+            "morning": "hermes.morning-briefing",
+        },
+        "argus": {
+            "browse": "argus.browse",
+            "navigate": "argus.browse",
+            "order": "argus.browse",
+            "book": "argus.browse",
+            "form": "argus.browse",
         },
         "infra": {
             "health": "health",
