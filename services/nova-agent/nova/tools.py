@@ -343,6 +343,39 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
+    # CIG Analytics (Communication Intelligence Graph — email/calendar/contacts)
+    # -------------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "query_cig",
+            "description": (
+                "Query the Communication Intelligence Graph (CIG) for email, calendar, and contact analytics. "
+                "Use for: email urgency/prioritization (domain='email'), "
+                "calendar/meeting patterns (domain='calendar'), "
+                "contact relationship health (domain='contacts'), "
+                "knowledge graph search for people/orgs (domain='search'). "
+                "For DRAFTING emails or scheduling meetings, use hub_delegate(agent='hermes', ...) instead. "
+                "This tool is for READ-ONLY analytics and insights."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "enum": ["email", "calendar", "contacts", "search"],
+                        "description": "Which analytics domain to query",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (required for domain='search', optional for others)",
+                    },
+                },
+                "required": ["domain"],
+            },
+        },
+    },
+    # -------------------------------------------------------------------------
     # Delegated tools (browser, email, calendar, shell — use for actions, not searches)
     # -------------------------------------------------------------------------
     {
@@ -2137,6 +2170,16 @@ async def _hub_rpc_call(method: str, params: dict) -> Any:
                 continue
     
     return await result_future
+
+
+# ---------------------------------------------------------------------------
+# CIG query handler (Communication Intelligence Graph)
+# ---------------------------------------------------------------------------
+
+async def handle_cig_query(domain: str = "email", query: str = "", user_id: str = "default", **kwargs) -> str:
+    """Query the Communication Intelligence Graph for analytics."""
+    from nova.cig import query_cig
+    return await query_cig(user_id, domain, query, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -3938,6 +3981,8 @@ TOOL_HANDLERS = {
     "openclaw_delegate": handle_openclaw_delegate,
     # Hub Agent delegation (Pi Agent Hub background agents)
     "hub_delegate": handle_hub_delegate,
+    # CIG analytics (Communication Intelligence Graph)
+    "query_cig": handle_cig_query,
     # Studio quick-reads (direct dashboard API)
     "check_studio": handle_check_studio,
     # Skill discovery (dynamic skill catalog)
@@ -4007,6 +4052,7 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         "save_memory", "forget_memory",  # Mutating PIC
         "openclaw_delegate",  # Long-running, unique tasks
         "hub_delegate",  # Long-running, approval-gated Hub tasks
+        "query_cig",  # User-specific CIG analytics
         "set_reminder", "manage_timer",  # Mutating
         "control_lights",  # Mutating
         "manage_ticket", "manage_workspace", "manage_notes", "exomind",  # Mutating

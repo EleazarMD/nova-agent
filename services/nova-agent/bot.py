@@ -236,7 +236,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"openclaw_delegate", "hub_delegate", "web_search", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
+    _SLOW_TOOLS = {"openclaw_delegate", "hub_delegate", "web_search", "query_cig", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -278,6 +278,7 @@ async def run_bot(
         desc_map = {
             "openclaw_delegate": f"🔧 Delegating to OpenClaw: {args.get('task', '')[:80]}...",
             "hub_delegate": f"🔧 Delegating to {args.get('agent', 'Hub')} agent: {args.get('method', '')}...",
+            "query_cig": f"📊 Querying CIG {args.get('domain', 'analytics')} analytics...",
             "tesla_control": "Checking Tesla vehicle status...",
             "tesla_stream_monitor": "Monitoring Tesla data stream...",
             "tesla_location_refresh": "Getting Tesla vehicle location...",
@@ -351,12 +352,21 @@ async def run_bot(
             try:
                 # Add timeout to prevent tools from hanging indefinitely
                 import asyncio
-                result = await asyncio.wait_for(dispatch_tool(tool_name, args), timeout=30.0)
+                # Slow delegation tools need much longer timeouts
+                _SLOW_TOOL_TIMEOUTS = {
+                    "openclaw_delegate": 600,   # 10 min — OpenClaw tasks can be long
+                    "hub_delegate": 300,        # 5 min — Hub RPC with approval flow
+                    "web_search": 30,           # 30s — Perplexity Sonar
+                    "service_status": 30,       # 30s — Docker API
+                    "homelab_diagnostics": 60,  # 60s — Full diagnostics
+                }
+                tool_timeout = _SLOW_TOOL_TIMEOUTS.get(tool_name, 30.0)
+                result = await asyncio.wait_for(dispatch_tool(tool_name, args), timeout=tool_timeout)
                 result_str = str(result)
                 logger.info(f"Tool {tool_name} returned type={type(result).__name__}, len={len(result_str)}, content={result_str[:200]}")
             except asyncio.TimeoutError:
-                logger.error(f"Tool {tool_name} timed out after 30 seconds")
-                result = f"Tool {tool_name} timed out after 30 seconds. The operation took too long to complete."
+                logger.error(f"Tool {tool_name} timed out after {tool_timeout}s")
+                result = f"Tool {tool_name} timed out after {tool_timeout:.0f}s. The operation took too long to complete."
             except Exception as e:
                 logger.error(f"Tool {tool_name} execution failed: {e}", exc_info=True)
                 result = f"Tool execution error: {str(e)}"
@@ -416,6 +426,8 @@ async def run_bot(
     llm.register_function("openclaw_delegate", make_tool_handler("openclaw_delegate"))
     # Hub Agent delegation (Pi Agent Hub background agents)
     llm.register_function("hub_delegate", make_tool_handler("hub_delegate"))
+    # CIG analytics (Communication Intelligence Graph)
+    llm.register_function("query_cig", make_tool_handler("query_cig"))
     # Studio quick-reads (direct dashboard API)
     llm.register_function("check_studio", make_tool_handler("check_studio"))
     # Skill discovery (dynamic skill catalog from OpenClaw)
