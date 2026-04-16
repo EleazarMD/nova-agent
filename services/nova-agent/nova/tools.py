@@ -82,6 +82,9 @@ handle_tesla_control = _tesla.handle_tesla_control
 _tesla_stream = _load_skill_module("tesla-stream-monitor", "tesla_stream_monitor")
 handle_tesla_stream_monitor = _tesla_stream.handle_tesla_stream_monitor
 
+# Tesla wake (direct import from tesla_tools)
+from nova.tesla_tools import handle_tesla_wake, handle_tesla_navigation
+
 # ---------------------------------------------------------------------------
 # AI Inferencing Service key fetcher (centralized API key vault, port 9000)
 # Constitutional rule: ALL API keys fetched via AI Inferencing, never hardcoded.
@@ -123,7 +126,6 @@ async def _fetch_provider_key(provider: str) -> str | None:
 # Environment configuration
 OPENCLAW_URL = os.environ.get("OPENCLAW_URL", "http://127.0.0.1:18793")
 OPENCLAW_TOKEN = os.environ.get("OPENCLAW_TOKEN", "")
-CONTEXT_BRIDGE_URL = os.environ.get("CONTEXT_BRIDGE_URL", "http://localhost:8764")
 AI_GATEWAY_BUDGET_OVERRIDE = os.environ.get("AI_GATEWAY_BUDGET_OVERRIDE", "")
 WORKSTATION_MONITOR_URL = os.environ.get("WORKSTATION_MONITOR_URL", "http://localhost:8404")
 NETDIAG_URL = os.environ.get("NETDIAG_URL", "http://localhost:8405")
@@ -133,9 +135,11 @@ HERMES_JWT_TOKEN = os.environ.get("HERMES_JWT_TOKEN", "")
 ECOSYSTEM_API_KEY = os.environ.get("ECOSYSTEM_API_KEY", "ai-gateway-api-key-2024")
 ECOSYSTEM_USER_ID = os.environ.get("ECOSYSTEM_USER_ID", "dfd9379f-a9cd-4241-99e7-140f5e89e3cd")
 INTERNAL_SERVICE_KEY = os.environ.get("INTERNAL_SERVICE_KEY", "")
-AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1")
+AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/v1")
 AI_GATEWAY_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
 SKILL_DISCOVERY_URL = os.environ.get("SKILL_DISCOVERY_URL", "http://127.0.0.1:18791")
+PI_HUB_URL = os.environ.get("PI_HUB_URL", "ws://127.0.0.1:18900")
+PI_HUB_TOKEN = os.environ.get("PI_HUB_TOKEN", "changeme")
 
 # Progress callback type: called with (status_type, message) during delegation
 ProgressCallback = Callable[[str, str], None]
@@ -286,6 +290,51 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["task"],
+            },
+        },
+    },
+    # -------------------------------------------------------------------------
+    # Hub Agent Delegation (Pi Agent Hub — specialized background agents)
+    # -------------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "hub_delegate",
+            "description": (
+                "Delegate specialized tasks to Pi Agent Hub background agents for long-running, "
+                "approval-gated, or deep work. Use for: "
+                "deep research → Atlas (atlas.research), "
+                "CIG analytics → Atlas (atlas.analytics), "
+                "fact-checking → Atlas (atlas.factCheck), "
+                "service operations → Infra (health, agents.run), "
+                "code fixes → Coder (agents.run), "
+                "vehicle monitoring → Tesla (tesla.status, tesla.command). "
+                "For QUICK lookups (weather, status, calendar, email read), use direct tools. "
+                "For BROWSER automation (ordering, forms, web browsing), use openclaw_delegate. "
+                "Hub tasks are asynchronous and may require approval via Hyperspace iOS push notification."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "enum": ["atlas", "infra", "coder", "tesla", "orchestrator"],
+                        "description": "Which Hub agent to delegate to",
+                    },
+                    "method": {
+                        "type": "string",
+                        "description": "RPC method to call (e.g., atlas.research, atlas.analytics, atlas.factCheck, health, tesla.status, tesla.command, agents.run)",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Parameters for the RPC method",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Background context from conversation that helps the agent understand the request",
+                    },
+                },
+                "required": ["agent", "method"],
             },
         },
     },
@@ -1153,14 +1202,14 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
-    # Context Bridge — Unified knowledge orchestration (PIC + KG-API)
+    # PCG — Unified Personal Context Graph
     # -------------------------------------------------------------------------
     {
         "type": "function",
         "function": {
             "name": "knowledge_query",
             "description": (
-                "Query across personal knowledge (PIC) and general knowledge (KG-API) through the Context Bridge. "
+                "Query across personal knowledge (PIC) and general knowledge (KG-API) through the Personal Context Graph (PCG). "
                 "Use for questions that might need both personal context AND general facts: "
                 "'What frameworks apply to my clinical workflow goal?', "
                 "'How should I approach the Coleman follow-up?', "
@@ -1196,7 +1245,7 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "get_enriched_context",
             "description": (
-                "Get enriched personal context for this conversation from the Context Bridge. "
+                "Get enriched personal context for this conversation from the Personal Context Graph (PCG). "
                 "Returns: identity, goals with applicable frameworks, relevant knowledge entities, "
                 "and a pre-formatted context prompt. Use at conversation start for grounding."
             ),
@@ -1604,11 +1653,28 @@ async def handle_openclaw_delegate(
     
     if is_web_task:
         system_msg += (
-            "\n\n--- Browser Tools Required ---\n"
-            "This task requires web browser automation. You MUST use the web fetch/navigate tools "
-            "to interact with websites. Do NOT rely on general knowledge. "
-            "Actually navigate to the website, interact with elements, and report what you see. "
-            "If authentication is needed, explain that the user needs to sign in via the browser."
+            "\n\n--- Browser Automation Rules (MANDATORY) ---\n"
+            "This task requires web browser automation. You MUST use the browser tool to interact with websites.\n"
+            "Do NOT rely on general knowledge — actually navigate and report what you see.\n\n"
+            "TAB MANAGEMENT:\n"
+            "1. First check existing tabs: browser(action=tabs)\n"
+            "2. Reuse existing tabs: browser(action=navigate, targetUrl=..., targetId=<from tabs>)\n"
+            "3. ONLY open new tabs when comparing pages: browser(action=open, targetUrl=...)\n"
+            "4. After snapshot/act, ALWAYS pass the returned targetId in subsequent calls\n"
+            "5. Close unused tabs when done: browser(action=close, targetId=...)\n"
+            "6. NEVER open more than 3 tabs simultaneously\n\n"
+            "VERIFICATION & ESCALATION:\n"
+            "1. If you encounter an anti-bot challenge (CAPTCHA, Cloudflare, reCAPTCHA, hCaptcha, bot detection), "
+            "STOP immediately. Do NOT attempt to solve it.\n"
+            "2. If you are confused about what to click, or the page looks unexpected, STOP and ask for guidance.\n"
+            "3. If a form has ambiguous fields or you are unsure what to enter, ask rather than guessing.\n"
+            "4. When escalating, tell the user: (a) what you were trying to do, (b) what blocked you, "
+            "(c) they can view/interact with the browser via the noVNC viewer.\n"
+            "5. The noVNC viewer runs 24/7: https://rtx-workstation.tailb64e64.ts.net:6081/vnc.html?autoconnect=1&resize=remote\n"
+            "6. After the user intervenes, take a new snapshot before continuing.\n\n"
+            "AUTHENTICATION:\n"
+            "If a site requires login, tell the user to sign in via the noVNC viewer above. "
+            "Wait for them to confirm, then take a snapshot to verify the authenticated state before proceeding."
         )
     # Inject caller identity so OpenClaw can authenticate to downstream APIs
     # Resolve real user ID: iOS sends "default" but workspace ops need the actual owner
@@ -1773,6 +1839,30 @@ async def handle_openclaw_delegate(
                                 data={"type": "approval_request", "action_id": data.get("action_id")},
                             )
                         return f"I need your approval: {desc}. Check your notifications."
+                    
+                    # Handle browser verification/escalation requests (anti-bot, CAPTCHA, confusion)
+                    if event_type == "openclaw.browser_verification_needed":
+                        reason = data.get("reason", "Browser interaction requires your attention")
+                        site = data.get("site", "the website")
+                        novnc_url = "https://rtx-workstation.tailb64e64.ts.net:6081/vnc.html?autoconnect=1&resize=remote"
+                        if user_id:
+                            await send_push(
+                                user_id=user_id,
+                                title="Browser Needs You",
+                                body=f"{reason} on {site}. Open noVNC to intervene.",
+                                data={
+                                    "type": "browser_verification",
+                                    "reason": reason,
+                                    "site": site,
+                                    "novnc_url": novnc_url,
+                                    "url": novnc_url,
+                                },
+                            )
+                        return (
+                            f"I need your help: {reason} on {site}. "
+                            f"Please view/interact with the browser at {novnc_url} "
+                            f"and let me know when you've resolved it."
+                        )
 
         # Prefer spoken channel result if available (avoids doubling)
         result = (spoken_result if has_spoken_channel else final_result).strip()
@@ -1800,12 +1890,241 @@ async def handle_openclaw_delegate(
 
 
 # ---------------------------------------------------------------------------
-# Memory tool handlers (PIC-backed)
+# Hub Agent Delegation (Pi Agent Hub WebSocket RPC)
 # ---------------------------------------------------------------------------
 
-async def handle_save_memory(content: str, category: str = "other") -> str:
-    """Save a user preference/fact to PIC as an observation."""
-    from nova.pic import record_observation
+async def handle_hub_delegate(
+    agent: str,
+    method: str,
+    params: Optional[dict] = None,
+    context: str = "",
+    **kwargs,
+) -> str:
+    """
+    Delegate a task to a Pi Agent Hub background agent via WebSocket RPC.
+    
+    Connects to the Hub gateway, authenticates, calls the specified RPC method,
+    and returns the result. Supports progress callbacks for ThinkingCard updates.
+    """
+    import websockets
+    
+    if not PI_HUB_TOKEN:
+        return "Pi Agent Hub delegation not configured (PI_HUB_TOKEN missing)."
+    
+    rpc_params = params or {}
+    if context:
+        rpc_params["context"] = context
+    
+    # Map agent name to the correct RPC method if shorthand provided
+    method_map = {
+        "atlas": {
+            "research": "atlas.research",
+            "analytics": "atlas.analytics",
+            "factCheck": "atlas.factCheck",
+            "fact_check": "atlas.factCheck",
+        },
+        "infra": {
+            "health": "health",
+            "status": "health",
+            "restart": "agents.run",
+            "monitor": "agents.run",
+        },
+        "coder": {
+            "fix": "agents.run",
+            "heal": "agents.run",
+            "implement": "agents.run",
+        },
+        "tesla": {
+            "status": "tesla.status",
+            "command": "tesla.command",
+            "monitor": "agents.run",
+        },
+        "orchestrator": {
+            "run": "agents.run",
+            "delegate": "agents.run",
+        },
+    }
+    
+    # Resolve shorthand method names
+    resolved_method = method
+    agent_methods = method_map.get(agent, {})
+    if method in agent_methods:
+        resolved_method = agent_methods[method]
+    
+    # For agents.run shorthand, inject the agentId
+    if resolved_method == "agents.run" and "agentId" not in rpc_params:
+        rpc_params["agentId"] = agent
+    
+    # Inject context into task description for agents.run
+    if resolved_method == "agents.run" and "task" not in rpc_params and context:
+        rpc_params["task"] = context
+    
+    progress_callback = _current_progress_callback
+    
+    try:
+        # Send initial progress
+        if progress_callback:
+            await progress_callback("phase", "delegating")
+            await progress_callback("thinking", f"🔧 Delegating to {agent}: {resolved_method}")
+        
+        # Connect to Hub WebSocket with timeout
+        connect_timeout = 10
+        rpc_timeout = 120  # 2 minutes for most RPC calls (research can take longer)
+        
+        # Adjust timeout based on method
+        if "research" in resolved_method:
+            rpc_timeout = 300  # 5 minutes for research
+        elif "health" in resolved_method or "status" in resolved_method:
+            rpc_timeout = 30  # 30 seconds for status checks
+        
+        result = await asyncio.wait_for(
+            _hub_rpc_call(resolved_method, rpc_params),
+            timeout=rpc_timeout,
+        )
+        
+        # Process result
+        if isinstance(result, dict):
+            # Check for approval-related results
+            status = result.get("status", "")
+            if status == "pending":
+                approval_msg = result.get("reason", "Approval required — check your Hyperspace app.")
+                return f"I've requested approval for this action. {approval_msg}"
+            elif status == "rejected":
+                return f"The approval was rejected: {result.get('reason', 'No reason given.')}"
+            elif status == "timeout":
+                return "The approval request timed out. Please try again."
+            
+            # Extract response text from agent result
+            response = result.get("response", "")
+            if response:
+                return response
+            
+            # Fallback: return the whole result as JSON
+            return json.dumps(result, default=str)
+        
+        return str(result) if result else "Hub agent returned no result."
+        
+    except asyncio.TimeoutError:
+        logger.warning(f"Hub delegation timed out: {agent}/{method}")
+        return f"The {agent} agent is taking longer than expected. The task is still running in the background — I'll let you know when it's done."
+    except ConnectionRefusedError:
+        logger.error("Pi Agent Hub connection refused")
+        return "The Pi Agent Hub is not running. I can't delegate this task right now."
+    except Exception as e:
+        logger.error(f"Hub delegation error: {e}", exc_info=True)
+        return f"Error delegating to {agent}: {str(e)}"
+
+
+async def _hub_rpc_call(method: str, params: dict) -> Any:
+    """Make a single RPC call to Pi Agent Hub via WebSocket.
+    
+    Handles the challenge-auth handshake and returns the RPC result.
+    """
+    import websockets
+    
+    request_id = f"nova-{int(asyncio.get_event_loop().time() * 1000)}"
+    connect_id = f"nova-connect-{int(asyncio.get_event_loop().time() * 1000)}"
+    connect_sent = False
+    
+    result_future = asyncio.get_event_loop().create_future()
+    
+    async with websockets.connect(
+        PI_HUB_URL,
+        max_size=25 * 1024 * 1024,  # 25MB max payload
+        open_timeout=10,
+    ) as ws:
+        # Process messages
+        async for raw in ws:
+            try:
+                frame = json.loads(raw)
+                ftype = frame.get("type", "")
+                
+                # Handle connect.challenge
+                if ftype == "event" and frame.get("event") == "connect.challenge":
+                    if not connect_sent:
+                        connect_sent = True
+                        connect_frame = {
+                            "type": "req",
+                            "id": connect_id,
+                            "method": "connect",
+                            "params": {
+                                "minProtocol": 3,
+                                "maxProtocol": 3,
+                                "client": {
+                                    "id": "nova-agent",
+                                    "displayName": "Nova Agent",
+                                    "version": "1.0.0",
+                                    "platform": "python",
+                                    "mode": "voice",
+                                },
+                                "caps": [],
+                                "role": "operator",
+                                "scopes": ["operator.read", "operator.write"],
+                                "auth": {"token": PI_HUB_TOKEN},
+                            },
+                        }
+                        await ws.send(json.dumps(connect_frame))
+                    continue
+                
+                # Handle tick events (ignore)
+                if ftype == "event" and frame.get("event") == "tick":
+                    continue
+                
+                # Handle broadcast events (log but don't resolve)
+                if ftype == "event":
+                    logger.debug(f"Hub event: {frame.get('event')} — {str(frame.get('payload', ''))[:100]}")
+                    continue
+                
+                # Handle response frames
+                if ftype == "res":
+                    res_id = frame.get("id", "")
+                    ok = frame.get("ok", False)
+                    
+                    # If this is the connect response, send the actual RPC call
+                    if res_id == connect_id:
+                        if ok:
+                            req_frame = {
+                                "type": "req",
+                                "id": request_id,
+                                "method": method,
+                                "params": params,
+                            }
+                            await ws.send(json.dumps(req_frame))
+                        else:
+                            error = frame.get("error", {}).get("message", "Connect failed")
+                            result_future.set_exception(Exception(f"Hub auth failed: {error}"))
+                            break
+                        continue
+                    
+                    # This is our method response
+                    if res_id == request_id:
+                        if ok:
+                            result_future.set_result(frame.get("payload"))
+                        else:
+                            error = frame.get("error", {}).get("message", "RPC error")
+                            result_future.set_exception(Exception(f"Hub RPC error: {error}"))
+                        break
+                    
+                    # Unknown response — ignore
+                    continue
+                    
+            except json.JSONDecodeError:
+                continue
+    
+    return await result_future
+
+
+# ---------------------------------------------------------------------------
+# Memory tool handlers (PCG-backed)
+# ---------------------------------------------------------------------------
+
+async def handle_save_memory(content: str = "", category: str = "other", **kwargs) -> str:
+    """Save a user preference/fact to PCG as an observation."""
+    from nova.pcg import record_observation
+    # Tolerate LLM using 'fact' instead of 'content' (SKILL.md examples use fact=)
+    if not content and kwargs.get("fact"):
+        content = kwargs["fact"]
+
     
     # Derive a short key from the fact
     key = content.split()[:4]  # first few words
@@ -1819,16 +2138,14 @@ async def handle_save_memory(content: str, category: str = "other") -> str:
         context="User explicitly stated this during voice conversation with Nova",
     )
     if success:
-        logger.info(f"PIC save_memory OK: [{category}] {content[:80]}")
-        return f"Saved to PIC ({category}): {content}"
-    return f"I'll remember that for this conversation, but couldn't save to long-term memory."""
+        logger.info(f"PCG save_memory OK: [{category}] {content[:80]}")
+        return f"Saved to PCG ({category}): {content}"
+    return "I will remember that for this conversation, but could not save to long-term memory."
 
 
-async def handle_recall_memory(query: str, category: str = "") -> str:
-    """Search PIC for stored preferences and observations matching a query."""
-    _pic = _load_skill_module("pcg-memory", "pic_memory")
-    get_preferences = _pic.get_preferences
-    get_identity = _pic.get_identity
+async def handle_recall_memory(query: str = "", category: str = "", **kwargs) -> str:
+    """Search PCG for stored preferences and observations matching a query."""
+    from nova.pcg import get_preferences, get_identity
 
     # Synonym expansion — common words that map to PIC categories or keys
     _SYNONYMS: dict[str, list[str]] = {
@@ -1873,16 +2190,16 @@ async def handle_recall_memory(query: str, category: str = "") -> str:
                 results.append(f"Bio: {ident['bio'][:150]}")
 
     if results:
-        logger.info(f"PIC recall_memory: {len(results)} matches for '{query}'")
-        return "Found in PIC:\n" + "\n".join(results[:10])
+        logger.info(f"PCG recall_memory: {len(results)} matches for '{query}'")
+        return "Found in PCG:\n" + "\n".join(results[:10])
 
-    logger.info(f"PIC recall_memory: no matches for '{query}'")
-    return f"Nothing found in PIC for '{query}'. The user may not have told you this yet."
+    logger.info(f"PCG recall_memory: no matches for '{query}'")
+    return f"Nothing found in PCG for '{query}'. The user may not have told you this yet."
 
 
-async def handle_forget_memory(keyword: str) -> str:
+async def handle_forget_memory(keyword: str = "", **kwargs) -> str:
     """Forget is not directly supported — record a correction observation instead."""
-    from skills.pic_memory.scripts.pic_memory import record_observation
+    from nova.pcg import record_observation
     
     success = await record_observation(
         observation_type="correction",
@@ -1897,84 +2214,73 @@ async def handle_forget_memory(keyword: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Context Bridge + Knowledge Graph handlers
+# PCG unified context handlers
 # ---------------------------------------------------------------------------
 
 async def handle_query_context(
-    query: str,
+    query: str = "",
     include_personal: bool = True,
     include_knowledge: bool = True,
     include_dimensions: bool = True,
+    **kwargs,
 ) -> str:
-    """Query Context Bridge for unified context across PIC, KG-API, and LIAM."""
-    from nova.context_bridge import query_knowledge
+    """Query PCG for unified context across personal data, knowledge graph, and frameworks."""
+    from nova.pcg import query as pcg_query
     
-    result = await query_knowledge(
+    result = await pcg_query(
         query=query,
         include_personal=include_personal,
         include_knowledge=include_knowledge,
-        include_dimensions=include_dimensions,
+        include_frameworks=include_dimensions,
     )
     
-    if "error" in result:
-        return f"Context Bridge query failed: {result['error']}"
-    
-    # Build response from synthesis
     synthesis = result.get("synthesis", "")
     personal = result.get("personal", [])
     knowledge = result.get("knowledge", [])
     
-    parts = []
     if synthesis:
-        parts.append(synthesis)
-    elif personal or knowledge:
-        # Build manual synthesis if no pre-formatted one
-        if personal:
-            parts.append("Personal context:")
-            for p in personal[:5]:
-                parts.append(f"  - {p.get('key', '?')}: {p.get('value', '')[:100]}")
-        if knowledge:
-            parts.append("Knowledge graph:")
-            for k in knowledge[:5]:
-                parts.append(f"  - {k.get('name', '?')}: {k.get('type', '')}")
+        logger.info(f"PCG query OK: '{query[:50]}' -> {len(personal)} personal, {len(knowledge)} knowledge")
+        return synthesis
+    
+    # Build manual synthesis
+    parts = []
+    if personal:
+        parts.append("Personal context:")
+        for p in personal[:5]:
+            parts.append(f"  - {p.get('key', '?')}: {p.get('value', '')[:100]}")
+    if knowledge:
+        parts.append("Knowledge graph:")
+        for k in knowledge[:5]:
+            parts.append(f"  - {k.get('name', k.get('id', '?'))}: {k.get('type', '')}")
     
     if not parts:
         return f"No relevant context found for '{query}'."
     
-    logger.info(f"Context Bridge query OK: '{query[:50]}' -> {len(personal)} personal, {len(knowledge)} knowledge")
+    logger.info(f"PCG query OK: '{query[:50]}' -> {len(personal)} personal, {len(knowledge)} knowledge")
     return "\n".join(parts)
 
 
-async def handle_kg_query(query: str, entity_type: str = "Service") -> str:
-    """Query Knowledge Graph for infrastructure context."""
-    from nova.knowledge_graph import knowledge_graph_query, get_service_status_from_graph
+async def handle_kg_query(query: str = "", entity_type: str = "Service", **kwargs) -> str:
+    """Query PCG knowledge graph for infrastructure context."""
+    from nova.pcg import query_knowledge_graph, search_knowledge
     
-    # Try to get structured service status first
-    if entity_type == "Service":
-        # Extract potential service name from query
-        query_lower = query.lower()
-        service_names = ["nova", "hermes", "ai gateway", "openclaw", "tesla"]
-        for name in service_names:
-            if name in query_lower:
-                status = await get_service_status_from_graph(name.replace(" ", "-"))
-                if "error" not in status:
-                    service = status.get("service", {})
-                    deps = status.get("dependencies", [])
-                    integrations = status.get("integrations", [])
-                    
-                    lines = [f"**{service.get('name', name)}** ({service.get('type', 'Service')})"]
-                    if deps:
-                        lines.append("Dependencies:")
-                        for d in deps:
-                            lines.append(f"  - {d.get('service_id', '?')}")
-                    if integrations:
-                        lines.append("Used by:")
-                        for i in integrations:
-                            lines.append(f"  - {i.get('service_id', '?')}")
-                    return "\n".join(lines)
+    # Search knowledge graph for matching entities
+    results = await search_knowledge(query, entity_types=[entity_type] if entity_type else None)
     
-    # Fall back to general knowledge graph query
-    context = await knowledge_graph_query(query)
+    if results:
+        lines = []
+        for r in results[:5]:
+            name = r.get("name", r.get("id", "?"))
+            rtype = r.get("type", "")
+            props = r.get("properties", {})
+            lines.append(f"**{name}** ({rtype})")
+            if props:
+                for k, v in list(props.items())[:3]:
+                    lines.append(f"  - {k}: {v}")
+        return "\n".join(lines)
+    
+    # Fall back to natural language query
+    context = await query_knowledge_graph(query)
     if context:
         return context
     
@@ -3465,7 +3771,7 @@ async def handle_youtube(action: str, query: str = "", video_id: str = "") -> st
 
 
 # ---------------------------------------------------------------------------
-# Context Bridge handlers (PIC + KG-API orchestration)
+# PCG handlers (unified context)
 # ---------------------------------------------------------------------------
 
 async def handle_knowledge_query(
@@ -3474,10 +3780,10 @@ async def handle_knowledge_query(
     include_knowledge: bool = True,
     include_dimensions: bool = True,
 ) -> str:
-    """Query across PIC and KG-API through Context Bridge."""
-    from nova.context_bridge import query_knowledge
+    """Query PCG for unified context."""
+    from nova.pcg import query as pcg_query
     
-    result = await query_knowledge(
+    result = await pcg_query(
         query=query,
         include_personal=include_personal,
         include_knowledge=include_knowledge,
@@ -3521,10 +3827,10 @@ async def handle_get_enriched_context(
     include_goals: bool = True,
     include_relationships: bool = False,
 ) -> str:
-    """Get enriched personal context from Context Bridge."""
-    from nova.context_bridge import get_enriched_context
+    """Get enriched personal context from PCG."""
+    from nova.pcg import query as pcg_query
     
-    result = await get_enriched_context(
+    result = await pcg_query(
         agent_id="nova-agent",
         include_goals=include_goals,
         include_relationships=include_relationships,
@@ -3566,8 +3872,8 @@ async def handle_link_goal_to_knowledge(
     relevance: float = 0.5,
     context: str = "",
 ) -> str:
-    """Create bi-directional link between PIC goal and KG-API entity."""
-    from nova.context_bridge import link_goal_to_entity
+    """Create bi-directional link between PCG goal and knowledge entity."""
+    from nova.pcg import record_observation
     
     result = await link_goal_to_entity(
         goal_id=goal_id,
@@ -3605,6 +3911,8 @@ TOOL_HANDLERS = {
     "search_past_conversations": handle_search_past_conversations,
     # Delegated (actions requiring browser/email/calendar/shell)
     "openclaw_delegate": handle_openclaw_delegate,
+    # Hub Agent delegation (Pi Agent Hub background agents)
+    "hub_delegate": handle_hub_delegate,
     # Studio quick-reads (direct dashboard API)
     "check_studio": handle_check_studio,
     # Skill discovery (dynamic skill catalog)
@@ -3638,7 +3946,7 @@ TOOL_HANDLERS = {
     "tesla_location_refresh": handle_tesla_location_refresh,
     # YouTube search and play
     "youtube": handle_youtube,
-    # Context Bridge - Unified knowledge orchestration (PIC + KG-API)
+    # PCG - Unified Personal Context Graph
     "query_context": handle_query_context,
     "kg_query": handle_kg_query,
     "knowledge_query": handle_knowledge_query,
@@ -3673,6 +3981,7 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         "homelab_operations",  # Mutating actions (restart/start/stop)
         "save_memory", "forget_memory",  # Mutating PIC
         "openclaw_delegate",  # Long-running, unique tasks
+        "hub_delegate",  # Long-running, approval-gated Hub tasks
         "set_reminder", "manage_timer",  # Mutating
         "control_lights",  # Mutating
         "manage_ticket", "manage_workspace", "manage_notes", "exomind",  # Mutating
@@ -3708,6 +4017,13 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
             args["user_id"] = _current_user_id or "default"
         
         result = await handler(**args)
+        
+        # Convert dict results to JSON string for consistency
+        if isinstance(result, dict):
+            result = json.dumps(result, indent=2)
+        
+        # Ensure result is a string
+        result = str(result) if result is not None else ""
         
         # Cache the result for cacheable tools
         if name not in UNCACHEABLE_TOOLS:
@@ -3775,6 +4091,94 @@ TESLA_CONTROL_TOOL = {
 
 # NOTE: TESLA_CONTROL_TOOL is loaded from skills/tesla-control/SKILL.md by skill_loader
 # to avoid duplication. The handler is registered at the bottom of this file.
+# DO NOT append here - it's already loaded from the skill!
+
+# ---------------------------------------------------------------------------
+# Tesla Wake Tool Definition
+# ---------------------------------------------------------------------------
+
+TESLA_WAKE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "tesla_wake",
+        "description": "Wake up a sleeping Tesla vehicle to enable remote control and data access. Use when a vehicle is offline/asleep and you need to interact with it. Automatically called before status checks if vehicle is detected as offline.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "vin": {
+                    "type": "string",
+                    "description": "Vehicle VIN (optional - defaults to first vehicle if not specified)",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+# NOTE: tesla_wake is loaded from skills/tesla-wake/SKILL.md by skill_loader
+# DO NOT append here - it's already loaded from the skill!
+
+# ---------------------------------------------------------------------------
+# Tesla Location Refresh Tool Definition
+# ---------------------------------------------------------------------------
+
+TESLA_LOCATION_REFRESH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "tesla_location_refresh",
+        "description": "Refresh and retrieve the current GPS location of a Tesla vehicle. Returns real-time coordinates, heading, and speed. Use when you need the most up-to-date vehicle location data.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "vin": {
+                    "type": "string",
+                    "description": "Vehicle VIN (optional - defaults to first vehicle if not specified)",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+# NOTE: tesla_location_refresh is loaded from skills/tesla-location-refresh/SKILL.md by skill_loader
+# DO NOT append here - it's already loaded from the skill!
+
+# ---------------------------------------------------------------------------
+# Tesla Navigation Tool Definition
+# ---------------------------------------------------------------------------
+
+TESLA_NAVIGATION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "tesla_navigation",
+        "description": "Send navigation destination to a Tesla vehicle. Supports both address/place names and GPS coordinates. Use when user wants to navigate to a location or set a destination in their Tesla.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "destination": {
+                    "type": "string",
+                    "description": "Address or place name (e.g., '1600 Amphitheatre Parkway, Mountain View, CA')",
+                },
+                "latitude": {
+                    "type": "number",
+                    "description": "GPS latitude for precise navigation (use with longitude)",
+                },
+                "longitude": {
+                    "type": "number",
+                    "description": "GPS longitude for precise navigation (use with latitude)",
+                },
+                "vin": {
+                    "type": "string",
+                    "description": "Vehicle VIN (optional - defaults to first vehicle if not specified)",
+                },
+            },
+            "required": ["destination"],
+        },
+    },
+}
+
+# NOTE: tesla_navigation is loaded from skills/tesla-navigation/SKILL.md by skill_loader
+# DO NOT append here - it's already loaded from the skill!
 
 # ---------------------------------------------------------------------------
 # Legacy Tesla Tool Definitions (DEPRECATED - kept for backward compatibility)
@@ -3993,15 +4397,21 @@ TOOL_HANDLERS["tesla_control"] = handle_tesla_control
 # Tesla stream monitor handler (skill-based)
 TOOL_HANDLERS["tesla_stream_monitor"] = handle_tesla_stream_monitor
 
+# Tesla wake handler (direct import from tesla_tools)
+TOOL_HANDLERS["tesla_wake"] = handle_tesla_wake
+
+# Tesla navigation handler (direct import from tesla_tools)
+TOOL_HANDLERS["tesla_navigation"] = handle_tesla_navigation
+
 # ---------------------------------------------------------------------------
 # Homelab Diagnostics Tool (skill-based)
 # ---------------------------------------------------------------------------
 
 _diagnostics = _load_skill_module("homelab-diagnostics", "diagnostics")
 
-async def handle_homelab_diagnostics(args: dict) -> dict:
+async def handle_homelab_diagnostics(**kwargs) -> dict:
     """Run homelab infrastructure diagnostics."""
-    action = args.get("action", "full_diagnostics")
+    action = kwargs.get("action") or kwargs.get("check") or kwargs.get("type") or "full_diagnostics"
     
     # Call the skill's full_diagnostics function
     if action == "full_diagnostics":
@@ -4053,12 +4463,12 @@ TOOL_HANDLERS["homelab_diagnostics"] = handle_homelab_diagnostics
 # Query Frameworks Tool (Dynamic LIAM Framework Discovery)
 # ---------------------------------------------------------------------------
 
-async def handle_query_frameworks(args: dict) -> dict:
+async def handle_query_frameworks(**kwargs) -> dict:
     """Query LIAM for scientific frameworks applicable to a problem."""
-    problem_description = args.get("problem_description", "")
-    dimension_id = args.get("dimension_id")
-    category = args.get("category")
-    limit = args.get("limit", 5)
+    problem_description = kwargs.get("problem_description", "")
+    dimension_id = kwargs.get("dimension_id")
+    category = kwargs.get("category")
+    limit = kwargs.get("limit", 5)
     
     if not problem_description:
         return {
@@ -4082,7 +4492,7 @@ async def handle_query_frameworks(args: dict) -> dict:
             dimension_id=dimension_id,
             category=category,
             limit=limit,
-            use_context_bridge=True
+            use_semantic=True
         )
         
         if "error" in result:

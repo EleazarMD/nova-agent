@@ -48,17 +48,27 @@ from nova.events import event_bus
 from nova.notify import create_event_handler
 from nova.prompt import build_system_prompt
 from nova.push import mark_user_active, mark_user_inactive, register_push_fallback
-from nova.store import init_db, get_or_create_session, append_turn, get_history
-from nova.pic import build_pic_context, record_observation, create_preference
+from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn
+from nova.pcg import build_context, record_observation, create_preference
 from nova.tools import TOOL_DEFINITIONS, dispatch_tool, set_progress_context
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1")
+AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/v1")
 AI_GATEWAY_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
-LLM_MODEL = os.environ.get("LLM_MODEL", "minimax-m2.5")
+LLM_MODEL = os.environ.get("LLM_MODEL", "minimax-m2.7")
+
+# Map iOS device UUIDs to real user IDs (iOS sends device identifier as user_id)
+DEVICE_USER_MAP: dict[str, str] = {
+    "DEAA114F-315F-420F-9C7C-C0A6D5F6C8DA": "eleazar",
+}
+
+
+def _resolve_user_id(raw_user_id: str) -> str:
+    """Resolve device UUID to real user ID, or return as-is if not a device."""
+    return DEVICE_USER_MAP.get(raw_user_id, raw_user_id)
 
 # Tool names for prompt builder
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS if "function" in t]
@@ -108,20 +118,43 @@ async def run_bot(
     # ── Session & history ────────────────────────────────────────────────
     session = await get_or_create_session(user_id, conversation_id)
     prior_turns = await get_history(session.session_id, limit=MAX_HISTORY_TURNS)
+    
+    # If no local history, try loading from PostgreSQL backend (iOS app creates new conversations)
+    if not prior_turns:
+        backend_conv = await get_backend_conversation(conversation_id, user_id)
+        if backend_conv and backend_conv.get("messages"):
+            logger.info(f"Loading {len(backend_conv['messages'])} messages from backend")
+            prior_turns = [
+                Turn(
+                    role=msg["role"],
+                    content=msg["content"],
+                    timestamp=msg.get("timestamp", ""),
+                    tool_calls=None,
+                )
+                for msg in backend_conv["messages"]
+                if msg["role"] in ("user", "assistant")
+            ]
+            # Sync to local SQLite for faster access
+            for turn in prior_turns:
+                await append_turn(session.session_id, turn.role, turn.content)
+    
     logger.info(f"Session {session.session_id}: restored {len(prior_turns)} turns")
 
-    # ── PIC context (identity, preferences, goals) ──────────────────
-    pic_ctx = await build_pic_context(user_id)
-    logger.info(f"PIC context: {len(pic_ctx.get('memory_snippets', []))} memory items")
+    # Ensure conversation exists in PostgreSQL backend for search/retrieval
+    await ensure_backend_conversation(conversation_id, user_id)
 
-    # ── Dynamic system prompt (shaped by PIC preferences) ────────────────
+    # ── PCG context (identity, preferences, goals) ──────────────────
+    pcg_ctx = await build_context(user_id)
+    logger.info(f"PCG context: {len(pcg_ctx.get('memory_snippets', []))} memory items")
+
+    # ── Dynamic system prompt (shaped by PCG preferences) ────────────────
     system_prompt = build_system_prompt(
-        user_name=pic_ctx.get("user_name") or (user_id if user_id != "default" else None),
-        user_timezone=pic_ctx.get("user_timezone", "America/Chicago"),
+        user_name=pcg_ctx.get("user_name") or (user_id if user_id != "default" else None),
+        user_timezone=pcg_ctx.get("user_timezone", "America/Chicago"),
         tool_names=TOOL_NAMES,
-        memory_snippets=pic_ctx.get("memory_snippets"),
-        preferences_by_category=pic_ctx.get("preferences_by_category"),
-        identity=pic_ctx.get("identity"),
+        memory_snippets=pcg_ctx.get("memory_snippets"),
+        preferences_by_category=pcg_ctx.get("preferences_by_category"),
+        identity=pcg_ctx.get("identity"),
     )
 
     # ── Transport ────────────────────────────────────────────────────────
@@ -142,13 +175,17 @@ async def run_bot(
     logger.info("WebRTC connection initialized")
 
     # ── LLM (MiniMax-compatible) ───────────────────────────────────────
-    # MiniMax sends tool_call.index=None in streaming chunks.
-    # Pipecat's _process_context compares tool_call.index != func_idx (int),
-    # so None != 0 incorrectly triggers the multi-tool branch.
-    # Fix: wrap the stream to normalize index=None → index=0.
+    # Use MiniMaxLLMService from nova.minimax_llm (supports thinking levels)
+    from nova.minimax_llm import MiniMaxLLMService as _MiniMaxLLM
 
-    class MiniMaxLLMService(OpenAILLMService):
-        """Patches tool_call.index for MiniMax streaming compatibility."""
+    # Orchestration mode → thinking level mapping
+    # Fast mode = low thinking (no reasoning chain, 4K tokens, fast)
+    # Default/medium = medium thinking (reasoning on, 8K tokens)
+    # Deep/Verified = high thinking (reasoning on, 16K tokens, deep analysis)
+    _thinking_level = "medium"  # default
+
+    class MiniMaxLLMService(_MiniMaxLLM):
+        """Extends MiniMaxLLMService with frame logging for voice agent."""
 
         async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
             """Log frame pushing to trace LLMFullResponseStartFrame/EndFrame emission."""
@@ -163,43 +200,13 @@ async def run_bot(
             # Call parent to actually push
             await super().push_frame(frame, direction)
 
-        async def get_chat_completions(self, params_from_context):
-            params = self.build_chat_completion_params(params_from_context)
-            raw_stream = await self._client.chat.completions.create(**params)
-
-            class _PatchedStream:
-                """Normalizes tool_call.index=None→0 for Pipecat compatibility."""
-                def __init__(self, raw):
-                    self._raw = raw
-                def __aiter__(self):
-                    return self._iter()
-                async def _iter(self):
-                    async for chunk in self._raw:
-                        if chunk.choices:
-                            for c in chunk.choices:
-                                if c.delta and c.delta.tool_calls:
-                                    for tc in c.delta.tool_calls:
-                                        if tc.index is None:
-                                            tc.index = 0
-                        yield chunk
-                async def close(self):
-                    if hasattr(self._raw, "close"):
-                        await self._raw.close()
-                async def aclose(self):
-                    if hasattr(self._raw, "aclose"):
-                        await self._raw.aclose()
-                    elif hasattr(self._raw, "close"):
-                        await self._raw.close()
-
-            return _PatchedStream(raw_stream)
-
     llm = MiniMaxLLMService(
+        thinking=_thinking_level,
         api_key=AI_GATEWAY_API_KEY,
         base_url=AI_GATEWAY_URL,
         model=LLM_MODEL,
         params=OpenAILLMService.InputParams(
             temperature=0.1,
-            max_tokens=8192,
         ),
         function_call_timeout_secs=600.0,  # OpenClaw tasks can take minutes
     )
@@ -225,7 +232,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"openclaw_delegate", "web_search", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh"}
+    _SLOW_TOOLS = {"openclaw_delegate", "hub_delegate", "web_search", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -234,6 +241,12 @@ async def run_bot(
     _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 3
     _MAX_TOOL_CALLS_BEFORE_WARN = 6
     _MAX_TOOL_CALLS_HARD_LIMIT = 10
+    # Track recent tool calls to detect duplicates
+    # Note: openclaw_delegate is excluded from dedup because each delegation
+    # is a unique long-running task — even if args look similar, the context
+    # and browser state differ between calls.
+    _DEDUP_EXCLUDED_TOOLS = {"openclaw_delegate", "hub_delegate"}
+    _last_tool_call: dict = {"name": None, "args": None, "result": None}
 
     def _build_spoken_ack(tool_name: str, args: dict) -> str | None:
         """Generate a contextual spoken acknowledgment from tool name + args.
@@ -243,6 +256,12 @@ async def run_bot(
             if task:
                 return f"On it — {task.rstrip('.')}."
             return "Working on that for you."
+        elif tool_name == "hub_delegate":
+            agent = args.get("agent", "")
+            method = args.get("method", "")
+            if agent:
+                return f"Delegating to {agent} — {method}."
+            return "Delegating to background agent."
         elif tool_name == "web_search":
             query = args.get("query", "")[:60]
             if query:
@@ -254,19 +273,39 @@ async def run_bot(
         """Generate a thinking description for the UI progress indicator."""
         desc_map = {
             "openclaw_delegate": f"🔧 Delegating to OpenClaw: {args.get('task', '')[:80]}...",
+            "hub_delegate": f"🔧 Delegating to {args.get('agent', 'Hub')} agent: {args.get('method', '')}...",
             "tesla_control": "Checking Tesla vehicle status...",
             "tesla_stream_monitor": "Monitoring Tesla data stream...",
             "tesla_location_refresh": "Getting Tesla vehicle location...",
+            "tesla_wake": "Waking up Tesla vehicle...",
+            "tesla_navigation": f"Sending navigation to {args.get('destination', 'destination')[:40]}...",
             "web_search": f"Searching for {args.get('query', 'information')[:40]}...",
+            "service_status": f"Checking status of {args.get('container', 'services')}...",
+            "homelab_diagnostics": "Running homelab diagnostics...",
         }
         return desc_map.get(tool_name, f"Executing {tool_name}...")
 
     def make_tool_handler(tool_name: str):
         async def handler(params: FunctionCallParams):
+            logger.info(f"🔥 HANDLER ENTERED for {tool_name}")
             args = dict(params.arguments)
+            
+            # Check for duplicate tool call (same tool with same args)
+            # Skip dedup for long-running delegation tools where each call is unique
+            import json as _json
+            args_str = _json.dumps(args, sort_keys=True, default=str)
+            if (tool_name not in _DEDUP_EXCLUDED_TOOLS and
+                _last_tool_call["name"] == tool_name and 
+                _last_tool_call["args"] == args_str and
+                _last_tool_call["result"] is not None):
+                logger.warning(f"🔥 Duplicate tool call detected: {tool_name}, returning cached result")
+                await params.result_callback(_last_tool_call["result"])
+                logger.info(f"🔥 Duplicate callback completed for {tool_name}")
+                return
+            
             _tool_calls_this_turn[0] += 1
             call_num = _tool_calls_this_turn[0]
-            logger.info(f"Tool call #{call_num}: {tool_name} args={str(args)[:100]}")
+            logger.info(f"🔥 Tool call #{call_num}: {tool_name} args={str(args)[:100]}")
 
             # ── Hard limit: prevent runaway tool chains ──
             if call_num > _MAX_TOOL_CALLS_HARD_LIMIT:
@@ -305,7 +344,26 @@ async def run_bot(
                 })
 
             # ── Background path: tool executes ──
-            result = await dispatch_tool(tool_name, args)
+            try:
+                # Add timeout to prevent tools from hanging indefinitely
+                import asyncio
+                result = await asyncio.wait_for(dispatch_tool(tool_name, args), timeout=30.0)
+                result_str = str(result)
+                logger.info(f"Tool {tool_name} returned type={type(result).__name__}, len={len(result_str)}, content={result_str[:200]}")
+            except asyncio.TimeoutError:
+                logger.error(f"Tool {tool_name} timed out after 30 seconds")
+                result = f"Tool {tool_name} timed out after 30 seconds. The operation took too long to complete."
+            except Exception as e:
+                logger.error(f"Tool {tool_name} execution failed: {e}", exc_info=True)
+                result = f"Tool execution error: {str(e)}"
+            
+            # Validate result is not empty
+            result_str = str(result) if result is not None else ""
+            if not result_str or not result_str.strip():
+                logger.error(f"Tool {tool_name} returned empty result (type={type(result).__name__}), injecting error message")
+                result = f"Tool {tool_name} executed but returned no data. Please try again or use a different approach."
+            else:
+                result = result_str
 
             # Clear ThinkingCard phase so the LLM's next response is spoken, not swallowed
             if tool_name in _SLOW_TOOLS:
@@ -320,7 +378,21 @@ async def run_bot(
                 )
 
             # ── Result path: feed back to LLM for comprehensive spoken response ──
-            await params.result_callback(result)
+            logger.info(f"🔥 Calling result_callback for {tool_name} with {len(str(result))} chars: {str(result)[:150]}")
+            try:
+                await params.result_callback(result)
+                logger.info(f"🔥 result_callback completed for {tool_name}")
+                # Cache the result for deduplication
+                _last_tool_call["name"] = tool_name
+                _last_tool_call["args"] = _json.dumps(args, sort_keys=True, default=str)
+                _last_tool_call["result"] = result
+                logger.info(f"🔥 Cached result for {tool_name}")
+                # Small delay to ensure Pipecat processes the result before handler returns
+                import asyncio
+                await asyncio.sleep(0.1)
+                logger.info(f"🔥 HANDLER COMPLETE for {tool_name}")
+            except Exception as e:
+                logger.error(f"🔥 result_callback failed for {tool_name}: {e}", exc_info=True)
         return handler
 
     # Native casual tools
@@ -338,6 +410,8 @@ async def run_bot(
     llm.register_function("forget_memory", make_tool_handler("forget_memory"))
     # Delegated (actions requiring browser/email/calendar/shell)
     llm.register_function("openclaw_delegate", make_tool_handler("openclaw_delegate"))
+    # Hub Agent delegation (Pi Agent Hub background agents)
+    llm.register_function("hub_delegate", make_tool_handler("hub_delegate"))
     # Studio quick-reads (direct dashboard API)
     llm.register_function("check_studio", make_tool_handler("check_studio"))
     # Skill discovery (dynamic skill catalog from OpenClaw)
@@ -348,10 +422,10 @@ async def run_bot(
     llm.register_function("get_time", make_tool_handler("get_time"))
     # Timers & alarms
     llm.register_function("manage_timer", make_tool_handler("manage_timer"))
-    # Context Bridge - link goals to knowledge graph
+    # PCG - link goals to knowledge graph
     llm.register_function("link_goal_to_knowledge", make_tool_handler("link_goal_to_knowledge"))
 
-    # ── Personal Context Graph (PIC + KG-API via Context Bridge) ───────
+    # ── Personal Context Graph (PCG) ────────────────────────────────────────
     llm.register_function("save_memory", make_tool_handler("save_memory"))
     llm.register_function("recall_memory", make_tool_handler("recall_memory"))
     llm.register_function("query_context", make_tool_handler("query_context"))
@@ -371,6 +445,8 @@ async def run_bot(
     llm.register_function("tesla_control", make_tool_handler("tesla_control"))
     llm.register_function("tesla_stream_monitor", make_tool_handler("tesla_stream_monitor"))
     llm.register_function("tesla_location_refresh", make_tool_handler("tesla_location_refresh"))
+    llm.register_function("tesla_wake", make_tool_handler("tesla_wake"))
+    llm.register_function("tesla_navigation", make_tool_handler("tesla_navigation"))
 
     # ── Context with history restoration ─────────────────────────────────
     messages = [{"role": "system", "content": system_prompt}]
@@ -469,6 +545,17 @@ async def run_bot(
                         data = msg.get("data", {})
                         text = data.get("content", "") if isinstance(data, dict) else ""
                         if text:
+                            # Detect orchestration mode from iOS prefix and update thinking level
+                            if "MODE POLICY:" in text:
+                                if "FAST" in text.split("MODE POLICY:")[1].split("\n")[0]:
+                                    llm.set_thinking("low")
+                                    set_web_search_agent_mode("fast")
+                                elif "DEEP" in text.split("MODE POLICY:")[1].split("\n")[0]:
+                                    llm.set_thinking("high")
+                                    set_web_search_agent_mode("deep")
+                                else:
+                                    llm.set_thinking("medium")
+                                    set_web_search_agent_mode("fast")
                             logger.info(f"Native STT → LLM (RTVI): {text[:80]}")
 
                 elif isinstance(frame, OutputTransportMessageFrame):
@@ -534,8 +621,7 @@ async def run_bot(
     # Let tools.py send server messages (e.g. citations from web_search)
     from nova.tools import set_server_msg_fn, set_web_search_agent_mode
     set_server_msg_fn(_send_server_msg)
-    # iOS sends "Deep (Verified)" orchestration mode — use sonar-pro for web search
-    set_web_search_agent_mode("deep")
+    # Default to medium thinking; NativeTextBridge updates this per message based on MODE POLICY
 
     # ── Conversation persistence ─────────────────────────────────────────
     # Buffer assistant text chunks, persist complete turns on boundaries.
@@ -566,21 +652,37 @@ async def run_bot(
                     role = msg.get("role", "")
                     content = msg.get("content", "")
                     if role == "user" and content:
-                        # New user turn — reset per-turn dedup and tool counter
+                        # New user turn — reset per-turn dedup, tool counter, and dedup cache
                         _ack_sent_this_turn[0] = False
                         _tool_calls_this_turn[0] = 0
+                        _last_tool_call.update({"name": None, "args": None, "result": None})
                         await append_turn(session.session_id, "user", content)
+                        await _sync_message_to_backend(
+                            conversation_id, user_id, "user", content
+                        )
                         logger.debug(f"Persisted user turn ({len(content)} chars)")
                 self._last_len = len(msgs)
 
     ctx_watcher = _ContextWatcher()
 
+    # Track whether we've sent a thinking phase for the current LLM response
+    _thinking_phase_sent: list[bool] = [False]
+    _first_text_sent: list[bool] = [False]
+
     @task.event_handler("on_frame_reached_downstream")
     async def on_frame_downstream(task_ref, frame):
         if isinstance(frame, LLMTextFrame):
             _assistant_buffer.append(frame.text)
+            # First text chunk: transition from thinking → responding
+            if not _first_text_sent[0]:
+                _first_text_sent[0] = True
+                await _send_server_msg({"phase": "responding"})
         elif isinstance(frame, LLMFullResponseStartFrame):
             logger.info("🎯 LLMFullResponseStartFrame reached downstream → RTVI should send bot-llm-started")
+            # Send thinking phase so iOS shows orange stop button + thinking card
+            _thinking_phase_sent[0] = True
+            _first_text_sent[0] = False
+            await _send_server_msg({"phase": "thinking"})
             await ctx_watcher.check_and_persist()
         elif isinstance(frame, LLMFullResponseEndFrame):
             logger.info("🎯 LLMFullResponseEndFrame reached downstream → RTVI should send bot-llm-stopped")
@@ -589,7 +691,28 @@ async def run_bot(
                 _assistant_buffer.clear()
                 if full_text.strip():
                     await append_turn(session.session_id, "assistant", full_text)
+                    await _sync_message_to_backend(
+                        conversation_id, user_id, "assistant", full_text,
+                        model=LLM_MODEL,
+                    )
                     logger.debug(f"Persisted assistant turn ({len(full_text)} chars)")
+
+                    # Send validated event for iOS response card + speech
+                    from nova.text_utils import strip_markdown_for_speech
+                    speech_text = strip_markdown_for_speech(full_text)
+                    await _send_server_msg({
+                        "type": "validated",
+                        "text": full_text,
+                        "speechText": speech_text,
+                        "result": "direct",
+                        "suppressSpeech": False,
+                    })
+
+            # Signal turn complete and done phase
+            await _send_server_msg({"type": "turn_complete"})
+            if _thinking_phase_sent[0]:
+                await _send_server_msg({"phase": "done"})
+                _thinking_phase_sent[0] = False
 
     # Event bus: proactive notifications while user is connected
     event_handler = create_event_handler(task, user_id)
@@ -698,7 +821,7 @@ if __name__ == "__main__":
             logger.info(f"WebSocket auth received: {list(auth_data.keys())}")
             
             # Extract auth fields
-            user_id = auth_data.get("user_id", "default")
+            user_id = _resolve_user_id(auth_data.get("user_id", "default"))
             audio_mode = auth_data.get("audio_mode", "native")
             conversation_id = auth_data.get("conversation_id", "default")
             token = auth_data.get("token", "")
@@ -739,7 +862,7 @@ if __name__ == "__main__":
             
             async def on_connection(connection):
                 rd = webrtc_request.request_data or {}
-                user_id = rd.get("user_id", "default")
+                user_id = _resolve_user_id(rd.get("user_id", "default"))
                 audio_mode = rd.get("audio_mode", "native")
                 conversation_id = rd.get("conversation_id", "default")
                 logger.info(f"Starting bot: user={user_id}, audio={audio_mode}, conv={conversation_id}")
@@ -809,7 +932,7 @@ if __name__ == "__main__":
             
             async def on_connection(connection):
                 rd = webrtc_request.request_data or {}
-                user_id = rd.get("user_id", "default")
+                user_id = _resolve_user_id(rd.get("user_id", "default"))
                 audio_mode = rd.get("audio_mode", "native")
                 conversation_id = rd.get("conversation_id", "default")
                 logger.info(f"Starting bot: user={user_id}, audio={audio_mode}, conv={conversation_id}")
@@ -896,7 +1019,7 @@ if __name__ == "__main__":
             async def on_connection(connection):
                 # Extract user_id, audio_mode, conversation_id from request data
                 rd = webrtc_request.request_data or {}
-                user_id = rd.get("user_id", "default")
+                user_id = _resolve_user_id(rd.get("user_id", "default"))
                 audio_mode = rd.get("audio_mode", "native")
                 conversation_id = rd.get("conversation_id", "default")
                 logger.info(f"Starting bot: user={user_id}, audio={audio_mode}, conv={conversation_id}")

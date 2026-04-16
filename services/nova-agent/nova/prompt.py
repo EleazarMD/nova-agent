@@ -252,6 +252,19 @@ def build_system_prompt(
             "- Single-step lookups (memory, status, calendar, email) → call the tool directly\n"
             "- Multi-step investigations or browser actions → openclaw_delegate\n"
             "- For decisions/problems, call query_frameworks FIRST to discover LIAM frameworks\n\n"
+            "**Hub Agent delegation** (long-running, specialized, approval-gated tasks):\n"
+            "Use hub_delegate for tasks that need specialized background agents:\n"
+            "- Deep research (multi-source, 5+ sources) → hub_delegate(agent='atlas', method='research', params={topic: '...'})\n"
+            "- CIG analytics (email/calendar/contact patterns) → hub_delegate(agent='atlas', method='analytics', params={domain: 'email'})\n"
+            "- Fact-checking (cross-source verification) → hub_delegate(agent='atlas', method='factCheck', params={claim: '...'})\n"
+            "- Infrastructure ops (restart, health check) → hub_delegate(agent='infra', method='health')\n"
+            "- Code fixes / self-healing → hub_delegate(agent='coder', method='fix', context='...')\n"
+            "- Vehicle proactive monitoring → hub_delegate(agent='tesla', method='monitor', context='...')\n"
+            "Hub tasks may require approval via Hyperspace iOS push. Tell the user when approval is needed.\n\n"
+            "**When to use hub_delegate vs openclaw_delegate**:\n"
+            "- hub_delegate → research, analytics, infrastructure, code, vehicle automation (Hub agents)\n"
+            "- openclaw_delegate → browser automation, web ordering, form filling, email drafting (OpenClaw)\n"
+            "- Direct tools → quick lookups, status checks, weather, lights, memory (no delegation needed)\n\n"
             "**Approval tiers**:\n"
             "- Read/search/lookup → auto-execute\n"
             "- Calendar write, content creation → verbal confirmation\n"
@@ -281,7 +294,7 @@ def build_system_prompt(
         )
 
     # Context
-    ctx_lines = [f"- Time: {time_str}"]
+    ctx_lines = [f"- Session started: {time_str} (call get_time for current time)"]
     if user_name:
         ctx_lines.append(f"- User: {user_name}")
     if user_location:
