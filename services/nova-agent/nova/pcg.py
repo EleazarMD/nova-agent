@@ -428,16 +428,20 @@ async def query(
     # LIAM frameworks
     if include_frameworks:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{PCG_URL}/api/liam/query/dimensions",
-                    headers=_admin_headers(),
-                    json={"query": query},
-                    timeout=_TIMEOUT,
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results["frameworks"] = data.get("dimensions", [])[:5]
+            from nova.liam import query_frameworks as liam_query_frameworks
+            fw_result = await liam_query_frameworks(query, limit=3)
+            fw_list = fw_result.get("frameworks", [])
+            # Extract just the framework content for synthesis
+            results["frameworks"] = [
+                {
+                    "name": rec.get("framework", {}).get("name", rec.get("framework_name", "")),
+                    "description": rec.get("framework", {}).get("description", ""),
+                    "when_to_use": rec.get("framework", {}).get("when_to_use", ""),
+                    "key_concepts": rec.get("framework", {}).get("key_concepts", []),
+                }
+                for rec in fw_list
+                if rec.get("framework")
+            ]
         except Exception as e:
             logger.debug(f"PCG LIAM query skipped: {e}")
 
@@ -454,7 +458,7 @@ async def query(
     if results["frameworks"]:
         parts.append("Applicable frameworks:")
         for f in results["frameworks"][:3]:
-            parts.append(f"  - {f.get('name', f.get('id', '?'))}")
+            parts.append(f"  - {f.get('name', '?')}: {f.get('when_to_use', f.get('description', ''))[:80]}")
     results["synthesis"] = "\n".join(parts)
 
     return results

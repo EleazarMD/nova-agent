@@ -3672,6 +3672,7 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         "save_memory", "forget_memory",  # Mutating PIC
         "hub_delegate",  # Long-running, approval-gated Hub tasks
         "query_cig",  # User-specific CIG analytics
+        "query_frameworks",  # Dynamic LIAM framework discovery
         "set_reminder", "manage_timer",  # Mutating
         "control_lights",  # Mutating
         "manage_ticket", "manage_workspace", "manage_notes", "exomind",  # Mutating
@@ -4155,49 +4156,72 @@ TOOL_HANDLERS["homelab_diagnostics"] = handle_homelab_diagnostics
 
 async def handle_query_frameworks(**kwargs) -> dict:
     """Query LIAM for scientific frameworks applicable to a problem."""
+    from nova.liam import query_frameworks as liam_query_frameworks
+    from nova.liam import list_dimensions as liam_list_dimensions
+
     problem_description = kwargs.get("problem_description", "")
     dimension_id = kwargs.get("dimension_id")
     category = kwargs.get("category")
     limit = kwargs.get("limit", 5)
-    
+
     if not problem_description:
         return {
             "success": False,
             "error": "problem_description is required"
         }
-    
-    # Import the skill script
-    import sys
-    skill_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)),
-        "skills/query-frameworks/scripts"
-    )
-    sys.path.insert(0, skill_path)
-    
+
     try:
-        from query_frameworks import query_frameworks
-        
-        result = await query_frameworks(
+        # Build dimension filter if specified
+        dimension_filter = [dimension_id] if dimension_id else None
+
+        result = await liam_query_frameworks(
             problem_description=problem_description,
-            dimension_id=dimension_id,
-            category=category,
+            dimension_filter=dimension_filter,
             limit=limit,
-            use_semantic=True
         )
-        
-        if "error" in result:
-            return {
-                "success": False,
-                "error": result["error"],
-                "fallback": "Using hardcoded framework quick-reference from training knowledge"
-            }
-        
+
+        frameworks = result.get("frameworks", [])
+
+        # Filter by category if specified
+        if category:
+            frameworks = [
+                f for f in frameworks
+                if f.get("framework", {}).get("category") == category
+                or f.get("category", "") == category
+            ]
+
+        # Build clean response with full framework content
+        clean_frameworks = []
+        for rec in frameworks:
+            fw = rec.get("framework", {})
+            clean_frameworks.append({
+                "name": fw.get("name", rec.get("framework_name", "")),
+                "source": fw.get("source", ""),
+                "category": fw.get("category", ""),
+                "description": fw.get("description", ""),
+                "when_to_use": fw.get("when_to_use", ""),
+                "key_concepts": fw.get("key_concepts", rec.get("key_insights", [])),
+                "limitations": fw.get("limitations", ""),
+                "applicable_dimensions": fw.get("applicable_dimensions", rec.get("applicable_dimensions", [])),
+                "relevance_score": rec.get("relevance_score", 0),
+                "reasoning": rec.get("reasoning", ""),
+            })
+
+        # Build synthesis
+        synthesis = ""
+        if clean_frameworks:
+            names = [f["name"] for f in clean_frameworks[:3]]
+            if len(clean_frameworks) == 1:
+                synthesis = f"Apply {clean_frameworks[0]['name']}: {clean_frameworks[0].get('when_to_use', '')}"
+            else:
+                synthesis = f"Use multiple frameworks (Model Thinker approach): {', '.join(names)}. Each provides a different lens on the problem."
+
         return {
             "success": True,
-            "query": result.get("query"),
-            "frameworks": result.get("applicable_frameworks", []),
-            "dimensions": result.get("dimensions_detected", []),
-            "synthesis": result.get("synthesis", "")
+            "query": result.get("query", problem_description),
+            "frameworks": clean_frameworks,
+            "total_frameworks": result.get("total_frameworks", 0),
+            "synthesis": synthesis,
         }
     except Exception as e:
         logger.error(f"Framework query failed: {e}")
@@ -4206,15 +4230,12 @@ async def handle_query_frameworks(**kwargs) -> dict:
             "error": f"Framework query error: {str(e)}",
             "fallback": "Using hardcoded framework quick-reference from training knowledge"
         }
-    finally:
-        if skill_path in sys.path:
-            sys.path.remove(skill_path)
 
 QUERY_FRAMEWORKS_TOOL = {
     "type": "function",
     "function": {
         "name": "query_frameworks",
-        "description": "Query LIAM (Life Intelligence Augmentation Matrix) for scientific frameworks applicable to a decision, problem, or life question. Returns framework names, when to use them, key concepts, limitations, and a synthesis of how they apply. Use this to dynamically discover frameworks as they are added to the knowledge graph. Always call this BEFORE applying frameworks to ensure you're using the latest available frameworks, not just hardcoded ones.",
+        "description": "Query LIAM (Life Intelligence Augmentation Matrix) for scientific frameworks applicable to a decision, problem, or life question. Returns full framework details: name, source, description, when to use, key concepts, limitations, applicable life dimensions, relevance score, and a synthesis. Covers 48 frameworks across 8 categories (decision_making, systems, computational, behavioral, probabilistic, strategic, structural, information_processing) mapped to 16 life dimensions. ALWAYS call this BEFORE applying frameworks to ensure you use the latest available knowledge, not just training data.",
         "parameters": {
             "type": "object",
             "properties": {

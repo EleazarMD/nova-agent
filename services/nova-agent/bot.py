@@ -236,7 +236,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -279,6 +279,7 @@ async def run_bot(
             "tesla_wake": "Waking up Tesla vehicle...",
             "tesla_navigation": f"Sending navigation to {args.get('destination', 'destination')[:40]}...",
             "web_search": f"Searching for {args.get('query', 'information')[:40]}...",
+            "query_frameworks": f"🧠 Querying LIAM frameworks for {args.get('problem_description', 'decision support')[:40]}...",
             "service_status": f"Checking status of {args.get('container', 'services')}...",
             "homelab_diagnostics": "Running homelab diagnostics...",
         }
