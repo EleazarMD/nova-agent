@@ -360,48 +360,61 @@ async def _search_local_conversations(
     days_back: int,
     limit: int,
 ) -> list[dict]:
-    """Fallback: search recent conversations in local SQLite."""
+    """Fallback: search recent conversations in local SQLite.
+    
+    Searches across the given user_id AND 'default' user, since historical
+    conversations were stored under user_id='default' before proper user
+    identification was implemented. Also falls back to all users if the
+    specific user_id yields nothing.
+    """
     try:
         terms = [t.lower() for t in query.split() if len(t) >= 2]
         if not terms:
             return []
         
         cutoff = time.time() - (days_back * 86400)
+        placeholders = " OR ".join(["LOWER(t.content) LIKE ?" for _ in terms])
+        params = [f"%{t}%" for t in terms]
+        
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            # Search turns for matching content
-            placeholders = " OR ".join(["LOWER(t.content) LIKE ?" for _ in terms])
-            params = [f"%{t}%" for t in terms]
             
-            rows = await db.execute_fetchall(
-                f"""SELECT DISTINCT s.conversation_id, s.session_id,
-                           MIN(CASE WHEN t.role='user' THEN t.content END) as first_user_msg,
-                           COUNT(*) as match_count
-                    FROM turns t
-                    JOIN sessions s ON t.session_id = s.session_id
-                    WHERE s.user_id = ?
-                      AND t.timestamp >= ?
-                      AND ({placeholders})
-                    GROUP BY s.conversation_id
-                    ORDER BY match_count DESC, MAX(t.timestamp) DESC
-                    LIMIT ?""",
-                [user_id, cutoff] + params + [limit],
-            )
+            # Try specific user_id first, then fall back to all users
+            for user_filter, label in [
+                (f"s.user_id IN (?, 'default')", "user+default"),
+                ("1=1", "all_users"),
+            ]:
+                rows = await db.execute_fetchall(
+                    f"""SELECT DISTINCT s.conversation_id, s.session_id,
+                               MIN(CASE WHEN t.role='user' THEN t.content END) as first_user_msg,
+                               COUNT(*) as match_count
+                        FROM turns t
+                        JOIN sessions s ON t.session_id = s.session_id
+                        WHERE {user_filter}
+                          AND t.timestamp >= ?
+                          AND ({placeholders})
+                        GROUP BY s.conversation_id
+                        ORDER BY match_count DESC, MAX(t.timestamp) DESC
+                        LIMIT ?""",
+                    [user_id, cutoff] + params + [limit] if label == "user+default"
+                    else [cutoff] + params + [limit],
+                )
+                
+                if rows:
+                    results = []
+                    for r in rows:
+                        snippet = r["first_user_msg"] or ""
+                        results.append({
+                            "conversation_id": r["conversation_id"],
+                            "title": f"Conversation {r['conversation_id'][:8]}",
+                            "snippet": snippet[:200],
+                            "relevance_score": min(r["match_count"] / 10.0, 1.0),
+                            "source": f"sqlite_fallback({label})",
+                        })
+                    logger.info(f"Local SQLite fallback found {len(results)} conversations for '{query}' (scope={label})")
+                    return results
             
-            results = []
-            for r in rows:
-                snippet = r["first_user_msg"] or ""
-                results.append({
-                    "conversation_id": r["conversation_id"],
-                    "title": f"Conversation {r['conversation_id'][:8]}",
-                    "snippet": snippet[:200],
-                    "relevance_score": min(r["match_count"] / 10.0, 1.0),
-                    "source": "sqlite_fallback",
-                })
-            
-            if results:
-                logger.info(f"Local SQLite fallback found {len(results)} conversations for '{query}'")
-            return results
+            return []
     except Exception as e:
         logger.warning(f"Local conversation search error: {e}")
         return []
