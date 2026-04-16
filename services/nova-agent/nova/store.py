@@ -2,18 +2,19 @@
 Persistent conversation store backed by SQLite + PostgreSQL.
 
 SQLite: Primary local store — fast, always available, no external dependency.
-PostgreSQL (direct asyncpg): Full-text search + long-term retention.
-Dashboard API: Used only for message sync (auto-creates conversations).
+PostgreSQL (direct asyncpg): Long-term retention, cross-device sync, full-text search.
+
+Nova owns her data pipeline end-to-end. No Dashboard API dependency.
 
 Stores conversation turns per conversation_id, supports session lookup by
 user_id, and syncs to PostgreSQL for cross-device access and retention.
 """
 
-import aiohttp
 import aiosqlite
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -26,8 +27,6 @@ except ImportError:
     _HAS_ASYNCPG = False
 
 DB_PATH = os.environ.get("SQLITE_PATH", "./data/nova.db")
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://localhost:8404")
-DASHBOARD_API_KEY = os.environ.get("DASHBOARD_API_KEY", "ai-gateway-api-key-2024")
 PG_DSN = os.environ.get("DATABASE_URL", "postgresql://eleazar@localhost/ecosystem_unified")
 
 # Reusable asyncpg pool (lazy-initialized)
@@ -214,8 +213,98 @@ async def get_user_sessions(
 
 
 # ---------------------------------------------------------------------------
-# PostgreSQL Sync (via Dashboard API) - Source of Truth
+# PostgreSQL Direct (asyncpg) — Nova owns her data pipeline
 # ---------------------------------------------------------------------------
+
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+# PII redaction patterns (mirrors Dashboard API logic)
+_CRITICAL_REDACTIONS = [
+    (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), '[REDACTED:SSN]'),
+    (re.compile(r'\b(?:\d{4}[-\s]?){3}\d{4}\b'), '[REDACTED:CARD]'),
+    (re.compile(r'(?:password|passwd|pwd)\s*[:=]\s*["\']?(\S{4,})["\']?', re.I), '[REDACTED:PASSWORD]'),
+    (re.compile(r'(?:api[_-]?key|apikey|secret|token)\s*[:=]\s*["\']?([a-zA-Z0-9_\-]{20,})["\']?', re.I), '[REDACTED:API_KEY]'),
+    (re.compile(r'Bearer\s+[a-zA-Z0-9_\-.]+', re.I), '[REDACTED:BEARER]'),
+]
+
+def _sanitize_content(content: str) -> str:
+    """Redact critical PII before storage."""
+    for pattern, replacement in _CRITICAL_REDACTIONS:
+        content = pattern.sub(replacement, content)
+    return content
+
+def _calculate_importance(content: str, role: str, has_tool_calls: bool = False) -> int:
+    """Calculate message importance score (0-100)."""
+    score = 50
+    lower = content.lower()
+    if has_tool_calls:
+        score += 15
+    for kw in ['remember', 'important', 'never forget', 'always', 'critical', 'must', 'decision', 'agreed']:
+        if kw in lower:
+            score += 10
+            break
+    for kw in ['prefer', 'like', 'want', 'need', 'should']:
+        if kw in lower:
+            score += 5
+            break
+    for kw in ['hello', 'hi', 'thanks', 'okay', 'ok', 'bye', 'goodbye']:
+        if lower == kw or lower.startswith(kw + ' ') or lower.startswith(kw + ','):
+            score -= 10
+            break
+    if len(content) > 500:
+        score += 10
+    elif len(content) < 20:
+        score -= 10
+    if role == 'user' and '?' in content:
+        score += 5
+    return max(0, min(100, score))
+
+
+async def _resolve_or_create_conversation(
+    conversation_id: str,
+    user_id: str,
+    pool: asyncpg.Pool,
+) -> Optional[str]:
+    """Resolve Nova's string conversation_id to PostgreSQL UUID.
+    
+    Tries: UUID match → external_id lookup → auto-create.
+    Returns the PostgreSQL UUID or None on failure.
+    """
+    # 1. Direct UUID match
+    if _UUID_RE.match(conversation_id):
+        row = await pool.fetchrow(
+            "SELECT id FROM workspace.ai_conversations WHERE id = $1 AND user_id = $2",
+            conversation_id, user_id,
+        )
+        if row:
+            return str(row["id"])
+    
+    # 2. Lookup by external_id in config JSONB
+    row = await pool.fetchrow(
+        """SELECT id FROM workspace.ai_conversations
+           WHERE user_id = $1 AND config->>'external_id' = $2
+           ORDER BY created_at DESC LIMIT 1""",
+        user_id, conversation_id,
+    )
+    if row:
+        return str(row["id"])
+    
+    # 3. Auto-create
+    row = await pool.fetchrow(
+        """INSERT INTO workspace.ai_conversations
+           (title, user_id, source, config, importance_score, retention_tier)
+           VALUES ($1, $2, 'nova', $3::jsonb, 50, 'hot')
+           RETURNING id""",
+        f"Nova Conversation {conversation_id[:8]}",
+        user_id,
+        json.dumps({"external_id": conversation_id}),
+    )
+    if row:
+        logger.info(f"Auto-created PG conversation: {conversation_id[:16]}...")
+        return str(row["id"])
+    
+    return None
+
 
 async def _sync_message_to_backend(
     conversation_id: str,
@@ -227,50 +316,66 @@ async def _sync_message_to_backend(
     tool_calls: list = None,
     _retry: int = 0,
 ):
-    """Sync a message to PostgreSQL via Dashboard API.
+    """Sync a message directly to PostgreSQL via asyncpg.
     
-    Retries once on transient failures. Called via await (bot.py) or
-    asyncio.create_task (text_chat.py) — errors are logged prominently.
+    No Dashboard dependency. Handles conversation resolution, PII redaction,
+    importance scoring, and conversation stats updates.
     """
+    if not _HAS_ASYNCPG:
+        logger.debug("asyncpg not available, skipping backend sync")
+        return
+    
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{DASHBOARD_URL}/api/memory/conversations/{conversation_id}/messages",
-                headers={
-                    "X-API-Key": DASHBOARD_API_KEY,
-                    "X-User-Id": user_id,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "role": role,
-                    "content": content,
-                    "model": model,
-                    "tokens_used": tokens_used,
-                    "tool_calls": tool_calls,
-                },
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status in (200, 201):
-                    logger.info(f"✅ Synced {role} message to backend: {conversation_id[:16]}... ({len(content)} chars)")
-                else:
-                    text = await resp.text()
-                    if _retry < 1 and resp.status >= 500:
-                        logger.warning(f"Backend sync retryable ({resp.status}), retrying: {text[:80]}")
-                        await asyncio.sleep(1)
-                        return await _sync_message_to_backend(
-                            conversation_id, user_id, role, content,
-                            model, tokens_used, tool_calls, _retry=_retry + 1,
-                        )
-                    logger.warning(f"Backend sync failed: {resp.status} {text[:100]}")
+        pool = await _get_pg_pool()
+        
+        # Resolve conversation UUID
+        pg_conv_id = await _resolve_or_create_conversation(conversation_id, user_id, pool)
+        if not pg_conv_id:
+            logger.error(f"Failed to resolve/create conversation: {conversation_id}")
+            return
+        
+        # Sanitize and score
+        safe_content = _sanitize_content(content)
+        importance = _calculate_importance(safe_content, role, bool(tool_calls))
+        is_preserved = importance >= 70
+        
+        # Insert message
+        await pool.execute(
+            """INSERT INTO workspace.ai_messages
+               (conversation_id, role, content, model, tokens_used, cost, metadata,
+                importance_score, is_preserved)
+               VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::jsonb, $7, $8)""",
+            pg_conv_id, role, safe_content, model, tokens_used or 0,
+            json.dumps({"tool_calls": tool_calls} if tool_calls else {}),
+            importance, is_preserved,
+        )
+        
+        # Update conversation stats
+        await pool.execute(
+            """UPDATE workspace.ai_conversations
+               SET last_message_at = NOW(),
+                   updated_at = NOW(),
+                   message_count = message_count + 1,
+                   total_tokens = total_tokens + $2,
+                   importance_score = (
+                       SELECT COALESCE(AVG(importance_score)::INTEGER, 50)
+                       FROM workspace.ai_messages WHERE conversation_id = $1::uuid
+                   )
+               WHERE id = $1::uuid""",
+            pg_conv_id, tokens_used or 0,
+        )
+        
+        logger.info(f"✅ Synced {role} message to PG: {conversation_id[:16]}... ({len(content)} chars)")
+    
     except Exception as e:
         if _retry < 1:
-            logger.warning(f"Backend sync error, retrying: {e}")
+            logger.warning(f"PG sync error, retrying: {e}")
             await asyncio.sleep(1)
             return await _sync_message_to_backend(
                 conversation_id, user_id, role, content,
                 model, tokens_used, tool_calls, _retry=_retry + 1,
             )
-        logger.error(f"❌ Backend sync failed after retry: {e}")
+        logger.error(f"❌ PG sync failed after retry: {e}")
 
 
 async def ensure_backend_conversation(
@@ -279,50 +384,38 @@ async def ensure_backend_conversation(
     title: str = "Nova Conversation",
     session_context: dict | None = None,
 ) -> bool:
-    """Ensure conversation exists in PostgreSQL backend.
+    """Ensure conversation exists in PostgreSQL via asyncpg.
     
     Uses external_id to map Nova's string conversation IDs to PostgreSQL UUIDs.
-    
-    session_context (optional) is set once at session start:
-      client: "ios" | "dashboard" | "tesla" | "web"
-      audio_mode: "native" | "server" | "text"
-      device: str or None (e.g. "iPhone 16 Pro")
-      app_version: str or None
-      location: {city, state, zip, lat, lng} or None
-      timezone: str or None
-    
-    Clients without location (Tesla, Dashboard) simply omit the field.
+    No Dashboard dependency.
     """
+    if not _HAS_ASYNCPG:
+        return False
+    
     try:
-        body: dict = {
-            "title": title,
-            "source": "nova",
-            "external_id": conversation_id,
-        }
-        if session_context:
-            body["session_context"] = session_context
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{DASHBOARD_URL}/api/memory/conversations",
-                headers={
-                    "X-API-Key": DASHBOARD_API_KEY,
-                    "X-User-Id": user_id,
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status in (200, 201):
-                    data = await resp.json()
-                    existing = data.get("existing", False)
-                    logger.info(f"Backend conversation {'found' if existing else 'created'}: {conversation_id}")
-                    return True
-                else:
-                    logger.warning(f"Failed to ensure backend conversation: {resp.status}")
-                    return False
+        pool = await _get_pg_pool()
+        
+        # Check if exists (by UUID or external_id)
+        pg_id = await _resolve_or_create_conversation(conversation_id, user_id, pool)
+        if pg_id:
+            # If auto-created, update title and session_context if provided
+            if session_context:
+                config_update = {"external_id": conversation_id}
+                for key in ("client", "audio_mode", "device", "app_version", "timezone", "started_at"):
+                    if key in session_context:
+                        config_update[key] = session_context[key]
+                if "location" in session_context:
+                    config_update["location"] = session_context["location"]
+                await pool.execute(
+                    "UPDATE workspace.ai_conversations SET config = config || $2::jsonb WHERE id = $1::uuid AND NOT (config ? 'location')",
+                    pg_id, json.dumps(config_update),
+                )
+            logger.info(f"Backend conversation ensured: {conversation_id[:16]}...")
+            return True
+        
+        return False
     except Exception as e:
-        logger.warning(f"Backend conversation check error: {e}")
+        logger.warning(f"Backend conversation ensure error: {e}")
         return False
 
 
@@ -517,23 +610,38 @@ async def get_backend_conversations(
     user_id: str,
     limit: int = 20,
 ) -> list[dict]:
-    """Get user's conversations from PostgreSQL backend."""
+    """Get user's conversations from PostgreSQL directly via asyncpg."""
+    if not _HAS_ASYNCPG:
+        return []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{DASHBOARD_URL}/api/memory/conversations",
-                params={"limit": limit},
-                headers={
-                    "X-API-Key": DASHBOARD_API_KEY,
-                    "X-User-Id": user_id,
-                },
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("conversations", [])
-                else:
-                    return []
+        pool = await _get_pg_pool()
+        # Include 'default' user for historical data
+        user_filter = "user_id = $1" if user_id == "default" else "user_id IN ($1, 'default')"
+        rows = await pool.fetch(
+            f"""SELECT id, title, user_id, source, importance_score, summary,
+                       retention_tier, message_count, total_tokens,
+                       created_at, updated_at, last_message_at
+                FROM workspace.ai_conversations
+                WHERE {user_filter}
+                  AND retention_tier != 'archived'
+                ORDER BY last_message_at DESC NULLS LAST, updated_at DESC
+                LIMIT $2""",
+            user_id, limit,
+        )
+        return [
+            {
+                "id": str(r["id"]),
+                "title": r["title"],
+                "user_id": r["user_id"],
+                "source": r["source"],
+                "importance_score": r["importance_score"],
+                "message_count": r["message_count"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                "last_message_at": r["last_message_at"].isoformat() if r["last_message_at"] else None,
+            }
+            for r in rows
+        ]
     except Exception as e:
         logger.warning(f"Get conversations error: {e}")
         return []
@@ -543,22 +651,56 @@ async def get_backend_conversation(
     conversation_id: str,
     user_id: str,
 ) -> dict | None:
-    """Get a single conversation with messages from PostgreSQL backend."""
+    """Get a single conversation with messages from PostgreSQL directly via asyncpg."""
+    if not _HAS_ASYNCPG:
+        return None
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{DASHBOARD_URL}/api/memory/conversations/{conversation_id}",
-                headers={
-                    "X-API-Key": DASHBOARD_API_KEY,
-                    "X-User-Id": user_id,
-                },
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("conversation")
-                else:
-                    return None
+        pool = await _get_pg_pool()
+        
+        # Resolve conversation UUID
+        pg_id = await _resolve_or_create_conversation(conversation_id, user_id, pool)
+        if not pg_id:
+            return None
+        
+        # Get conversation metadata
+        conv = await pool.fetchrow(
+            """SELECT id, title, user_id, source, importance_score, message_count,
+                      created_at, updated_at, last_message_at
+               FROM workspace.ai_conversations WHERE id = $1::uuid""",
+            pg_id,
+        )
+        if not conv:
+            return None
+        
+        # Get messages
+        msgs = await pool.fetch(
+            """SELECT id, role, content, model, tokens_used, created_at,
+                      importance_score, is_preserved
+               FROM workspace.ai_messages
+               WHERE conversation_id = $1::uuid
+               ORDER BY created_at ASC""",
+            pg_id,
+        )
+        
+        return {
+            "id": str(conv["id"]),
+            "title": conv["title"],
+            "user_id": conv["user_id"],
+            "message_count": conv["message_count"],
+            "created_at": conv["created_at"].isoformat() if conv["created_at"] else None,
+            "messages": [
+                {
+                    "id": str(m["id"]),
+                    "role": m["role"],
+                    "content": m["content"],
+                    "model": m["model"],
+                    "tokens_used": m["tokens_used"],
+                    "created_at": m["created_at"].isoformat() if m["created_at"] else None,
+                    "importance_score": m["importance_score"],
+                }
+                for m in msgs
+            ],
+        }
     except Exception as e:
         logger.warning(f"Get conversation error: {e}")
         return None
