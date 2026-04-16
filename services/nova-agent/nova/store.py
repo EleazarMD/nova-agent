@@ -1,11 +1,12 @@
 """
-Persistent conversation store backed by SQLite + PostgreSQL sync.
+Persistent conversation store backed by SQLite + PostgreSQL.
 
-SQLite: Local session state and fast access for current conversation.
-PostgreSQL (via Dashboard API): Source of truth for all conversation history.
+SQLite: Primary local store — fast, always available, no external dependency.
+PostgreSQL (direct asyncpg): Full-text search + long-term retention.
+Dashboard API: Used only for message sync (auto-creates conversations).
 
 Stores conversation turns per conversation_id, supports session lookup by
-user_id, and syncs to backend for RFI retention policy.
+user_id, and syncs to PostgreSQL for cross-device access and retention.
 """
 
 import aiohttp
@@ -18,9 +19,30 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 from loguru import logger
 
+try:
+    import asyncpg
+    _HAS_ASYNCPG = True
+except ImportError:
+    _HAS_ASYNCPG = False
+
 DB_PATH = os.environ.get("SQLITE_PATH", "./data/nova.db")
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://localhost:8404")
 DASHBOARD_API_KEY = os.environ.get("DASHBOARD_API_KEY", "ai-gateway-api-key-2024")
+PG_DSN = os.environ.get("DATABASE_URL", "postgresql://eleazar@localhost/ecosystem_unified")
+
+# Reusable asyncpg pool (lazy-initialized)
+_pg_pool: Optional[asyncpg.Pool] = None
+
+
+async def _get_pg_pool() -> asyncpg.Pool:
+    """Get or create the asyncpg connection pool."""
+    global _pg_pool
+    if _pg_pool is not None and not _pg_pool._closed:
+        return _pg_pool
+    if not _HAS_ASYNCPG:
+        raise RuntimeError("asyncpg not installed")
+    _pg_pool = await asyncpg.create_pool(dsn=PG_DSN, min_size=1, max_size=5)
+    return _pg_pool
 
 
 @dataclass
@@ -312,44 +334,21 @@ async def search_past_conversations(
     from_days: int | None = None,
     to_days: int | None = None,
 ) -> list[dict]:
-    """Search past conversations via Dashboard API with SQLite fallback.
+    """Search past conversations: SQLite first, then PostgreSQL directly.
+    
+    No Dashboard dependency — Nova queries her own data directly.
     
     Time intervals:
       days_back=7          → last 7 days from now
       from_days=90, to_days=7  → between 3 months ago and 1 week ago
     """
-    results = []
+    # 1. SQLite first — fast, always available, no external dependency
+    results = await _search_local_conversations(user_id, query, days_back, limit)
     
-    # Try Dashboard API first (PostgreSQL + ChromaDB vector search)
-    try:
-        params: dict = {"q": query, "limit": limit}
-        if from_days is not None and to_days is not None:
-            params["from_days"] = from_days
-            params["to_days"] = to_days
-        else:
-            params["days_back"] = days_back
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{DASHBOARD_URL}/api/memory/conversations/search",
-                params=params,
-                headers={
-                    "X-API-Key": DASHBOARD_API_KEY,
-                    "X-User-Id": user_id,
-                },
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get("results", [])
-                else:
-                    logger.warning(f"Conversation search failed: {resp.status}")
-    except Exception as e:
-        logger.warning(f"Conversation search error: {e}")
-    
-    # If backend returned nothing, fall back to local SQLite search
+    # 2. If SQLite had nothing, try PostgreSQL directly (not via Dashboard)
     if not results:
-        results = await _search_local_conversations(user_id, query, days_back, limit)
+        results = await _search_postgres_direct(user_id, query, days_back, limit,
+                                                 from_days=from_days, to_days=to_days)
     
     return results
 
@@ -417,6 +416,100 @@ async def _search_local_conversations(
             return []
     except Exception as e:
         logger.warning(f"Local conversation search error: {e}")
+        return []
+
+
+async def _search_postgres_direct(
+    user_id: str,
+    query: str,
+    days_back: int,
+    limit: int,
+    from_days: int | None = None,
+    to_days: int | None = None,
+) -> list[dict]:
+    """Search conversations directly in PostgreSQL via asyncpg.
+    
+    Bypasses the Dashboard API entirely — Nova owns her data.
+    Includes 'default' user's conversations for historical data.
+    """
+    if not _HAS_ASYNCPG:
+        logger.debug("asyncpg not available, skipping direct PG search")
+        return []
+    
+    try:
+        pool = await _get_pg_pool()
+        terms = [t for t in query.split() if len(t) >= 2]
+        if not terms:
+            return []
+        
+        # Build parameterized ILIKE conditions ($3, $4, ... for search terms)
+        # Each term needs two placeholders (content + title)
+        param_idx = 3  # $1=user_id, $2=limit
+        conditions = []
+        params = [user_id, limit]
+        for t in terms:
+            like_val = f"%{t}%"
+            conditions.append(f"(m.content ILIKE ${param_idx} OR c.title ILIKE ${param_idx})")
+            params.append(like_val)
+            param_idx += 1
+        conditions_sql = " OR ".join(conditions)
+        
+        # Time window (parameterized)
+        if from_days is not None and to_days is not None:
+            from_interval = f"{min(from_days, 365)} days"
+            to_interval = f"{max(to_days, 0)} days"
+            time_filter = f"c.created_at >= NOW() - INTERVAL ${param_idx} AND c.created_at <= NOW() - INTERVAL ${param_idx + 1}"
+            params.extend([from_interval, to_interval])
+            param_idx += 2
+        else:
+            interval = f"{min(days_back, 365)} days"
+            time_filter = f"c.created_at >= NOW() - INTERVAL ${param_idx}"
+            params.append(interval)
+            param_idx += 1
+        
+        # Include 'default' user for historical data
+        user_filter = (
+            "c.user_id = $1" if user_id == "default"
+            else "c.user_id IN ($1, 'default')"
+        )
+        
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""SELECT DISTINCT ON (c.id)
+                       c.id as conversation_id,
+                       c.title,
+                       m.content as snippet,
+                       c.importance_score as relevance_score,
+                       c.created_at,
+                       c.message_count
+                   FROM workspace.ai_conversations c
+                   JOIN workspace.ai_messages m ON m.conversation_id = c.id
+                   WHERE {user_filter}
+                     AND c.retention_tier != 'archived'
+                     AND {time_filter}
+                     AND ({conditions_sql})
+                   ORDER BY c.id, c.importance_score DESC, c.last_message_at DESC
+                   LIMIT $2""",
+                *params,
+            )
+            
+            results = []
+            for r in rows:
+                results.append({
+                    "conversation_id": str(r["conversation_id"]),
+                    "title": r["title"] or "Untitled",
+                    "snippet": (r["snippet"] or "")[:200],
+                    "relevance_score": (r["relevance_score"] or 50) / 100,
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else "",
+                    "message_count": r["message_count"] or 0,
+                    "source": "postgres_direct",
+                })
+            
+            if results:
+                logger.info(f"Direct PG search found {len(results)} conversations for '{query}'")
+            return results
+    except Exception as e:
+        logger.warning(f"Direct PG search error: {e}")
         return []
 
 
