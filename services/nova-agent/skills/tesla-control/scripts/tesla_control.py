@@ -49,7 +49,7 @@ async def _tesla_api(method: str, path: str, body: dict = None) -> dict:
 
 async def handle_tesla_status(user_id: str) -> str:
     """Check Tesla connection status."""
-    result = await _tesla_api("GET", "/auth/status?user_id={user_id}")
+    result = await _tesla_api("GET", f"/auth/status?user_id={user_id}")
     
     if result.get("error"):
         return result["error"]
@@ -65,13 +65,16 @@ async def handle_tesla_vehicles(user_id: str) -> str:
     """List Tesla vehicles."""
     result = await _tesla_api("GET", "/vehicles")
     
-    if result.get("error"):
+    # Tesla Relay returns direct array, not wrapped in {"response": [...]}
+    if isinstance(result, list):
+        vehicles = result
+    elif isinstance(result, dict) and result.get("error"):
         if result.get("needs_auth"):
             return "Tesla account not connected. Please connect your Tesla account first."
         return result["error"]
+    else:
+        vehicles = result.get("response", [])
     
-    # Tesla Relay returns direct array, not wrapped in {"response": [...]}
-    vehicles = result if isinstance(result, list) else result.get("response", [])
     if not vehicles:
         return "No Tesla vehicles found on your account."
     
