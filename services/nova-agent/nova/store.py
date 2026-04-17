@@ -12,6 +12,7 @@ user_id, and syncs to PostgreSQL for cross-device access and retention.
 
 import aiosqlite
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -452,12 +453,11 @@ async def _search_local_conversations(
     days_back: int,
     limit: int,
 ) -> list[dict]:
-    """Fallback: search recent conversations in local SQLite.
+    """Search recent conversations in local SQLite.
     
-    Searches across the given user_id AND 'default' user, since historical
-    conversations were stored under user_id='default' before proper user
-    identification was implemented. Also falls back to all users if the
-    specific user_id yields nothing.
+    Returns actual matching messages with surrounding context, not just
+    conversation metadata. Searches across the given user_id AND 'default'
+    user, since historical conversations were stored under user_id='default'.
     """
     try:
         terms = [t.lower() for t in query.split() if len(t) >= 2]
@@ -476,34 +476,73 @@ async def _search_local_conversations(
                 (f"s.user_id IN (?, 'default')", "user+default"),
                 ("1=1", "all_users"),
             ]:
-                rows = await db.execute_fetchall(
-                    f"""SELECT DISTINCT s.conversation_id, s.session_id,
-                               MIN(CASE WHEN t.role='user' THEN t.content END) as first_user_msg,
-                               COUNT(*) as match_count
+                # Find matching messages directly — not grouped by conversation
+                match_rows = await db.execute_fetchall(
+                    f"""SELECT t.rowid, t.role, t.content, t.timestamp,
+                               s.conversation_id, s.session_id, s.user_id
                         FROM turns t
                         JOIN sessions s ON t.session_id = s.session_id
                         WHERE {user_filter}
                           AND t.timestamp >= ?
                           AND ({placeholders})
-                        GROUP BY s.conversation_id
-                        ORDER BY match_count DESC, MAX(t.timestamp) DESC
+                        ORDER BY t.timestamp DESC
                         LIMIT ?""",
-                    [user_id, cutoff] + params + [limit] if label == "user+default"
-                    else [cutoff] + params + [limit],
+                    [user_id, cutoff] + params + [limit * 3] if label == "user+default"
+                    else [cutoff] + params + [limit * 3],
                 )
                 
-                if rows:
-                    results = []
-                    for r in rows:
-                        snippet = r["first_user_msg"] or ""
-                        results.append({
-                            "conversation_id": r["conversation_id"],
-                            "title": f"Conversation {r['conversation_id'][:8]}",
-                            "snippet": snippet[:200],
-                            "relevance_score": min(r["match_count"] / 10.0, 1.0),
-                            "source": f"sqlite_fallback({label})",
-                        })
-                    logger.info(f"Local SQLite fallback found {len(results)} conversations for '{query}' (scope={label})")
+                if not match_rows:
+                    continue
+                
+                # For each match, get surrounding context (prev + next message)
+                results = []
+                seen_conversations = set()
+                for m in match_rows:
+                    conv_id = m["conversation_id"]
+                    
+                    # Get context: 1 message before and 1 after the match
+                    context_parts = []
+                    try:
+                        context_rows = await db.execute_fetchall(
+                            """SELECT role, content FROM turns
+                               WHERE session_id = ? AND rowid BETWEEN ? AND ?
+                               ORDER BY rowid""",
+                            (m["session_id"], m["rowid"] - 1, m["rowid"] + 1),
+                        )
+                        for cr in context_rows:
+                            role_label = "User" if cr["role"] == "user" else "Nova"
+                            context_parts.append(f"{role_label}: {cr['content'][:150]}")
+                    except Exception:
+                        context_parts.append(f"{'User' if m['role']=='user' else 'Nova'}: {m['content'][:200]}")
+                    
+                    # Derive a title from the conversation's first user message
+                    title_row = await db.execute_fetchall(
+                        """SELECT content FROM turns
+                           WHERE session_id = ? AND role = 'user'
+                           ORDER BY rowid LIMIT 1""",
+                        (m["session_id"],),
+                    )
+                    title = title_row[0]["content"][:60] if title_row else f"Conversation {conv_id[:8]}"
+                    
+                    # Timestamp for display
+                    ts = m["timestamp"] or 0
+                    date_str = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "unknown"
+                    
+                    results.append({
+                        "conversation_id": conv_id,
+                        "title": title,
+                        "snippet": "\n".join(context_parts)[:400],
+                        "date": date_str,
+                        "relevance_score": 0.7,
+                        "source": f"sqlite({label})",
+                    })
+                    
+                    seen_conversations.add(conv_id)
+                    if len(results) >= limit:
+                        break
+                
+                if results:
+                    logger.info(f"Local SQLite found {len(results)} matches for '{query}' (scope={label})")
                     return results
             
             return []

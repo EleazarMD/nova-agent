@@ -347,7 +347,7 @@ TOOL_DEFINITIONS = [
                 "'what was that thing we discussed last week', or when you need historical context. "
                 "Returns conversation snippets ranked by relevance. "
                 "Use a broad query like 'recent' to browse recent conversations. "
-                "ALWAYS use days_back=30 unless the user specifies a narrower range."
+                "ALWAYS use days_back=90 unless the user specifies a narrower range."
             ),
             "parameters": {
                 "type": "object",
@@ -358,8 +358,8 @@ TOOL_DEFINITIONS = [
                     },
                     "days_back": {
                         "type": "integer",
-                        "description": "How many days back from now to search. Default 30.",
-                        "default": 30,
+                        "description": "How many days back from now to search. Default 90.",
+                        "default": 90,
                     },
                     "limit": {
                         "type": "integer",
@@ -1979,7 +1979,7 @@ async def handle_kg_query(query: str = "", entity_type: str = "Service", **kwarg
 _conversation_search_count: dict[str, int] = {}
 
 async def handle_search_past_conversations(
-    query: str, days_back: int = 30, limit: int = 5, user_id: str = "default",
+    query: str, days_back: int = 90, limit: int = 5, user_id: str = "default",
     from_days: int = None, to_days: int = None,
 ) -> str:
     """Search past conversations for historical context."""
@@ -2018,11 +2018,13 @@ async def handle_search_past_conversations(
     output = [f"Found {len(results)} relevant past conversation(s):\n"]
     for i, r in enumerate(results, 1):
         title = r.get("title", "Untitled")
-        snippet = r.get("snippet", "")[:200]
+        snippet = r.get("snippet", "")[:300]
         msg_count = r.get("message_count", "")
-        output.append(f"{i}. {title}" + (f" ({msg_count} messages)" if msg_count else ""))
+        date = r.get("date", r.get("created_at", ""))
+        date_display = f" [{date}]" if date else ""
+        output.append(f"{i}. {title}{date_display}" + (f" ({msg_count} messages)" if msg_count else ""))
         if snippet:
-            output.append(f"   \"{snippet}\"")
+            output.append(f"   {snippet}")
     
     output.append("\nSummarize the relevant findings for the user. These are real past conversations.")
     return "\n".join(output)
