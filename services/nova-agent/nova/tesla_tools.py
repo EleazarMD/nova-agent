@@ -1,16 +1,18 @@
 """
 Tesla Fleet API Tools for Nova Agent
 
-Provides voice/text control of Tesla vehicles via Fleet API.
-Tokens are managed by the Dashboard API.
+Provides voice/text control of Tesla vehicles via Tesla Relay Service.
+The Tesla Relay (port 18810) is an independent microservice that manages
+OAuth tokens, vehicle polling, and SSE streams.
 """
 
 import os
+import json
 import aiohttp
 from typing import Optional
 from loguru import logger
 
-TESLA_RELAY_URL = os.environ.get("TESLA_RELAY_URL", "http://100.108.41.22:18810")
+TESLA_RELAY_URL = os.environ.get("TESLA_RELAY_URL", "http://localhost:18810")
 
 # ---------------------------------------------------------------------------
 # Helper: Call Tesla Relay Service
@@ -27,6 +29,16 @@ async def _tesla_api(method: str, path: str, body: dict = None) -> dict:
             if resp.status != 200:
                 text = await resp.text()
                 logger.error(f"Tesla API error: {resp.status} {text}")
+                # Parse relay error format for structured info
+                # Relay returns: {"detail":"Tesla API error: {\"error\":\"vehicle unavailable...\"}"}
+                try:
+                    err_data = json.loads(text)
+                    detail = err_data.get("detail", "")
+                except:
+                    detail = text
+                # Check for vehicle unavailable/asleep/offline in any format
+                if "vehicle unavailable" in detail or "vehicle is offline" in detail or "asleep" in detail:
+                    return {"error": "vehicle_unavailable", "detail": detail}
                 return {"error": f"Tesla API error: {resp.status}"}
             return await resp.json()
 
@@ -43,7 +55,7 @@ async def handle_tesla_status(user_id: str) -> str:
         return result["error"]
     
     if not result.get("connected"):
-        return "Tesla account is not connected. Please connect your Tesla account in the dashboard settings."
+        return "Tesla account is not connected. Please connect your Tesla account via the Tesla settings page."
     
     vehicles = result.get("vehicles_count", 0)
     scopes = result.get("scopes", [])
@@ -167,22 +179,25 @@ async def _get_single_vehicle_status(vin: str) -> str:
     """Get status for a single vehicle by VIN."""
     result = await _tesla_api("GET", f"/vehicles/{vin}/data")
     
-    # If 412 error (vehicle asleep), wake it and retry
-    if result.get("error") and "412" in str(result.get("error")):
+    # If vehicle is unavailable/asleep/offline, try to wake it and retry
+    if result.get("error") == "vehicle_unavailable" or \
+       (result.get("error") and "412" in str(result.get("error"))):
         wake_result = await _tesla_api("POST", f"/vehicles/{vin}/wake_up")
         if wake_result.get("error"):
-            return f"Vehicle is asleep. Tried to wake it but got error: {wake_result['error']}"
+            return f"Vehicle is asleep/offline. Tried to wake it but got error: {wake_result.get('error', 'unknown')}"
         
-        # Wait a moment for vehicle to wake
+        # Wait for vehicle to wake
         import asyncio
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         
         # Retry data fetch
         result = await _tesla_api("GET", f"/vehicles/{vin}/data")
         if result.get("error"):
-            return f"Vehicle woke up but couldn't get data: {result['error']}"
+            if result.get("error") == "vehicle_unavailable":
+                return "Vehicle is still waking up. It may take 10-20 seconds to come online. Try asking again in a moment."
+            return f"Vehicle woke up but couldn't get data: {result.get('error', 'unknown')}"
     elif result.get("error"):
-        return result["error"]
+        return result.get("error", str(result))
     
     # Tesla Relay returns flattened format (all fields at top level)
     # Not nested like Fleet API (charge_state, climate_state, etc.)
