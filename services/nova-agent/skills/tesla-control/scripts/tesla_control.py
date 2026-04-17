@@ -82,7 +82,10 @@ async def handle_tesla_vehicles(user_id: str) -> str:
     for v in vehicles:
         state = v.get("state", "unknown")
         name = v.get("display_name", v.get("vin", "Unknown"))
-        lines.append(f"- {name}: {state}")
+        model = v.get("model", "")
+        vin = v.get("vin", "")
+        model_str = f" ({model})" if model else ""
+        lines.append(f"- {name}{model_str}: {state} [VIN: {vin}]")
     
     return "\n".join(lines)
 
