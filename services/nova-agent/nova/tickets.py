@@ -1,8 +1,8 @@
 """
 Nova Agent ticket management handlers.
 
-Provides CRUD operations against the ecosystem dashboard's /api/tickets
-endpoint. Tickets are the structured way Nova reports issues discovered
+Direct PostgreSQL CRUD — no Dashboard dependency.
+Tickets are the structured way Nova reports issues discovered
 during conversations so they can be triaged, analyzed by OpenClaw, and
 fixed by Windsurf or OpenClaw with approval gating.
 
@@ -11,22 +11,26 @@ Ticket lifecycle:
   approval engine → implement → resolved
 """
 
-import aiohttp
+import json
 import os
 from typing import Any, Optional
 from loguru import logger
 
-ECOSYSTEM_URL = os.environ.get("ECOSYSTEM_URL", "http://localhost:8404")
-ECOSYSTEM_API_KEY = os.environ.get("ECOSYSTEM_API_KEY", "ai-gateway-api-key-2024")
+try:
+    import asyncpg
+    _POOL: Optional[asyncpg.Pool] = None
+    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://eleazar@localhost/ecosystem_unified")
+except ImportError:
+    asyncpg = None  # type: ignore
+    _POOL = None
+    DATABASE_URL = ""    # type: ignore
 
-_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
-
-def _headers() -> dict[str, str]:
-    return {
-        "X-API-Key": ECOSYSTEM_API_KEY,
-        "Content-Type": "application/json",
-    }
+async def _get_pool() -> asyncpg.Pool:
+    global _POOL
+    if _POOL is None:
+        _POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+    return _POOL
 
 
 async def handle_create_ticket(
@@ -43,45 +47,27 @@ async def handle_create_ticket(
     """Create a new ticket in the homelab ticket tracker."""
     try:
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        body: dict[str, Any] = {
-            "title": title,
-            "description": description,
-            "priority": priority,
-            "severity": severity,
-            "category": category,
-            "source_agent": "nova",
-            "tags": tag_list,
-        }
-        if component:
-            body["component"] = component
-        if source_context:
-            body["source_context"] = source_context
-        if assigned_to:
-            body["assigned_to"] = assigned_to
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{ECOSYSTEM_URL}/api/tickets",
-                headers=_headers(),
-                json=body,
-                timeout=_TIMEOUT,
-            ) as resp:
-                if resp.status == 201:
-                    data = await resp.json()
-                    ticket = data.get("ticket", {})
-                    tid = ticket.get("id", "?")[:8]
-                    logger.info(f"Ticket created: {tid} — {title}")
-                    return (
-                        f"Ticket created (ID: {tid}).\n"
-                        f"Title: {title}\n"
-                        f"Priority: {priority}, Category: {category}"
-                        + (f", Component: {component}" if component else "")
-                        + (f"\nAssigned to: {assigned_to}" if assigned_to else "")
-                    )
-                else:
-                    text = await resp.text()
-                    logger.warning(f"Ticket create failed: HTTP {resp.status} {text[:200]}")
-                    return f"Failed to create ticket (HTTP {resp.status})."
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO tickets
+                   (title, description, priority, severity, category, component,
+                    tags, source_agent, source_context, assigned_to, status)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'nova', $8, $9, 'open')
+                   RETURNING id""",
+                title, description, priority, severity, category,
+                component or None, json.dumps(tag_list),
+                source_context or None, assigned_to or None,
+            )
+            tid = str(row["id"])[:8]
+            logger.info(f"Ticket created: {tid} — {title}")
+            return (
+                f"Ticket created (ID: {tid}).\n"
+                f"Title: {title}\n"
+                f"Priority: {priority}, Category: {category}"
+                + (f", Component: {component}" if component else "")
+                + (f"\nAssigned to: {assigned_to}" if assigned_to else "")
+            )
     except Exception as e:
         logger.error(f"Ticket create error: {e}")
         return f"Error creating ticket: {e}"
@@ -95,43 +81,46 @@ async def handle_list_tickets(
 ) -> str:
     """List tickets from the homelab ticket tracker."""
     try:
-        params: dict[str, str] = {"per_page": limit}
+        pool = await _get_pool()
+        conditions = []
+        params = []
+        idx = 1
         if status:
-            params["status"] = status
+            conditions.append(f"status = ${idx}")
+            params.append(status)
+            idx += 1
         if priority:
-            params["priority"] = priority
+            conditions.append(f"priority = ${idx}")
+            params.append(priority)
+            idx += 1
         if assigned_to:
-            params["assigned_to"] = assigned_to
+            conditions.append(f"assigned_to = ${idx}")
+            params.append(assigned_to)
+            idx += 1
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{ECOSYSTEM_URL}/api/tickets",
-                headers=_headers(),
-                params=params,
-                timeout=_TIMEOUT,
-            ) as resp:
-                if resp.status != 200:
-                    return f"Failed to list tickets (HTTP {resp.status})."
-                data = await resp.json()
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(int(limit))
 
-        tickets = data.get("tickets", [])
-        total = data.get("total", 0)
-        if not tickets:
+        rows = await pool.fetch(
+            f"""SELECT id, title, status, priority, category, component, assigned_to, created_at
+                FROM tickets {where}
+                ORDER BY created_at DESC LIMIT ${idx}""",
+            *params,
+        )
+        if not rows:
             filter_desc = []
-            if status:
-                filter_desc.append(f"status={status}")
-            if priority:
-                filter_desc.append(f"priority={priority}")
+            if status: filter_desc.append(f"status={status}")
+            if priority: filter_desc.append(f"priority={priority}")
             return f"No tickets found" + (f" ({', '.join(filter_desc)})" if filter_desc else "") + "."
 
-        lines = [f"{total} ticket(s) found:"]
-        for t in tickets:
-            tid = t.get("id", "?")[:8]
-            st = t.get("status", "?")
-            pri = t.get("priority", "?")
-            title = t.get("title", "Untitled")[:80]
-            comp = t.get("component", "")
-            assigned = t.get("assigned_to", "")
+        lines = [f"{len(rows)} ticket(s) found:"]
+        for r in rows:
+            tid = str(r["id"])[:8]
+            st = r["status"] or "?"
+            pri = r["priority"] or "?"
+            title = (r["title"] or "Untitled")[:80]
+            comp = r["component"] or ""
+            assigned = r["assigned_to"] or ""
             line = f"- [{tid}] {st.upper()} ({pri}) {title}"
             if comp:
                 line += f" [{comp}]"
@@ -148,26 +137,22 @@ async def handle_list_tickets(
 async def handle_get_ticket(ticket_id: str) -> str:
     """Get full details of a specific ticket."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{ECOSYSTEM_URL}/api/tickets/{ticket_id}",
-                headers=_headers(),
-                timeout=_TIMEOUT,
-            ) as resp:
-                if resp.status == 404:
-                    return f"Ticket {ticket_id[:8]} not found."
-                if resp.status != 200:
-                    return f"Failed to get ticket (HTTP {resp.status})."
-                data = await resp.json()
+        pool = await _get_pool()
+        row = await pool.fetchrow(
+            """SELECT * FROM tickets WHERE id = $1::uuid""",
+            ticket_id,
+        )
+        if not row:
+            return f"Ticket {ticket_id[:8]} not found."
 
-        t = data.get("ticket", {})
+        t = dict(row)
         parts = [
-            f"Ticket {t.get('id', '?')[:8]}",
+            f"Ticket {str(t.get('id', '?'))[:8]}",
             f"Title: {t.get('title', '?')}",
             f"Status: {t.get('status', '?')} | Priority: {t.get('priority', '?')} | Severity: {t.get('severity', '?')}",
             f"Category: {t.get('category', '?')} | Component: {t.get('component', '—')}",
             f"Source: {t.get('source_agent', '?')} | Assigned: {t.get('assigned_to', '—')}",
-            f"Created: {t.get('created_at', '?')[:19]}",
+            f"Created: {str(t.get('created_at', '?'))[:19]}",
         ]
         if t.get("description"):
             parts.append(f"\nDescription:\n{t['description'][:500]}")
@@ -180,6 +165,8 @@ async def handle_get_ticket(ticket_id: str) -> str:
         if t.get("affected_files"):
             files = t["affected_files"]
             if files:
+                if isinstance(files, str):
+                    files = json.loads(files)
                 parts.append(f"\nAffected Files: {', '.join(str(f) for f in files[:10])}")
         if t.get("resolution"):
             parts.append(f"\nResolution ({t.get('resolution_agent', '?')}):\n{t['resolution'][:500]}")
@@ -203,45 +190,66 @@ async def handle_update_ticket(
 ) -> str:
     """Update fields on an existing ticket."""
     try:
-        body: dict[str, Any] = {}
-        if status:
-            body["status"] = status
-        if priority:
-            body["priority"] = priority
-        if assigned_to:
-            body["assigned_to"] = assigned_to
-        if analysis:
-            body["analysis"] = analysis
-            body["analysis_agent"] = "nova"
-        if proposed_fix:
-            body["proposed_fix"] = proposed_fix
-        if resolution:
-            body["resolution"] = resolution
-            body["resolution_agent"] = resolution_agent or "nova"
-        if affected_files:
-            body["affected_files"] = [f.strip() for f in affected_files.split(",") if f.strip()]
+        sets = []
+        params = []
+        idx = 1
 
-        if not body:
+        if status:
+            sets.append(f"status = ${idx}")
+            params.append(status)
+            idx += 1
+        if priority:
+            sets.append(f"priority = ${idx}")
+            params.append(priority)
+            idx += 1
+        if assigned_to:
+            sets.append(f"assigned_to = ${idx}")
+            params.append(assigned_to)
+            idx += 1
+        if analysis:
+            sets.append(f"analysis = ${idx}")
+            params.append(analysis)
+            idx += 1
+            sets.append(f"analysis_agent = ${idx}")
+            params.append("nova")
+            idx += 1
+            sets.append("analysis_at = now()")
+        if proposed_fix:
+            sets.append(f"proposed_fix = ${idx}")
+            params.append(proposed_fix)
+            idx += 1
+        if resolution:
+            sets.append(f"resolution = ${idx}")
+            params.append(resolution)
+            idx += 1
+            sets.append(f"resolution_agent = ${idx}")
+            params.append(resolution_agent or "nova")
+            idx += 1
+        if affected_files:
+            file_list = [f.strip() for f in affected_files.split(",") if f.strip()]
+            sets.append(f"affected_files = ${idx}::jsonb")
+            params.append(json.dumps(file_list))
+            idx += 1
+
+        if not sets:
             return "No fields provided to update."
 
-        async with aiohttp.ClientSession() as session:
-            async with session.patch(
-                f"{ECOSYSTEM_URL}/api/tickets/{ticket_id}",
-                headers=_headers(),
-                json=body,
-                timeout=_TIMEOUT,
-            ) as resp:
-                if resp.status == 404:
-                    return f"Ticket {ticket_id[:8]} not found."
-                if resp.status != 200:
-                    text = await resp.text()
-                    return f"Failed to update ticket (HTTP {resp.status}): {text[:200]}"
-                data = await resp.json()
+        # If status is resolved/closed, set closed_at
+        if status in ("resolved", "closed"):
+            sets.append("closed_at = now()")
 
-        t = data.get("ticket", {})
-        updated_fields = ", ".join(body.keys())
+        params.append(ticket_id)
+        row = await (await _get_pool()).fetchrow(
+            f"""UPDATE tickets SET {', '.join(sets)} WHERE id = ${idx}::uuid
+                RETURNING id, status""",
+            *params,
+        )
+        if not row:
+            return f"Ticket {ticket_id[:8]} not found."
+
+        updated_fields = ", ".join(s.split("=")[0].strip() for s in sets)
         logger.info(f"Ticket {ticket_id[:8]} updated: {updated_fields}")
-        return f"Ticket {t.get('id', '?')[:8]} updated ({updated_fields}). Status: {t.get('status', '?')}."
+        return f"Ticket {str(row['id'])[:8]} updated ({updated_fields}). Status: {row['status']}."
     except Exception as e:
         logger.error(f"Ticket update error: {e}")
         return f"Error updating ticket: {e}"
@@ -252,41 +260,23 @@ async def handle_delegate_ticket(
     delegate_to: str = "openclaw",
     task_description: str = "",
 ) -> str:
-    """Delegate a ticket to OpenClaw or Windsurf for analysis/fix.
-
-    For OpenClaw: updates the ticket status to 'analyzing' and sets
-    assigned_to. The OpenClaw coding agent will pick it up, analyze the
-    codebase, and write back its analysis + proposed fix. Any actual
-    code changes require approval via the homelab approval engine.
-
-    For Windsurf: marks as assigned so IDE-based work can begin.
-    """
+    """Delegate a ticket to OpenClaw or Windsurf for analysis/fix."""
     try:
-        body: dict[str, Any] = {
-            "assigned_to": delegate_to,
-            "delegated_to": delegate_to,
-            "delegation_status": "pending",
-        }
-        if delegate_to == "openclaw":
-            body["status"] = "analyzing"
-        elif delegate_to == "windsurf":
-            body["status"] = "in_progress"
+        new_status = "analyzing" if delegate_to == "openclaw" else "in_progress"
+        pool = await _get_pool()
+        row = await pool.fetchrow(
+            """UPDATE tickets
+               SET assigned_to = $1, delegated_to = $1,
+                   delegation_status = 'pending', status = $2
+               WHERE id = $3::uuid
+               RETURNING id, title""",
+            delegate_to, new_status, ticket_id,
+        )
+        if not row:
+            return f"Ticket {ticket_id[:8]} not found."
 
-        async with aiohttp.ClientSession() as session:
-            async with session.patch(
-                f"{ECOSYSTEM_URL}/api/tickets/{ticket_id}",
-                headers=_headers(),
-                json=body,
-                timeout=_TIMEOUT,
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    return f"Failed to delegate ticket (HTTP {resp.status}): {text[:200]}"
-                data = await resp.json()
-
-        t = data.get("ticket", {})
-        tid = t.get("id", "?")[:8]
-        title = t.get("title", "?")[:60]
+        tid = str(row["id"])[:8]
+        title = (row["title"] or "?")[:60]
         logger.info(f"Ticket {tid} delegated to {delegate_to}")
 
         if delegate_to == "openclaw":
