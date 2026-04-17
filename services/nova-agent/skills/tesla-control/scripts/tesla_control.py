@@ -1,8 +1,9 @@
 """
 Tesla Fleet API Tools for Nova Agent
 
-Provides voice/text control of Tesla vehicles via Fleet API.
-Tokens are managed by the Dashboard API.
+Provides voice/text control of Tesla vehicles via Tesla Relay Service.
+The Tesla Relay (port 18810) is an independent microservice that manages
+OAuth tokens, vehicle polling, and SSE streams.
 """
 
 import os
@@ -10,15 +11,15 @@ import aiohttp
 from typing import Optional
 from loguru import logger
 
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://localhost:8404")
+TESLA_RELAY_URL = os.environ.get("TESLA_RELAY_URL", "http://localhost:18810")
 
 # ---------------------------------------------------------------------------
-# Helper: Call Dashboard Tesla API
+# Helper: Call Tesla Relay Service directly
 # ---------------------------------------------------------------------------
 
 async def _tesla_api(method: str, path: str, body: dict = None) -> dict:
-    """Call Tesla API via Dashboard proxy."""
-    url = f"{DASHBOARD_URL}/api/tesla{path}"
+    """Call Tesla API via Tesla Relay Service (independent microservice)."""
+    url = f"{TESLA_RELAY_URL}{path}"
     
     async with aiohttp.ClientSession() as session:
         async with session.request(method, url, json=body) as resp:
@@ -37,7 +38,7 @@ async def _tesla_api(method: str, path: str, body: dict = None) -> dict:
 
 async def handle_tesla_status(user_id: str) -> str:
     """Check Tesla connection status."""
-    result = await _tesla_api("GET", "/auth/status")
+    result = await _tesla_api("GET", "/auth/status?user_id={user_id}")
     
     if result.get("error"):
         return result["error"]
@@ -58,7 +59,8 @@ async def handle_tesla_vehicles(user_id: str) -> str:
             return "Tesla account not connected. Please connect your Tesla account first."
         return result["error"]
     
-    vehicles = result.get("response", [])
+    # Tesla Relay returns direct array, not wrapped in {"response": [...]}
+    vehicles = result if isinstance(result, list) else result.get("response", [])
     if not vehicles:
         return "No Tesla vehicles found on your account."
     
@@ -81,9 +83,10 @@ async def handle_tesla_vehicle_status(user_id: str, vehicle_identifier: Optional
     """
     # Get all vehicles first
     vehicles_result = await _tesla_api("GET", "/vehicles")
-    if vehicles_result.get("error"):
+    if isinstance(vehicles_result, dict) and vehicles_result.get("error"):
         return vehicles_result["error"]
-    vehicles = vehicles_result.get("response", [])
+    # Tesla Relay returns direct array
+    vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
     if not vehicles:
         return "No Tesla vehicles found."
     
@@ -176,46 +179,42 @@ async def _get_single_vehicle_status(vin: str) -> str:
     elif result.get("error"):
         return result["error"]
     
-    data = result.get("response", {})
-    
-    # Extract key info
-    charge = data.get("charge_state", {})
-    climate = data.get("climate_state", {})
-    vehicle = data.get("vehicle_state", {})
-    drive = data.get("drive_state", {})
+    # Tesla Relay returns flattened format (all fields at top level)
+    # Not nested like Fleet API (charge_state, climate_state, etc.)
+    data = result if isinstance(result, dict) else result.get("response", {})
     
     lines = [f"Tesla Status ({data.get('display_name', vin)}):"]
     
-    # Battery & Charging
-    battery = charge.get("battery_level", "?")
-    range_mi = charge.get("battery_range", "?")
-    charging = charge.get("charging_state", "Unknown")
+    # Battery & Charging (flattened format)
+    battery = data.get("battery_level", "?")
+    range_mi = data.get("battery_range", "?")
+    charging = data.get("charging_state", "Unknown")
     lines.append(f"🔋 Battery: {battery}% ({range_mi} miles)")
     lines.append(f"⚡ Charging: {charging}")
     
     if charging == "Charging":
-        rate = charge.get("charge_rate", 0)
-        time_left = charge.get("minutes_to_full_charge", 0)
+        rate = data.get("charge_rate", 0)
+        time_left = data.get("minutes_to_full_charge", 0)
         lines.append(f"   Rate: {rate} mi/hr, {time_left} min to full")
     
-    # Climate
-    inside_temp = climate.get("inside_temp")
+    # Climate (flattened format)
+    inside_temp = data.get("inside_temp")
     if inside_temp:
         inside_f = round(inside_temp * 9/5 + 32, 1)
         lines.append(f"🌡️ Interior: {inside_f}°F")
     
-    hvac_on = climate.get("is_climate_on", False)
+    hvac_on = data.get("is_climate_on", False)
     lines.append(f"❄️ Climate: {'On' if hvac_on else 'Off'}")
     
-    # Security
-    locked = vehicle.get("locked", None)
-    sentry = vehicle.get("sentry_mode", False)
+    # Security (flattened format)
+    locked = data.get("locked", None)
+    sentry = data.get("sentry_mode", False)
     lines.append(f"🔒 Locked: {'Yes' if locked else 'No'}")
     lines.append(f"👁️ Sentry Mode: {'On' if sentry else 'Off'}")
     
-    # Location
-    lat = drive.get("latitude")
-    lon = drive.get("longitude")
+    # Location (flattened format)
+    lat = data.get("latitude")
+    lon = data.get("longitude")
     if lat and lon:
         lines.append(f"📍 Location: {lat:.4f}, {lon:.4f}")
     
@@ -235,7 +234,7 @@ async def handle_tesla_charge_control(
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if vehicles_result.get("error"):
             return vehicles_result["error"]
-        vehicles = vehicles_result.get("response", [])
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
@@ -278,7 +277,7 @@ async def handle_tesla_climate_control(
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if vehicles_result.get("error"):
             return vehicles_result["error"]
-        vehicles = vehicles_result.get("response", [])
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
@@ -317,7 +316,7 @@ async def handle_tesla_lock_control(
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if vehicles_result.get("error"):
             return vehicles_result["error"]
-        vehicles = vehicles_result.get("response", [])
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
@@ -349,7 +348,7 @@ async def handle_tesla_trunk_control(
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if vehicles_result.get("error"):
             return vehicles_result["error"]
-        vehicles = vehicles_result.get("response", [])
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
@@ -372,7 +371,7 @@ async def handle_tesla_wake(user_id: str, vin: Optional[str] = None) -> str:
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if vehicles_result.get("error"):
             return vehicles_result["error"]
-        vehicles = vehicles_result.get("response", [])
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
@@ -397,7 +396,7 @@ async def handle_tesla_honk_flash(
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if vehicles_result.get("error"):
             return vehicles_result["error"]
-        vehicles = vehicles_result.get("response", [])
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
@@ -461,7 +460,7 @@ async def handle_tesla_navigation(
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if vehicles_result.get("error"):
             return vehicles_result["error"]
-        vehicles = vehicles_result.get("response", [])
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
