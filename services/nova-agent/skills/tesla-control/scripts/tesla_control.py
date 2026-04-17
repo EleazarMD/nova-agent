@@ -515,6 +515,216 @@ async def handle_tesla_navigation(
     return f"Navigation sent to Tesla: {location_str}"
 
 
+async def handle_tesla_waypoints(
+    user_id: str,
+    waypoints: list,
+    vin: Optional[str] = None,
+) -> str:
+    """Send multi-stop navigation waypoints to Tesla.
+    
+    Args:
+        waypoints: List of dicts with 'lat', 'lon', 'name' keys
+        vin: Vehicle VIN
+    """
+    if not vin:
+        vehicles_result = await _tesla_api("GET", "/vehicles")
+        if isinstance(vehicles_result, dict) and vehicles_result.get("error"):
+            return vehicles_result["error"]
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
+        if not vehicles:
+            return "No Tesla vehicles found."
+        vin = vehicles[0].get("vin")
+    
+    result = await _tesla_api("POST", f"/vehicles/{vin}/command", {
+        "command": "navigation_waypoints_request",
+        "params": {
+            "waypoints": waypoints
+        }
+    })
+    
+    if result.get("error"):
+        return result["error"]
+    
+    return f"Navigation waypoints sent to Tesla: {len(waypoints)} stops"
+
+
+async def handle_tesla_software_update(
+    user_id: str,
+    action: str = "schedule",
+    offset_sec: int = 0,
+    vin: Optional[str] = None,
+) -> str:
+    """Schedule or cancel a Tesla software update.
+    
+    Args:
+        action: 'schedule' or 'cancel'
+        offset_sec: Seconds from now to schedule update (default 0 = ASAP)
+        vin: Vehicle VIN
+    """
+    if not vin:
+        vehicles_result = await _tesla_api("GET", "/vehicles")
+        if isinstance(vehicles_result, dict) and vehicles_result.get("error"):
+            return vehicles_result["error"]
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
+        if not vehicles:
+            return "No Tesla vehicles found."
+        vin = vehicles[0].get("vin")
+    
+    if action == "cancel":
+        result = await _tesla_api("POST", f"/vehicles/{vin}/command", {
+            "command": "cancel_software_update",
+            "params": {}
+        })
+        if result.get("error"):
+            return result["error"]
+        return "Software update cancelled."
+    
+    # Schedule update
+    result = await _tesla_api("POST", f"/vehicles/{vin}/command", {
+        "command": "schedule_software_update",
+        "params": {"offset_sec": offset_sec}
+    })
+    if result.get("error"):
+        return result["error"]
+    
+    when = "immediately" if offset_sec == 0 else f"in {offset_sec // 60} minutes"
+    return f"Software update scheduled {when}."
+
+
+async def handle_tesla_nearby_charging(
+    user_id: str,
+    vin: Optional[str] = None,
+) -> str:
+    """Find nearby Superchargers and destination chargers."""
+    if not vin:
+        vehicles_result = await _tesla_api("GET", "/vehicles")
+        if isinstance(vehicles_result, dict) and vehicles_result.get("error"):
+            return vehicles_result["error"]
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
+        if not vehicles:
+            return "No Tesla vehicles found."
+        vin = vehicles[0].get("vin")
+    
+    result = await _tesla_api("GET", f"/vehicles/{vin}/nearby_charging_sites")
+    if isinstance(result, dict) and result.get("error"):
+        return result["error"]
+    
+    # Format charging sites
+    superchargers = result.get("superchargers", [])
+    destinations = result.get("destination_charging", [])
+    
+    lines = []
+    if superchargers:
+        lines.append(f"⚡ Superchargers nearby ({len(superchargers)}):")
+        for s in superchargers[:5]:
+            name = s.get("name", "Unknown")
+            dist = s.get("distance_miles", "?")
+            available = s.get("available_stalls", "?")
+            total = s.get("total_stalls", "?")
+            lines.append(f"  - {name}: {available}/{total} stalls, {dist} mi")
+    if destinations:
+        lines.append(f"🔌 Destination chargers nearby ({len(destinations)}):")
+        for d in destinations[:3]:
+            name = d.get("name", "Unknown")
+            dist = d.get("distance_miles", "?")
+            lines.append(f"  - {name}: {dist} mi")
+    
+    if not lines:
+        return "No nearby charging sites found."
+    return "\n".join(lines)
+
+
+async def handle_tesla_live_camera(
+    user_id: str,
+    vin: Optional[str] = None,
+) -> str:
+    """Get live camera snapshot URLs from Tesla.
+    
+    Requires key pairing. Returns URLs for front, rear, left, right, interior cameras.
+    """
+    if not vin:
+        vehicles_result = await _tesla_api("GET", "/vehicles")
+        if isinstance(vehicles_result, dict) and vehicles_result.get("error"):
+            return vehicles_result["error"]
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
+        if not vehicles:
+            return "No Tesla vehicles found."
+        vin = vehicles[0].get("vin")
+    
+    result = await _tesla_api("GET", f"/vehicles/{vin}/live_camera")
+    if isinstance(result, dict) and result.get("error"):
+        return result["error"]
+    
+    # Format camera URLs
+    lines = ["📷 Live camera URLs:"]
+    for cam_name in ["front", "rear", "left_repeater", "right_repeater", "interior"]:
+        url = result.get(cam_name) or result.get(f"{cam_name}_camera")
+        if url:
+            lines.append(f"  - {cam_name}: {url}")
+    
+    if len(lines) == 1:
+        return "No camera URLs available. Vehicle may be asleep or key not paired."
+    return "\n".join(lines)
+
+
+async def handle_tesla_charging_sessions(
+    user_id: str,
+) -> str:
+    """Get charging session history."""
+    result = await _tesla_api("GET", "/charging/sessions")
+    if isinstance(result, dict) and result.get("error"):
+        return result["error"]
+    
+    # Format sessions
+    sessions = result if isinstance(result, list) else result.get("sessions", result.get("data", []))
+    if not sessions:
+        return "No charging sessions found. (Requires business fleet account)"
+    
+    lines = [f"🔋 Charging sessions ({len(sessions)}):"]
+    for s in sessions[:5]:
+        date = s.get("charging_start_date", s.get("session_start", "Unknown"))
+        energy = s.get("energy_kwh", s.get("charging_energy", "?"))
+        cost = s.get("cost", s.get("charging_cost", "?"))
+        site = s.get("site_name", s.get("charging_station", "Unknown"))
+        lines.append(f"  - {site}: {energy} kWh, ${cost} ({date})")
+    
+    return "\n".join(lines)
+
+
+async def handle_tesla_telemetry(
+    user_id: str,
+    vin: Optional[str] = None,
+) -> str:
+    """Get fleet telemetry configuration and status."""
+    if not vin:
+        vehicles_result = await _tesla_api("GET", "/vehicles")
+        if isinstance(vehicles_result, dict) and vehicles_result.get("error"):
+            return vehicles_result["error"]
+        vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
+        if not vehicles:
+            return "No Tesla vehicles found."
+        vin = vehicles[0].get("vin")
+    
+    config = await _tesla_api("GET", f"/vehicles/{vin}/fleet_telemetry_config")
+    errors = await _tesla_api("GET", f"/vehicles/{vin}/fleet_telemetry_errors")
+    
+    lines = [f"📊 Fleet Telemetry for {vin}:"]
+    if isinstance(config, dict) and not config.get("error"):
+        lines.append(f"  Config: synced={config.get('synced', '?')}, limit_reached={config.get('limit_reached', '?')}")
+        if config.get("hostname"):
+            lines.append(f"  Hostname: {config['hostname']}")
+    else:
+        lines.append(f"  Config: not configured or unavailable")
+    
+    if isinstance(errors, dict) and not errors.get("error"):
+        err_count = len(errors.get("errors", []))
+        lines.append(f"  Errors: {err_count}")
+    else:
+        lines.append(f"  Errors: none")
+    
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Unified Tesla Control Handler (Claude Skills Format)
 # ---------------------------------------------------------------------------
@@ -614,5 +824,36 @@ async def handle_tesla_control(
             vin=vin,
         )
     
+    elif action == "waypoints":
+        if not value or not isinstance(value, list):
+            return "Waypoints requires a list of stops with lat/lon/name"
+        return await handle_tesla_waypoints(
+            user_id=user_id,
+            waypoints=value,
+            vin=vin,
+        )
+    
+    elif action == "software_update":
+        update_action = command or "schedule"
+        offset = int(value) if value else 0
+        return await handle_tesla_software_update(
+            user_id=user_id,
+            action=update_action,
+            offset_sec=offset,
+            vin=vin,
+        )
+    
+    elif action == "nearby_charging":
+        return await handle_tesla_nearby_charging(user_id=user_id, vin=vin)
+    
+    elif action == "live_camera":
+        return await handle_tesla_live_camera(user_id=user_id, vin=vin)
+    
+    elif action == "charging_sessions":
+        return await handle_tesla_charging_sessions(user_id=user_id)
+    
+    elif action == "telemetry":
+        return await handle_tesla_telemetry(user_id=user_id, vin=vin)
+    
     else:
-        return f"Unknown Tesla action: {action}. Valid actions: vehicles, status, climate, charge, lock, trunk, wake, honk_flash, navigation"
+        return f"Unknown Tesla action: {action}. Valid actions: vehicles, status, climate, charge, lock, trunk, wake, honk_flash, navigation, waypoints, software_update, nearby_charging, live_camera, charging_sessions, telemetry"
