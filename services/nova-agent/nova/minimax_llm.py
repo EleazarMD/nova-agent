@@ -51,6 +51,19 @@ class MiniMaxLLMService(OpenAILLMService):
             ),
         )
 
+    def set_thinking(self, level: str):
+        """Dynamically change the thinking level for subsequent LLM calls.
+
+        Levels: 'low' (fast, no thinking), 'medium' (brief), 'high' (extended 16K).
+        """
+        # Pipecat stores InputParams.extra_body in self._settings.extra dict
+        if hasattr(self, '_settings') and hasattr(self._settings, 'extra'):
+            self._settings.extra["extra_body"] = {"thinking": level}
+        else:
+            # Fallback: try direct attribute
+            if hasattr(self, '_params') and hasattr(self._params, 'extra_body'):
+                self._params.extra_body["thinking"] = level
+
     async def get_chat_completions(self, params_from_context):
         params = self.build_chat_completion_params(params_from_context)
         # Sanitize surrogates from iOS speech recognition text
