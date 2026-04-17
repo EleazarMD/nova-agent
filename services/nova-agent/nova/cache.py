@@ -346,8 +346,10 @@ class ToolResultCache:
             container = args.get("container", "all")
             parts.append(container.lower())
         elif tool_name.startswith("tesla_"):
-            vin = args.get("vin", args.get("vehicle_id", "default"))
-            parts.append(str(vin)[:8])  # First 8 chars of VIN
+            action = args.get("action", "default")
+            parts.append(action)
+            vin = args.get("vin", args.get("vehicle_id", args.get("vehicle_identifier", "default")))
+            parts.append(str(vin)[:8])  # First 8 chars of VIN or identifier
         else:
             # Generic: hash all args
             args_str = json.dumps(args, sort_keys=True, default=str)

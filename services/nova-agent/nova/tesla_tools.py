@@ -82,7 +82,10 @@ async def handle_tesla_vehicles(user_id: str) -> str:
     for v in vehicles:
         state = v.get("state", "unknown")
         name = v.get("display_name", v.get("vin", "Unknown"))
-        lines.append(f"- {name}: {state}")
+        model = v.get("model", "")
+        vin = v.get("vin", "")
+        model_str = f" ({model})" if model else ""
+        lines.append(f"- {name}{model_str}: {state} [VIN: {vin}]")
     
     return "\n".join(lines)
 
@@ -139,7 +142,11 @@ async def _resolve_vehicle_identifier(vehicles: list, identifier: str) -> Option
     for vehicle in vehicles:
         vin = vehicle.get("vin", "")
         display_name = vehicle.get("display_name", "").lower()
-        model = _get_model_from_vin(vin).lower()
+        # Use model from relay response (reliable), fallback to VIN-based guess
+        model = (vehicle.get("model") or _get_model_from_vin(vin)).lower()
+        # Populate model cache for _get_model_from_vin
+        if vehicle.get("model"):
+            _vehicle_model_cache[vin] = vehicle["model"]
         
         # Check VIN exact match
         if vin.lower() == identifier_lower:
@@ -157,22 +164,19 @@ async def _resolve_vehicle_identifier(vehicles: list, identifier: str) -> Option
 
 
 def _get_model_from_vin(vin: str) -> str:
-    """Extract model type from VIN."""
-    if not vin or len(vin) < 4:
-        return "Unknown"
+    """Get model name from vehicle data cache or VIN fallback.
     
-    # Tesla VIN format: position 4 indicates model
-    # 3 = Model 3, S = Model S, X = Model X, Y = Model Y
-    model_char = vin[3] if len(vin) > 3 else ""
-    
-    model_map = {
-        "3": "Model 3",
-        "S": "Model S", 
-        "X": "Model X",
-        "Y": "Model Y",
-    }
-    
-    return model_map.get(model_char.upper(), f"Model {model_char}")
+    The relay now returns 'model' in /vehicles response.
+    VIN position 4 is NOT reliable for model detection.
+    """
+    # Check cache first (populated from /vehicles which includes model)
+    if vin in _vehicle_model_cache:
+        return _vehicle_model_cache[vin]
+    return "Unknown"
+
+
+# Cache for vehicle model names (populated from /vehicles API)
+_vehicle_model_cache: dict = {}
 
 
 async def _get_single_vehicle_status(vin: str) -> str:
@@ -203,7 +207,9 @@ async def _get_single_vehicle_status(vin: str) -> str:
     # Not nested like Fleet API (charge_state, climate_state, etc.)
     data = result if isinstance(result, dict) else result.get("response", {})
     
-    lines = [f"Tesla Status ({data.get('display_name', vin)}):"]
+    model = data.get("model", _get_model_from_vin(vin))
+    model_str = f" ({model})" if model and model != "Unknown" else ""
+    lines = [f"Tesla Status ({data.get('display_name', vin)}{model_str}) [VIN: {vin}]"]
     
     # Battery & Charging (flattened format)
     battery = data.get("battery_level", "?")
