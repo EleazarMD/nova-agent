@@ -1,18 +1,15 @@
 """
-Nova Agent Notes Handler
+Nova Agent Notes Handler (Pi Workspace Integration)
 
-Manages meeting notes, action items, and productivity documents
-via the Dashboard Notes API.
+Manages notes as Pi Workspace pages with blocks.
+Uses the Pi Workspace API (port 8762).
 """
 
 import os
-import aiohttp
 from typing import Optional, List, Dict, Any
 from loguru import logger
 
-ECOSYSTEM_URL = os.environ.get("ECOSYSTEM_URL", "http://localhost:8404")
-ECOSYSTEM_USER_ID = os.environ.get("ECOSYSTEM_USER_ID", "dfd9379f-a9cd-4241-99e7-140f5e89e3cd")
-INTERNAL_SERVICE_KEY = os.environ.get("INTERNAL_SERVICE_KEY", "")
+PI_WORKSPACE_URL = os.environ.get("PI_WORKSPACE_URL", "http://localhost:8762")
 
 
 async def handle_manage_notes(
@@ -30,301 +27,199 @@ async def handle_manage_notes(
     action_item_text: Optional[str] = None,
     action_item_completed: Optional[bool] = None,
     limit: Optional[str] = None,
+    **kwargs,
 ) -> str:
     """
-    Handle notes management operations.
+    Handle notes management via Pi Workspace pages.
     
     Actions:
-    - create: Create a new note
-    - list: List notes (with optional filters)
-    - get: Get a specific note by ID
+    - create: Create a new note as a workspace page
+    - list: List notes (pages)
+    - get: Get a specific note
     - update: Update a note
-    - search: Search notes by content
-    - add_action: Add action item to a note
-    - complete_action: Mark action item as complete
-    - list_actions: List action items for a note
+    - search: Search notes via workspace search
+    - add_action: Add to-do item to a note (as block)
+    - complete_action: Mark to-do as complete
+    - list_actions: List to-do blocks in a page
+    
+    DEPRECATED: This handler is maintained for backward compatibility.
+    New code should use manage_workspace with create_page instead.
     """
-    base = ECOSYSTEM_URL
-    headers = {
-        "Content-Type": "application/json",
-        "X-User-Id": ECOSYSTEM_USER_ID,
-        "X-Internal-Service-Key": INTERNAL_SERVICE_KEY,
-    }
-    timeout = aiohttp.ClientTimeout(total=15)
+    from nova.pi_workspace import (
+        create_page, list_pages, get_page, get_page_blocks, create_block,
+        search_workspace, _plain_title
+    )
 
     try:
-        async with aiohttp.ClientSession() as session:
-            # CREATE: Create a new note
-            if action == "create":
-                if not title:
-                    return "Error: title is required to create a note."
-                
-                body: Dict[str, Any] = {
-                    "title": title,
-                    "content": content or "",
-                    "note_type": note_type or "quick",
-                }
-                
-                if tags:
-                    body["tags"] = [t.strip() for t in tags.split(",")]
-                if meeting_date:
-                    body["meeting_date"] = meeting_date
-                if attendees:
-                    body["attendees"] = [a.strip() for a in attendees.split(",")]
-                if action_items:
-                    # Parse action items from comma-separated string
-                    items = []
-                    for item_text in action_items.split(";"):
-                        item_text = item_text.strip()
-                        if item_text:
-                            items.append({
-                                "text": item_text,
-                                "completed": False,
-                            })
-                    body["action_items"] = items
+        icon_map = {"meeting": "📅", "quick": "📝", "project": "📁", "reference": "📚", "journal": "📔"}
 
-                url = f"{base}/api/notes"
-                async with session.post(url, json=body, headers=headers, timeout=timeout) as resp:
-                    if resp.status not in (200, 201):
-                        text = await resp.text()
-                        logger.error(f"Notes API create error: {resp.status} - {text}")
-                        return f"Failed to create note (HTTP {resp.status})."
-                    
-                    data = await resp.json()
-                    result = f"✅ Note created: \"{data.get('title', title)}\"\n"
-                    result += f"ID: {data.get('id')}\n"
-                    result += f"Type: {data.get('note_type', 'quick')}"
-                    
-                    items = data.get("action_items", [])
-                    if items:
-                        result += f"\nAction items: {len(items)}"
-                    
-                    return result
+        # CREATE: Create a new note as workspace page
+        if action == "create":
+            if not title:
+                return "Error: title is required to create a note."
+            
+            icon = icon_map.get(note_type or "quick", "📝")
+            page = await create_page(title, icon=icon)
+            if not page:
+                return "Failed to create note (workspace page creation failed)."
+            
+            # Add content as paragraph block if provided
+            if content:
+                await create_block(
+                    page["id"], "paragraph",
+                    {"richText": [{"type": "text", "text": {"content": content}, "plainText": content}]},
+                    parent_id=page.get("rootBlockId", "")
+                )
+            
+            # Add to-do blocks for action items
+            if action_items:
+                for item_text in action_items.split(";"):
+                    item_text = item_text.strip()
+                    if item_text:
+                        await create_block(
+                            page["id"], "to_do",
+                            {"richText": [{"type": "text", "text": {"content": item_text}, "plainText": item_text}], "checked": False},
+                            parent_id=page.get("rootBlockId", "")
+                        )
+            
+            # Add metadata callout
+            meta_lines = []
+            if note_type and note_type != "quick":
+                meta_lines.append(f"Type: {note_type}")
+            if meeting_date:
+                meta_lines.append(f"Meeting: {meeting_date}")
+            if attendees:
+                meta_lines.append(f"Attendees: {attendees}")
+            if tags:
+                meta_lines.append(f"Tags: {tags}")
+            
+            if meta_lines:
+                await create_block(
+                    page["id"], "callout",
+                    {"richText": [{"type": "text", "text": {"content": "\n".join(meta_lines)}, "plainText": "\n".join(meta_lines)}]},
+                    parent_id=page.get("rootBlockId", "")
+                )
+            
+            return f"✅ Note created: \"{title}\" (id: {page['id'][:8]}...)"
 
-            # LIST: List notes with optional filters
-            elif action == "list":
-                params: Dict[str, str] = {}
-                if note_type:
-                    params["note_type"] = note_type
-                if tags:
-                    params["tag"] = tags.split(",")[0].strip()
-                if limit:
-                    params["limit"] = limit
+        # LIST: List notes (pages)
+        elif action == "list":
+            pages = await list_pages()
+            if not pages:
+                return "No notes found."
+            
+            lines = [f"📝 {len(pages)} notes:"]
+            for p in pages[:10]:
+                t = _plain_title(p.get("title", "Untitled"))[:50]
+                emoji = p.get("icon", {}).get("emoji", "📝")
+                lines.append(f"  {emoji} {t} (id: {p['id'][:8]}...)")
+            return "\n".join(lines)
 
-                url = f"{base}/api/notes"
-                async with session.get(url, params=params, headers=headers, timeout=timeout) as resp:
-                    if resp.status != 200:
-                        return f"Failed to list notes (HTTP {resp.status})."
-                    
-                    data = await resp.json()
-                    notes = data.get("notes", [])
-                    total = data.get("pagination", {}).get("total", len(notes))
-                    
-                    if not notes:
-                        return "No notes found."
-                    
-                    lines = [f"📝 {total} notes found:"]
-                    for n in notes[:10]:
-                        title_str = n.get("title", "Untitled")[:50]
-                        ntype = n.get("note_type", "quick")
-                        items = n.get("action_items", [])
-                        pending = len([i for i in items if not i.get("completed")])
-                        
-                        line = f"- [{ntype}] {title_str}"
-                        if pending > 0:
-                            line += f" ({pending} pending actions)"
-                        line += f" (id: {n.get('id')[:8]}...)"
-                        lines.append(line)
-                    
-                    return "\n".join(lines)
+        # GET: Get a specific note with blocks
+        elif action == "get":
+            if not note_id:
+                return "Error: note_id is required for get action."
+            
+            page = await get_page(note_id)
+            if not page:
+                return f"Note {note_id} not found."
+            
+            t = _plain_title(page.get("title", "Untitled"))
+            lines = [f"📋 {t}"]
+            
+            blocks = await get_page_blocks(note_id)
+            for b in (blocks or [])[:20]:
+                bt = b.get("type", "")
+                props = b.get("properties", {})
+                
+                if bt == "paragraph" and props.get("richText"):
+                    text = " ".join(s.get("plainText", "") for s in props["richText"][:3])
+                    if text.strip():
+                        lines.append(f"  {text[:100]}")
+                elif bt in ("heading_1", "heading_2") and props.get("richText"):
+                    text = " ".join(s.get("plainText", "") for s in props["richText"])
+                    lines.append(f"  # {text}")
+                elif bt == "to_do" and props.get("richText"):
+                    checked = "✅" if props.get("checked") else "☐"
+                    text = props.get("richText", [{}])[0].get("plainText", "")
+                    lines.append(f"  {checked} {text}")
+                elif bt == "callout" and props.get("richText"):
+                    text = props.get("richText", [{}])[0].get("plainText", "")
+                    if "Type:" in text or "Meeting:" in text:
+                        lines.append(f"  ℹ️ {text[:80]}")
+            
+            return "\n".join(lines)
 
-            # GET: Get a specific note
-            elif action == "get":
-                if not note_id:
-                    return "Error: note_id is required for get action."
-                
-                url = f"{base}/api/notes/{note_id}"
-                async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    if resp.status == 404:
-                        return f"Note {note_id} not found."
-                    if resp.status != 200:
-                        return f"Failed to get note (HTTP {resp.status})."
-                    
-                    n = await resp.json()
-                    lines = [
-                        f"📋 {n.get('title', 'Untitled')}",
-                        f"Type: {n.get('note_type', 'quick')}",
-                    ]
-                    
-                    if n.get("meeting_date"):
-                        lines.append(f"Meeting date: {n['meeting_date']}")
-                    if n.get("attendees"):
-                        lines.append(f"Attendees: {', '.join(n['attendees'])}")
-                    if n.get("tags"):
-                        lines.append(f"Tags: {', '.join(n['tags'])}")
-                    
-                    content = n.get("content", "")
-                    if content:
-                        # Truncate long content
-                        if len(content) > 500:
-                            content = content[:500] + "..."
-                        lines.append(f"\n{content}")
-                    
-                    items = n.get("action_items", [])
-                    if items:
-                        lines.append(f"\nAction Items ({len(items)}):")
-                        for item in items:
-                            status = "✅" if item.get("completed") else "☐"
-                            line = f"  {status} {item.get('text', '')}"
-                            if item.get("assignee"):
-                                line += f" (@{item['assignee']})"
-                            if item.get("due_date"):
-                                line += f" [due: {item['due_date']}]"
-                            lines.append(line)
-                    
-                    return "\n".join(lines)
+        # UPDATE: Update a note (not fully implemented - would need block diffing)
+        elif action == "update":
+            if not note_id:
+                return "Error: note_id is required for update action."
+            # For simplicity, we add a callout with update info
+            if content:
+                await create_block(
+                    note_id, "callout",
+                    {"richText": [{"type": "text", "text": {"content": f"Updated: {content}"}, "plainText": f"Updated: {content}"}]}
+                )
+            return f"✅ Note updated (appended to page {note_id[:8]}...)"
 
-            # UPDATE: Update a note
-            elif action == "update":
-                if not note_id:
-                    return "Error: note_id is required for update action."
-                
-                body = {}
-                if title:
-                    body["title"] = title
-                if content:
-                    body["content"] = content
-                if note_type:
-                    body["note_type"] = note_type
-                if tags:
-                    body["tags"] = [t.strip() for t in tags.split(",")]
-                if meeting_date:
-                    body["meeting_date"] = meeting_date
-                if attendees:
-                    body["attendees"] = [a.strip() for a in attendees.split(",")]
-                
-                if not body:
-                    return "Error: No fields to update. Provide title, content, tags, etc."
-                
-                url = f"{base}/api/notes/{note_id}"
-                async with session.patch(url, json=body, headers=headers, timeout=timeout) as resp:
-                    if resp.status == 404:
-                        return f"Note {note_id} not found."
-                    if resp.status != 200:
-                        return f"Failed to update note (HTTP {resp.status})."
-                    
-                    data = await resp.json()
-                    return f"✅ Note updated: \"{data.get('title', 'Untitled')}\""
+        # SEARCH: Search notes via workspace search
+        elif action == "search":
+            if not search:
+                return "Error: search query is required."
+            
+            results = await search_workspace(search)
+            items = results.get("results", [])
+            if not items:
+                return f"No notes found matching '{search}'."
+            
+            lines = [f"🔍 Found {len(items)} results for '{search}':"]
+            for r in items[:8]:
+                if r.get("type") == "page":
+                    lines.append(f"  📄 {r.get('title', 'Untitled')} (id: {r.get('id', '')[:8]}...)")
+            return "\n".join(lines)
 
-            # SEARCH: Search notes
-            elif action == "search":
-                if not search:
-                    return "Error: search query is required."
-                
-                params = {"search": search}
-                if limit:
-                    params["limit"] = limit
-                
-                url = f"{base}/api/notes"
-                async with session.get(url, params=params, headers=headers, timeout=timeout) as resp:
-                    if resp.status != 200:
-                        return f"Search failed (HTTP {resp.status})."
-                    
-                    data = await resp.json()
-                    notes = data.get("notes", [])
-                    
-                    if not notes:
-                        return f"No notes found matching '{search}'."
-                    
-                    lines = [f"🔍 Found {len(notes)} notes matching '{search}':"]
-                    for n in notes[:8]:
-                        title_str = n.get("title", "Untitled")[:50]
-                        ntype = n.get("note_type", "quick")
-                        lines.append(f"- [{ntype}] {title_str} (id: {n.get('id')[:8]}...)")
-                    
-                    return "\n".join(lines)
+        # ADD_ACTION: Add to-do block to note
+        elif action == "add_action":
+            if not note_id:
+                return "Error: note_id is required."
+            if not action_item_text:
+                return "Error: action_item_text is required."
+            
+            block = await create_block(
+                note_id, "to_do",
+                {"richText": [{"type": "text", "text": {"content": action_item_text}, "plainText": action_item_text}], "checked": False}
+            )
+            return f"✅ Action item added: \"{action_item_text}\"" if block else "Failed to add action item."
 
-            # ADD_ACTION: Add action item to a note
-            elif action == "add_action":
-                if not note_id:
-                    return "Error: note_id is required."
-                if not action_item_text:
-                    return "Error: action_item_text is required."
-                
-                body = {"text": action_item_text}
-                
-                url = f"{base}/api/notes/{note_id}/action-items"
-                async with session.post(url, json=body, headers=headers, timeout=timeout) as resp:
-                    if resp.status == 404:
-                        return f"Note {note_id} not found."
-                    if resp.status not in (200, 201):
-                        return f"Failed to add action item (HTTP {resp.status})."
-                    
-                    data = await resp.json()
-                    return f"✅ Action item added: \"{action_item_text}\"\nTotal items: {data.get('total_items', 1)}"
+        # COMPLETE_ACTION: Mark to-do as complete (via update row not implemented yet)
+        elif action == "complete_action":
+            # Note: This would need block update capability in pi_workspace.py
+            # For now, we return a message directing to use manage_workspace
+            return "Action item completion: Please use manage_workspace(action='update_task') instead."
 
-            # COMPLETE_ACTION: Mark action item as complete
-            elif action == "complete_action":
-                if not note_id:
-                    return "Error: note_id is required."
-                if not action_item_id:
-                    return "Error: action_item_id is required."
-                
-                completed = action_item_completed if action_item_completed is not None else True
-                body = {
-                    "action_item_id": action_item_id,
-                    "completed": completed,
-                }
-                
-                url = f"{base}/api/notes/{note_id}/action-items"
-                async with session.patch(url, json=body, headers=headers, timeout=timeout) as resp:
-                    if resp.status == 404:
-                        return f"Note or action item not found."
-                    if resp.status != 200:
-                        return f"Failed to update action item (HTTP {resp.status})."
-                    
-                    data = await resp.json()
-                    status = "completed" if completed else "reopened"
-                    return f"✅ Action item {status}. {data.get('completed_count', 0)}/{data.get('total_items', 0)} complete."
+        # LIST_ACTIONS: List to-do blocks
+        elif action == "list_actions":
+            if not note_id:
+                return "Error: note_id is required."
+            
+            blocks = await get_page_blocks(note_id)
+            todos = [b for b in (blocks or []) if b.get("type") == "to_do"]
+            
+            if not todos:
+                return "No action items in this note."
+            
+            lines = [f"Action Items ({len(todos)})"]
+            for t in todos:
+                props = t.get("properties", {})
+                checked = "✅" if props.get("checked") else "☐"
+                text = props.get("richText", [{}])[0].get("plainText", "") if props.get("richText") else ""
+                lines.append(f"  {checked} {text}")
+            
+            return "\n".join(lines)
 
-            # LIST_ACTIONS: List action items for a note
-            elif action == "list_actions":
-                if not note_id:
-                    return "Error: note_id is required."
-                
-                url = f"{base}/api/notes/{note_id}/action-items"
-                async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    if resp.status == 404:
-                        return f"Note {note_id} not found."
-                    if resp.status != 200:
-                        return f"Failed to list action items (HTTP {resp.status})."
-                    
-                    data = await resp.json()
-                    items = data.get("action_items", [])
-                    summary = data.get("summary", {})
-                    
-                    if not items:
-                        return "No action items in this note."
-                    
-                    lines = [f"Action Items ({summary.get('completed', 0)}/{summary.get('total', 0)} complete):"]
-                    for item in items:
-                        status = "✅" if item.get("completed") else "☐"
-                        line = f"  {status} {item.get('text', '')}"
-                        if item.get("assignee"):
-                            line += f" (@{item['assignee']})"
-                        if item.get("due_date"):
-                            line += f" [due: {item['due_date']}]"
-                        line += f" (id: {item.get('id', '')[:12]})"
-                        lines.append(line)
-                    
-                    return "\n".join(lines)
+        else:
+            return f"Unknown action: {action}. Available: create, list, get, update, search, add_action, complete_action, list_actions"
 
-            else:
-                return f"Unknown action: {action}. Available: create, list, get, update, search, add_action, complete_action, list_actions"
-
-    except aiohttp.ClientError as e:
-        logger.error(f"Notes API connection error: {e}")
-        return f"Could not connect to notes service: {str(e)}"
     except Exception as e:
-        logger.error(f"Notes handler error: {e}")
+        logger.error(f"Notes handler error: {e}", exc_info=True)
         return f"Notes operation failed: {str(e)}"

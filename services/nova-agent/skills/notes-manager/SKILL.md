@@ -2,8 +2,9 @@
 name: notes-manager
 tool_name: manage_notes
 description: >
-  Meeting notes, action items, and productivity document management via Dashboard Notes API.
-  Use for creating notes, tracking action items, and organizing meeting documentation.
+  DEPRECATED: Use manage_workspace instead. Notes are now Pi Workspace pages.
+  Backward-compatible wrapper for creating notes as workspace pages.
+  Creates notes with to-do blocks for action items, callouts for metadata.
 parameters:
   type: object
   properties:
@@ -21,33 +22,39 @@ parameters:
       description: "Action to perform"
     note_id:
       type: string
-      description: "Note ID (for get, update, add_action, complete_action, list_actions)"
+      description: "Note ID (page ID in workspace)"
     title:
       type: string
-      description: "Note title (for create, update)"
+      description: "Note title"
     content:
       type: string
-      description: "Note content/body text (for create, update). Supports markdown."
+      description: "Note content (added as paragraph block)"
     note_type:
       type: string
-      enum:
-        - meeting
-        - quick
-        - project
-        - journal
-        - reference
-      description: "Type of note (for create, list filter). Default: quick"
+      description: "Note type sets emoji icon: meeting=📅, quick=📝, project=📁, reference=📚, journal=📔"
     tags:
       type: string
-      description: "Comma-separated tags (for create, update, list filter)"
-    query:
-      type: string
-      description: "Search query (for search action)"
+      description: "Comma-separated tags (stored in metadata callout)"
   required:
     - action
 ---
 
-# Notes Manager
+# Notes Manager (DEPRECATED)
+
+**DEPRECATED**: This skill is maintained for backward compatibility. New code should use `manage_workspace` with `create_page` instead.
+
+Notes are now stored as Pi Workspace pages with blocks:
+- Content → paragraph blocks
+- Action items → to_do blocks
+- Metadata → callout blocks
+
+## Migration Path
+
+Old: `manage_notes(action="create", title="Meeting")`
+New: `manage_workspace(action="create_page", title="Meeting", icon="📅")`
+
+Old: `manage_notes(action="list")`
+New: `manage_workspace(action="list_pages")`
 
 Manage meeting notes, action items, and productivity documents with full CRUD operations.
 

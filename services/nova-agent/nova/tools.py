@@ -829,49 +829,162 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "manage_workspace",
             "description": (
-                "Manage workspace pages, permissions, share links, and AI templates. "
-                "Fast operations (~10-50ms). "
+                "Manage the Pi Workspace — your persistent Notion-like workspace for notes, "
+                "pages, databases, planner, forms, and AI-powered content. "
+                "All data persists across conversations and is context-grounded with CIG/PCG. "
                 "Actions: "
-                "generate_template (create page structure from description), "
-                "infer_schema (suggest database columns), "
-                "grant_permission (give user page access), "
-                "revoke_permission (remove access), "
-                "create_share_link (public link), "
-                "list_permissions, list_share_links. "
-                "For creating/editing actual page CONTENT, use hub_delegate(agent='argus') instead."
+                "list_pages (browse all pages/notes), "
+                "create_page (new note or document), "
+                "get_page (read page content and blocks), "
+                "add_block (add content block to a page), "
+                "search (hybrid FTS + vector search across all content), "
+                "list_databases (browse databases), "
+                "create_database (new table with schema), "
+                "add_row (add row to a database), "
+                "update_row (edit database row properties), "
+                "list_rows (view database rows), "
+                "create_form (build a form attached to a database), "
+                "submit_form (submit form data), "
+                "planner (view daily planner with tasks and events), "
+                "create_task (add task to planner), "
+                "update_task (change task status/priority), "
+                "create_event (add calendar event to planner), "
+                "list_templates (browse page templates), "
+                "create_from_template (new page from template), "
+                "ai_chat (ask AI with full workspace context), "
+                "component_registry (list all workspace component types for PiCode Agent). "
+                "This is your PRIMARY tool for personal knowledge management, note-taking, "
+                "task tracking, and structured data. Use it proactively to store information "
+                "the user shares and to recall context from previous conversations."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["generate_template", "infer_schema", "grant_permission", "revoke_permission", "create_share_link", "list_permissions", "list_share_links"],
+                        "enum": [
+                            "list_pages", "create_page", "get_page", "add_block",
+                            "search",
+                            "list_databases", "create_database", "add_row", "update_row", "list_rows",
+                            "create_form", "submit_form",
+                            "planner", "create_task", "update_task", "delete_task",
+                            "create_event",
+                            "list_templates", "create_from_template",
+                            "ai_chat",
+                            "component_registry",
+                        ],
                         "description": "Action to perform",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Title for pages, databases, tasks, events, forms",
                     },
                     "page_id": {
                         "type": "string",
-                        "description": "Page ID (for permission/share actions)",
+                        "description": "Page ID (for get_page, add_block)",
                     },
-                    "purpose": {
+                    "database_id": {
                         "type": "string",
-                        "description": "Template purpose (for generate_template): meeting, project, docs, bug, review, decision, journal, database",
+                        "description": "Database ID (for add_row, list_rows, create_form)",
                     },
-                    "description": {
+                    "row_id": {
                         "type": "string",
-                        "description": "Database description (for infer_schema): e.g. 'bug tracker', 'inventory list'",
+                        "description": "Database row ID (for update_row)",
                     },
-                    "user_id": {
+                    "task_id": {
                         "type": "string",
-                        "description": "Target user ID (for grant/revoke permission)",
+                        "description": "Planner task ID (for update_task, delete_task)",
                     },
-                    "role": {
+                    "form_id": {
                         "type": "string",
-                        "enum": ["owner", "editor", "commenter", "viewer"],
-                        "description": "Permission role (for grant_permission, create_share_link)",
+                        "description": "Form ID (for submit_form)",
                     },
-                    "permission_id": {
+                    "template_id": {
                         "type": "string",
-                        "description": "Permission ID to revoke",
+                        "description": "Template ID (for create_from_template)",
+                    },
+                    "block_type": {
+                        "type": "string",
+                        "description": "Block type for add_block: paragraph, heading_1, heading_2, heading_3, bulleted_list_item, numbered_list_item, to_do, callout, quote, code, divider, toggle, table, planner_day, planner_task",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text content for blocks, pages, or search queries",
+                    },
+                    "properties": {
+                        "type": "object",
+                        "description": "Properties for database rows, form submissions, or block properties",
+                    },
+                    "schema": {
+                        "type": "array",
+                        "description": "Database schema definition (for create_database): array of {name, type} objects. Types: title, rich_text, number, select, multi_select, date, person, checkbox, url, email, phone_number",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high", "urgent"],
+                        "description": "Task priority (for create_task, update_task)",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Task status (for update_task): not_started, in_progress, done, cancelled",
+                    },
+                    "due_date": {
+                        "type": "string",
+                        "description": "Due date for task (ISO date: 2026-04-17)",
+                    },
+                    "due_time": {
+                        "type": "string",
+                        "description": "Due time for task (HH:mm)",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Date for planner view (ISO date: 2026-04-17). Defaults to today.",
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "description": "Event start time (ISO datetime: 2026-04-17T09:00:00)",
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "description": "Event end time (ISO datetime: 2026-04-17T09:30:00)",
+                    },
+                    "location": {
+                        "type": "string",
+                        "description": "Event location",
+                    },
+                    "source_type": {
+                        "type": "string",
+                        "enum": ["manual", "cig_calendar", "pcg_goal", "agent_task"],
+                        "description": "Source of task/event. Use 'cig_calendar' for calendar-sourced, 'pcg_goal' for goal-derived.",
+                    },
+                    "source_id": {
+                        "type": "string",
+                        "description": "ID of the source (CIG email, PCG goal, etc.)",
+                    },
+                    "icon": {
+                        "type": "string",
+                        "description": "Emoji icon for pages (e.g. '📝', '🎯', '📊')",
+                    },
+                    "parent_id": {
+                        "type": "string",
+                        "description": "Parent page ID for nested pages/blocks",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tags for tasks",
+                    },
+                    "assignee": {
+                        "type": "string",
+                        "description": "Assignee for tasks",
+                    },
+                    "fields": {
+                        "type": "array",
+                        "description": "Form field definitions (for create_form): array of {name, type, required} objects",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message for AI chat",
                     },
                 },
                 "required": ["action"],
@@ -3302,112 +3415,331 @@ async def handle_manage_ticket(
 
 async def handle_manage_workspace(
     action: str,
+    title: str = "",
     page_id: str = "",
-    purpose: str = "",
-    description: str = "",
-    user_id: str = "",
-    role: str = "viewer",
-    permission_id: str = "",
+    database_id: str = "",
+    row_id: str = "",
+    task_id: str = "",
+    form_id: str = "",
+    template_id: str = "",
+    block_type: str = "",
+    content: str = "",
+    properties: dict | None = None,
+    schema: list | None = None,
+    priority: str = "",
+    status: str = "",
+    due_date: str = "",
+    due_time: str = "",
+    date: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    location: str = "",
+    source_type: str = "",
+    source_id: str = "",
+    icon: str = "",
+    parent_id: str = "",
+    tags: list | None = None,
+    assignee: str = "",
+    fields: list | None = None,
+    message: str = "",
+    **kwargs,
 ) -> str:
-    """Handle workspace management operations via dashboard API."""
-    headers = {
-        "Content-Type": "application/json",
-        "X-API-Key": ECOSYSTEM_API_KEY,
-    }
+    """Handle Pi Workspace operations via the Workspace API (port 8762)."""
+    from nova.pi_workspace import (
+        create_page, list_pages, get_page, get_page_blocks, create_block,
+        create_database, list_databases, list_database_rows, create_database_row,
+        update_database_row, create_form, submit_form,
+        get_planner_day, create_task, update_task, delete_task,
+        create_event, update_planner_notes,
+        search_workspace, ai_chat, get_component_registry,
+        list_templates, create_from_template,
+        _plain_title,
+    )
 
     try:
-        async with aiohttp.ClientSession() as session:
-            if action == "generate_template":
-                if not purpose:
-                    return "Please specify a purpose (e.g. 'meeting notes', 'project plan', 'bug report')."
-                url = f"{ECOSYSTEM_URL}/api/ai/smart-templates"
-                payload = {"action": "generate-template", "purpose": purpose}
-                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        block_count = len(data.get("blocks", []))
-                        return f"Generated '{data.get('title')}' template with {block_count} blocks. {data.get('description', '')}"
-                    return f"Template generation failed: {resp.status}"
+        # ── Pages ──
+        if action == "list_pages":
+            pages = await list_pages()
+            if not pages:
+                return "No pages found in workspace. Create one with create_page."
+            lines = [f"📝 {len(pages)} pages:"]
+            for p in pages[:15]:
+                t = _plain_title(p.get("title", "Untitled"))
+                emoji = p.get("icon", {}).get("emoji", "")
+                lines.append(f"  {emoji} {t} (id: {p['id'][:8]}...)")
+            return "\n".join(lines)
 
-            elif action == "infer_schema":
-                if not description:
-                    return "Please describe what the database should track (e.g. 'bug tracker', 'inventory')."
-                url = f"{ECOSYSTEM_URL}/api/ai/smart-templates"
-                payload = {"action": "infer-schema", "description": description}
-                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        schema = data.get("schema", {})
-                        cols = [f"{v['name']} ({v['type']})" for v in schema.values()]
-                        return f"Suggested schema with {len(cols)} columns: {', '.join(cols)}"
-                    return f"Schema inference failed: {resp.status}"
+        elif action == "create_page":
+            if not title:
+                return "Title is required to create a page."
+            page = await create_page(title, parent_id=parent_id, icon=icon)
+            if not page:
+                return "Failed to create page."
+            # If content provided, add a paragraph block
+            if content:
+                await create_block(page["id"], "paragraph",
+                                   {"richText": [{"type": "text", "text": {"content": content}, "plainText": content}]},
+                                   parent_id=page.get("rootBlockId", ""))
+            return f"✅ Page created: \"{title}\" (id: {page['id'][:8]}...)"
 
-            elif action == "grant_permission":
-                if not page_id or not user_id:
-                    return "page_id and user_id are required to grant permission."
-                url = f"{ECOSYSTEM_URL}/api/pages/{page_id}/permissions"
-                payload = {"userId": user_id, "role": role, "grantedBy": ECOSYSTEM_USER_ID}
-                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status in (200, 201):
-                        return f"Granted {role} access to user {user_id} on page {page_id}."
-                    return f"Permission grant failed: {resp.status}"
+        elif action == "get_page":
+            if not page_id:
+                return "page_id is required for get_page."
+            page = await get_page(page_id)
+            if not page:
+                return f"Page {page_id} not found."
+            t = _plain_title(page.get("title", "Untitled"))
+            lines = [f"📄 {t}"]
+            # Get blocks
+            blocks = await get_page_blocks(page_id)
+            for b in (blocks or [])[:20]:
+                bt = b.get("type", "")
+                props = b.get("properties", {})
+                if bt == "paragraph" and props.get("richText"):
+                    text = " ".join(s.get("plainText", "") for s in props["richText"][:3])
+                    lines.append(f"  {text[:100]}")
+                elif bt == "heading_1" and props.get("richText"):
+                    text = " ".join(s.get("plainText", "") for s in props["richText"])
+                    lines.append(f"  # {text}")
+                elif bt == "heading_2" and props.get("richText"):
+                    text = " ".join(s.get("plainText", "") for s in props["richText"])
+                    lines.append(f"  ## {text}")
+                elif bt == "to_do":
+                    checked = "✅" if props.get("checked") else "☐"
+                    text = props.get("richText", [{}])[0].get("plainText", "") if props.get("richText") else ""
+                    lines.append(f"  {checked} {text}")
+                elif bt == "bulleted_list_item" and props.get("richText"):
+                    text = " ".join(s.get("plainText", "") for s in props["richText"])
+                    lines.append(f"  • {text}")
+                elif bt == "planner_task":
+                    text = props.get("richText", [{}])[0].get("plainText", "") if props.get("richText") else title
+                    lines.append(f"  📋 {text} [{props.get('status', '?')}] P{props.get('priority', '?')}")
+            return "\n".join(lines)
 
-            elif action == "revoke_permission":
-                if not page_id or not permission_id:
-                    return "page_id and permission_id are required to revoke permission."
-                url = f"{ECOSYSTEM_URL}/api/pages/{page_id}/permissions/{permission_id}"
-                async with session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        return f"Revoked permission {permission_id} from page {page_id}."
-                    return f"Permission revoke failed: {resp.status}"
+        elif action == "add_block":
+            if not page_id or not block_type:
+                return "page_id and block_type are required for add_block."
+            block_props: dict = {}
+            if content:
+                block_props["richText"] = [{"type": "text", "text": {"content": content}, "plainText": content}]
+            if properties:
+                block_props.update(properties)
+            block = await create_block(page_id, block_type, block_props, parent_id=parent_id)
+            if not block:
+                return "Failed to add block."
+            return f"✅ Added {block_type} block to page {page_id[:8]}..."
 
-            elif action == "create_share_link":
-                if not page_id:
-                    return "page_id is required to create a share link."
-                url = f"{ECOSYSTEM_URL}/api/pages/{page_id}/share"
-                payload = {"role": role, "createdBy": ECOSYSTEM_USER_ID}
-                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status in (200, 201):
-                        data = await resp.json()
-                        token = data.get("token", "")
-                        return f"Created {role} share link for page {page_id}. Token: {token}"
-                    return f"Share link creation failed: {resp.status}"
+        # ── Search ──
+        elif action == "search":
+            if not content:
+                return "Search query (content) is required."
+            results = await search_workspace(content)
+            items = results.get("results", [])
+            if not items:
+                return f"No results found for '{content}'."
+            lines = [f"🔍 Found {len(items)} results for '{content}':"]
+            for r in items[:8]:
+                emoji = {"page": "📄", "block": "📝", "database": "📊", "email": "📧"}.get(r.get("type", ""), "📎")
+                lines.append(f"  {emoji} {r.get('title', 'Untitled')} (score: {r.get('score', 0):.2f}) id: {r.get('id', '')[:8]}...")
+            return "\n".join(lines)
 
-            elif action == "list_permissions":
-                if not page_id:
-                    return "page_id is required to list permissions."
-                url = f"{ECOSYSTEM_URL}/api/pages/{page_id}/permissions"
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        perms = data.get("permissions", [])
-                        if not perms:
-                            return f"No permissions set on page {page_id}."
-                        lines = [f"- {p['user_id']}: {p['role']}" for p in perms]
-                        return f"Permissions on page {page_id}:\n" + "\n".join(lines)
-                    return f"Permission list failed: {resp.status}"
+        # ── Databases ──
+        elif action == "list_databases":
+            dbs = await list_databases()
+            if not dbs:
+                return "No databases found. Create one with create_database."
+            lines = [f"📊 {len(dbs)} databases:"]
+            for d in dbs[:10]:
+                t = _plain_title(d.get("title", "Untitled"))
+                schema_count = len(d.get("schema", []))
+                lines.append(f"  {t} ({schema_count} columns) id: {d['id'][:8]}...")
+            return "\n".join(lines)
 
-            elif action == "list_share_links":
-                if not page_id:
-                    return "page_id is required to list share links."
-                url = f"{ECOSYSTEM_URL}/api/pages/{page_id}/share"
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        links = data.get("links", [])
-                        if not links:
-                            return f"No active share links on page {page_id}."
-                        lines = [f"- {l['token'][:8]}... ({l['role']}, {l['accessCount']} views)" for l in links]
-                        return f"Share links on page {page_id}:\n" + "\n".join(lines)
-                    return f"Share link list failed: {resp.status}"
+        elif action == "create_database":
+            if not title or not schema:
+                return "Title and schema are required for create_database."
+            db = await create_database(title, schema)
+            if not db:
+                return "Failed to create database."
+            return f"✅ Database created: \"{title}\" ({len(schema)} columns) id: {db['id'][:8]}..."
 
-            else:
-                return f"Unknown workspace action: {action}. Use generate_template, infer_schema, grant_permission, revoke_permission, create_share_link, list_permissions, or list_share_links."
+        elif action == "list_rows":
+            if not database_id:
+                return "database_id is required for list_rows."
+            rows = await list_database_rows(database_id)
+            if not rows:
+                return "No rows in this database."
+            lines = [f"📋 {len(rows)} rows:"]
+            for r in rows[:10]:
+                t = _plain_title(r.get("title", "Untitled"))
+                props = r.get("properties", {})
+                prop_str = " | ".join(f"{k}={v}" for k, v in list(props.items())[:3])
+                lines.append(f"  {t} — {prop_str}")
+            return "\n".join(lines)
 
-    except asyncio.TimeoutError:
-        return "Workspace API timed out. Try again."
+        elif action == "add_row":
+            if not database_id or not title:
+                return "database_id and title are required for add_row."
+            row = await create_database_row(database_id, title, properties or {})
+            if not row:
+                return "Failed to add row."
+            return f"✅ Row added: \"{title}\" (id: {row['id'][:8]}...)"
+
+        elif action == "update_row":
+            if not row_id or not properties:
+                return "row_id and properties are required for update_row."
+            result = await update_database_row(row_id, properties)
+            if not result:
+                return f"Row {row_id} not found or update failed."
+            return f"✅ Row updated: {list(properties.keys())}"
+
+        # ── Forms ──
+        elif action == "create_form":
+            if not database_id or not title or not fields:
+                return "database_id, title, and fields are required for create_form."
+            form = await create_form(database_id, title, fields)
+            if not form:
+                return "Failed to create form."
+            return f"✅ Form created: \"{title}\" ({len(fields)} fields) id: {form.get('formId', '')[:8]}..."
+
+        elif action == "submit_form":
+            if not form_id or not properties:
+                return "form_id and properties (values) are required for submit_form."
+            sub = await submit_form(form_id, properties)
+            if not sub:
+                return "Failed to submit form."
+            row_info = f" → row {sub.get('rowId', '')[:8]}..." if sub.get("rowId") else ""
+            return f"✅ Form submitted{row_info}"
+
+        # ── Planner ──
+        elif action == "planner":
+            day = await get_planner_day(date)
+            if not day:
+                return "Could not load planner."
+            d = day.get("date", "today")
+            tasks = day.get("tasks", [])
+            events = day.get("events", [])
+            notes = day.get("notes", [])
+            lines = [f"📅 Planner for {d}:"]
+            if events:
+                lines.append(f"  Events ({len(events)}):")
+                for e in events[:5]:
+                    loc = f" @ {e['location']}" if e.get("location") else ""
+                    lines.append(f"    🕐 {e.get('title', '')} {e.get('startTime', '')[:16]}{loc}")
+            if tasks:
+                lines.append(f"  Tasks ({len(tasks)}):")
+                for t in tasks:
+                    status_icon = {"not_started": "☐", "in_progress": "🔄", "done": "✅", "cancelled": "❌"}.get(t.get("status", ""), "☐")
+                    pri = {"low": "🟢", "medium": "🟡", "high": "🟠", "urgent": "🔴"}.get(t.get("priority", ""), "")
+                    due = f" due:{t.get('dueDate', '')}" if t.get("dueDate") else ""
+                    lines.append(f"    {status_icon} {pri} {t.get('title', '')}{due}")
+            if notes:
+                note_text = " ".join(n.get("plainText", "") for n in notes if isinstance(n, dict))
+                if note_text:
+                    lines.append(f"  Notes: {note_text[:100]}")
+            if not tasks and not events:
+                lines.append("  No tasks or events scheduled.")
+            return "\n".join(lines)
+
+        elif action == "create_task":
+            if not title:
+                return "Title is required for create_task."
+            task = await create_task(title, priority=priority or "medium",
+                                     due_date=due_date, due_time=due_time,
+                                     source_type=source_type or "manual",
+                                     source_id=source_id, assignee=assignee,
+                                     tags=tags or [])
+            if not task:
+                return "Failed to create task."
+            return f"✅ Task created: \"{title}\" [{task.get('status', 'not_started')}] P{task.get('priority', 'medium')}"
+
+        elif action == "update_task":
+            if not task_id:
+                return "task_id is required for update_task."
+            patch: dict = {}
+            if status:
+                patch["status"] = status
+            if priority:
+                patch["priority"] = priority
+            if due_date:
+                patch["dueDate"] = due_date
+            if assignee:
+                patch["assignee"] = assignee
+            if tags:
+                patch["tags"] = tags
+            if not patch:
+                return "No fields to update. Provide status, priority, due_date, etc."
+            result = await update_task(task_id, patch)
+            if not result:
+                return f"Task {task_id} not found or update failed."
+            return f"✅ Task updated: {list(patch.keys())}"
+
+        elif action == "delete_task":
+            if not task_id:
+                return "task_id is required for delete_task."
+            ok = await delete_task(task_id)
+            return "✅ Task deleted." if ok else f"Task {task_id} not found."
+
+        elif action == "create_event":
+            if not title or not start_time or not end_time:
+                return "title, start_time, and end_time are required for create_event."
+            event = await create_event(title, start_time, end_time,
+                                       location=location,
+                                       source_type=source_type or "manual",
+                                       source_id=source_id)
+            if not event:
+                return "Failed to create event."
+            return f"✅ Event created: \"{title}\" @ {start_time}"
+
+        # ── Templates ──
+        elif action == "list_templates":
+            templates = await list_templates()
+            if not templates:
+                return "No templates available."
+            lines = [f"📋 {len(templates)} templates:"]
+            for t in templates[:10]:
+                emoji = t.get("icon", {}).get("emoji", "📄")
+                lines.append(f"  {emoji} {t.get('name', 'Untitled')} ({t.get('category', '')}) id: {t.get('id', '')[:8]}...")
+            return "\n".join(lines)
+
+        elif action == "create_from_template":
+            if not template_id:
+                return "template_id is required for create_from_template."
+            from nova.pi_workspace import _get_workspace_id
+            ws_id = await _get_workspace_id()
+            result = await create_from_template(ws_id, template_id, title)
+            if not result:
+                return "Failed to create page from template."
+            page = result.get("page", result)
+            return f"✅ Page created from template: \"{title or template_id}\" (id: {page.get('id', '')[:8]}...)"
+
+        # ── AI Chat ──
+        elif action == "ai_chat":
+            if not message:
+                return "message is required for ai_chat."
+            result = await ai_chat(message)
+            if not result:
+                return "AI chat failed."
+            content = result.get("content", "")
+            return f"🤖 {content[:300]}" if content else "AI returned no response."
+
+        # ── Component Registry ──
+        elif action == "component_registry":
+            components = await get_component_registry()
+            if not components:
+                return "Component registry unavailable."
+            lines = [f"🔧 {len(components)} workspace components:"]
+            for c in components[:15]:
+                caps = ", ".join(c.get("capabilities", []))
+                sources = ", ".join(c.get("contextSources", []))
+                lines.append(f"  {c.get('type', '')}: {c.get('label', '')} [{caps}] ← {sources}")
+            return "\n".join(lines)
+
+        else:
+            return f"Unknown workspace action: {action}. Available: list_pages, create_page, get_page, add_block, search, list_databases, create_database, add_row, update_row, list_rows, create_form, submit_form, planner, create_task, update_task, delete_task, create_event, list_templates, create_from_template, ai_chat, component_registry"
+
     except Exception as e:
-        logger.error(f"Workspace management error: {e}")
+        logger.error(f"Workspace handler error: {e}", exc_info=True)
         return f"Workspace error: {str(e)}"
 
 
