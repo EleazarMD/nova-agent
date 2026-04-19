@@ -29,58 +29,84 @@ When this skill requires a tool call (e.g., creating a workspace page), you MUST
 - **If the task takes multiple steps**: Narrate each step — "Adding the problems now... and the answer key at the bottom."
 Never go silent while a tool is running. The user should always hear what's happening.
 
-## STAAR Multiple-Choice Format (MANDATORY)
+## Problem Format Variety
 
-Every math problem MUST include 4 answer choices in STAAR format:
+Use a mix of problem types — not just plain A/B/C/D. STAAR uses multiple formats, and variety keeps students engaged.
 
-- **4 choices labeled A, B, C, D**
-- **One correct answer** and **three plausible distractors**
-- Distractors should reflect common misconceptions or calculation errors
-  - e.g., for 3/8 + 2/8: distractors include 1/8 (subtracted instead), 6/8 (added denominators), 5/16 (added both num+denom)
-- Offer the correct answers as a **separate Answer Key** section at the end, so the student can work through problems first
-
-### Format
-
-```
-Problem N — [Skill Name]
-[Real-world context and question]
-
-A) [choice]  B) [choice]  C) [choice]  D) [choice]
-```
-
-...after all problems...
-
-```
----
-Answer Key
-1. A   2. B   3. C   4. D   5. A
-```
-
-### Example
+### Type 1: Multiple Choice (standard)
+4 choices labeled A, B, C, D with one correct answer and three plausible distractors.
 
 ```
 Problem 1 — Adding Fractions
-Sophia ran 3/8 of a mile in the morning and 2/8 of a mile after school.
+Sofia ran 3/8 of a mile in the morning and 2/8 of a mile after school.
 How far did she run in total?
 
-A) 5/8  B) 1/8  C) 6/8  D) 5/16
+A) 5/8    B) 1/8    C) 6/8    D) 5/16
+```
 
-Problem 2 — Subtracting Fractions
-A pizza had 7/10 left. Sofia's family ate 4/10. How much is left?
+### Type 2: Fill in the Blank (□)
+Student writes the answer in the box. Use □ as the answer blank.
 
-A) 3/10  B) 11/10  C) 3/20  D) 4/10
+```
+Problem 2 — Fraction of a Whole
+Luca has 12 baseball cards. He gave 1/3 of them to his friend.
+How many cards did Luca give away?  □
+```
 
+### Type 3: Compare with >, <, or =
+Student picks the correct comparison symbol.
+
+```
+Problem 3 — Comparing Fractions
+Fill in the blank with >, <, or =:
+
+3/4  ___  2/3
+```
+
+### Type 4: Equivalent Fractions (find the missing number)
+Student fills in the missing numerator or denominator.
+
+```
+Problem 4 — Equivalent Fractions
+2/4 = □/8
+```
+
+### Type 5: Number Line
+Show a number line with a point and ask the student to identify the fraction.
+
+```
+Problem 5 — Fractions on a Number Line
+What fraction does point P represent?
+
+|----|----|----|----|
+0         P         1
+          ↑
+     (point at 3/4)
+
+A) 1/4    B) 2/4    C) 3/4    D) 4/4
+```
+
+### Distractor Rules
+- Distractors should reflect common misconceptions or calculation errors
+  - e.g., for 3/8 + 2/8: distractors include 1/8 (subtracted instead), 6/8 (added denominators), 5/16 (added both num+denom)
+- Offer the correct answers as a **separate Answer Key** section at the end
+
+### Answer Key Format
+
+After all problems:
+
+```
 ---
 Answer Key
-1. A   2. A
+1. A   2. 4   3. >   4. 4   5. C
 ```
 
 ## STAAR-Aligned Problem Structure
 
 1. **Real-world context** — Use relatable scenarios (Sofia, Luca, cooking, sports, school, pets)
 2. **Clear question stem** — One question per problem
-3. **Four answer choices** — A through D
-4. **Answer Key** — Offer as a separate section at the end so students can check after attempting all problems
+3. **Mix of problem types** — Multiple choice, fill-in (□), comparison (>/< /=), number lines
+4. **Answer Key** — Separate section at the end
 
 ## Grade-Level Skills (4th Grade TEKS)
 
@@ -100,7 +126,10 @@ Answer Key
 
 - Fractions: write as `3/8` (not "three-eighths") — TTS reads it naturally
 - Answer choices: `A) 5/8` — speak as "A, five eighths"
-- Avoid raw LaTeX or special symbols — keep it plain text
+- Fill-in blanks: `□` — TTS reads as "blank"
+- Comparison: `>  <  =` — TTS reads as "greater than, less than, equals"
+- Number lines: describe the position verbally too — "point P is three marks from zero"
+- Avoid raw LaTeX — keep it plain text with unicode symbols
 - Percent: write `25%` — TTS says "twenty-five percent"
 
 ## Creating Worksheet Pages
@@ -120,12 +149,14 @@ manage_workspace(
     {"type": "heading_2", "content": "Problem 1 — Adding Fractions"},
     {"type": "paragraph", "content": "Sophia ran 3/8 of a mile in the morning and 2/8 of a mile after school. How far did she run in total?"},
     {"type": "paragraph", "content": "A) 5/8   B) 1/8   C) 6/8   D) 5/16"},
-    {"type": "heading_2", "content": "Problem 2 — Subtracting Fractions"},
-    {"type": "paragraph", "content": "A pizza had 7/10 left. Sofia's family ate 4/10. How much is left?"},
-    {"type": "paragraph", "content": "A) 3/10   B) 11/10   C) 3/20   D) 4/10"},
+    {"type": "heading_2", "content": "Problem 2 — Fraction of a Whole"},
+    {"type": "paragraph", "content": "Luca has 12 baseball cards. He gave 1/3 of them to his friend. How many cards did Luca give away?  □"},
+    {"type": "heading_2", "content": "Problem 3 — Comparing Fractions"},
+    {"type": "paragraph", "content": "Fill in the blank with >, <, or =:"},
+    {"type": "paragraph", "content": "3/4  ___  2/3"},
     {"type": "divider"},
     {"type": "heading_2", "content": "Answer Key"},
-    {"type": "paragraph", "content": "1. A   2. A"},
+    {"type": "paragraph", "content": "1. A   2. 4   3. >"},
     {"type": "callout", "properties": {"icon": {"type": "emoji", "emoji": "✅"}, "calloutColor": "green", "title": [{"type": "text", "text": {"content": "Score: ___ / 2"}, "plainText": "Score: ___ / 2"}]}}
   ]}
 )
