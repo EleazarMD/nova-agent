@@ -627,15 +627,21 @@ async def run_bot(
                         msg_type = msg.get("type", "")
                         logger.info(f"LLM → Client ({msg_type}): {str(msg)[:120]}")
 
-                # Filter LLMTextFrames: strip raw tool-call syntax
+                # Filter LLMTextFrames: strip raw tool-call syntax + markdown for TTS
                 if isinstance(frame, LLMTextFrame):
                     original = frame.text
+                    # Step 1: Strip raw tool-call syntax
                     cleaned = _TOOL_CALL_TEXT_RE.sub('', original)
                     if cleaned != original:
                         logger.warning(f"🧹 Stripped tool syntax from LLM text: {original[:120]}")
                         if not cleaned.strip():
                             # Entire frame was tool syntax — drop it
                             return
+                    # Step 2: Strip markdown for TTS (bold, headers, pipes, emojis)
+                    # iOS TTS reads raw markdown verbatim — pipes become "pipe", dashes become "minus"
+                    from nova.text_utils import strip_markdown_for_speech
+                    cleaned = strip_markdown_for_speech(cleaned)
+                    if cleaned != original:
                         frame.text = cleaned
 
                 # Log LLMFullResponseStartFrame/EndFrame

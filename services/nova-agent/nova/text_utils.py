@@ -100,38 +100,135 @@ ABBREVIATIONS = {
 }
 
 
+def _convert_table_to_speech(text: str) -> str:
+    """
+    Convert markdown tables to natural speech text.
+
+    Handles:
+    - Separator rows (|------|-------|) → removed entirely
+    - Header + data rows → "Key: Value. Key: Value."
+    - Multi-row tables → each row spoken as key-value pairs
+
+    Example input:
+        | Stat | Value |
+        |------|-------|
+        | Battery | 52% |
+        | Range | 138 miles |
+
+    Example output:
+        Battery: 52%. Range: 138 miles.
+    """
+    lines = text.split('\n')
+    result_lines = []
+    table_rows = []
+    in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+        # Detect table row: starts and ends with |
+        if stripped.startswith('|') and stripped.endswith('|'):
+            # Skip separator rows (all dashes/colons)
+            cells = [c.strip() for c in stripped.split('|')[1:-1]]
+            if all(re.match(r'^[-:]+$', c) for c in cells if c):
+                continue  # separator row — skip
+            table_rows.append(cells)
+            in_table = True
+        else:
+            # Flush any accumulated table
+            if table_rows:
+                result_lines.append(_table_rows_to_speech(table_rows))
+                table_rows = []
+                in_table = False
+            result_lines.append(line)
+
+    # Flush remaining table
+    if table_rows:
+        result_lines.append(_table_rows_to_speech(table_rows))
+
+    return '\n'.join(result_lines)
+
+
+def _table_rows_to_speech(rows: list[list[str]]) -> str:
+    """Convert parsed table rows to natural speech."""
+    if not rows:
+        return ""
+
+    # Generic header labels that don't add meaning when spoken
+    _GENERIC_HEADERS = {"stat", "value", "key", "item", "name", "label", "property", "field", "#"}
+
+    if len(rows) >= 2:
+        headers = [h.strip().lower() for h in rows[0]]
+        # For 2-column tables with generic headers like Stat/Value,
+        # just speak as "Label: Value" using column 0 as label
+        if (len(headers) == 2 and
+            headers[0] in _GENERIC_HEADERS and
+            headers[1] in _GENERIC_HEADERS):
+            speech_parts = []
+            for row in rows[1:]:
+                cells = [c.strip() for c in row]
+                if len(cells) >= 2 and cells[0]:
+                    speech_parts.append(f"{cells[0]}: {cells[1]}")
+                elif cells[0]:
+                    speech_parts.append(cells[0])
+            return '. '.join(speech_parts) + '.' if speech_parts else ''
+        # General case: use headers as labels
+        speech_parts = []
+        for row in rows[1:]:
+            for i, cell in enumerate(row):
+                if i < len(headers) and cell.strip():
+                    label = rows[0][i].strip()
+                    if not re.match(r'^\d+$', label):
+                        speech_parts.append(f"{label}: {cell.strip()}")
+                    else:
+                        speech_parts.append(cell.strip())
+        return '. '.join(speech_parts) + '.' if speech_parts else ''
+    else:
+        # Single row — just speak values
+        cells = [c.strip() for c in rows[0] if c.strip()]
+        return '. '.join(cells) + '.' if cells else ''
+
+
 def strip_markdown_for_speech(text: str) -> str:
     """
     Strip markdown formatting to make text sound natural when spoken.
-    
+
     Converts:
     - **bold** → bold
     - *italic* → italic
     - - list items → list items (without dash)
     - ## headers → headers
     - [links](url) → links
+    - Markdown tables → natural key: value pairs
     - Emojis → removed (iOS TTS handles poorly)
-    
+    - Numeric units: °F → degrees Fahrenheit, % → percent, mph → miles per hour
+
     Preserves line breaks for natural pauses.
     """
     if not text:
         return text
-    
+
+    # Convert markdown tables to natural speech BEFORE stripping pipes
+    # Table format: | Stat | Value | or |------|-------|
+    text = _convert_table_to_speech(text)
+
     # Remove bold/italic markers
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # **bold**
     text = re.sub(r'\*([^*]+)\*', r'\1', text)      # *italic*
     text = re.sub(r'__([^_]+)__', r'\1', text)      # __bold__
     text = re.sub(r'_([^_]+)_', r'\1', text)        # _italic_
-    
+
     # Remove headers
     text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
-    
+
     # Convert list items to natural speech
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
-    
+
     # Remove links but keep text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    
+
+    # Remove stray pipe characters (leftover from incomplete table parsing)
+    text = re.sub(r'\|', ' ', text)
+
     # Remove emojis (they sound weird in TTS)
     emoji_pattern = re.compile(
         "["
@@ -145,11 +242,18 @@ def strip_markdown_for_speech(text: str) -> str:
         flags=re.UNICODE
     )
     text = emoji_pattern.sub('', text)
-    
+
+    # Normalize numeric units for speech
+    text = re.sub(r'(\d+)\s*°F\b', r'\1 degrees Fahrenheit', text)
+    text = re.sub(r'(\d+)\s*°C\b', r'\1 degrees Celsius', text)
+    text = re.sub(r'(\d+)\s*%\b', r'\1 percent', text)
+    text = re.sub(r'(\d+)\s*mph\b', r'\1 miles per hour', text)
+    text = re.sub(r'(\d+)\s*mi\b', r'\1 miles', text)
+
     # Clean up extra whitespace
     text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 newlines
     text = re.sub(r' {2,}', ' ', text)      # Max 1 space
-    
+
     return text.strip()
 
 
