@@ -25,8 +25,7 @@ Every math problem MUST include 4 answer choices in STAAR format:
 - **One correct answer** and **three plausible distractors**
 - Distractors should reflect common misconceptions or calculation errors
   - e.g., for 3/8 + 2/8: distractors include 1/8 (subtracted instead), 6/8 (added denominators), 5/16 (added both num+denom)
-- **NEVER show the correct answer next to the problem** — that defeats the quiz purpose
-- Put all answers in a separate **Answer Key** section at the very end
+- Offer the correct answers as a **separate Answer Key** section at the end, so the student can work through problems first
 
 ### Format
 
@@ -68,8 +67,8 @@ Answer Key
 
 1. **Real-world context** — Use relatable scenarios (Sofia, Luca, cooking, sports, school, pets)
 2. **Clear question stem** — One question per problem
-3. **Four answer choices** — A through D (NO correct answer shown next to problem)
-4. **Answer Key** — Separate section at the end listing all correct letters
+3. **Four answer choices** — A through D
+4. **Answer Key** — Offer as a separate section at the end so students can check after attempting all problems
 
 ## Grade-Level Skills (4th Grade TEKS)
 
