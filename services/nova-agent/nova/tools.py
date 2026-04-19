@@ -82,6 +82,10 @@ handle_tesla_control = _tesla.handle_tesla_control
 _tesla_stream = _load_skill_module("tesla-stream-monitor", "tesla_stream_monitor")
 handle_tesla_stream_monitor = _tesla_stream.handle_tesla_stream_monitor
 
+# STAAR Tutor (skill-based)
+_staar = _load_skill_module("staar-tutor", "staar_tutor")
+handle_staar_tutor = _staar.handle_staar_tutor
+
 # Tesla wake (direct import from tesla_tools)
 from nova.tesla_tools import handle_tesla_wake, handle_tesla_navigation
 
@@ -3979,6 +3983,8 @@ TOOL_HANDLERS = {
     "service_health_check": handle_service_health_check,
     # Unified homelab_operations (per /claude-skills spec)
     "homelab_operations": handle_homelab_operations,
+    # STAAR Tutor (TEKS-aligned problem generation)
+    "staar_tutor": handle_staar_tutor,
     # EV Charging & Route Planning (NREL AFDC API)
     "ev_route_planner": handle_ev_route_planner,
     # Tesla location refresh

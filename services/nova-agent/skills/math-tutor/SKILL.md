@@ -29,19 +29,38 @@ When this skill requires a tool call (e.g., creating a workspace page), you MUST
 - **If the task takes multiple steps**: Narrate each step — "Adding the problems now... and the answer key at the bottom."
 Never go silent while a tool is running. The user should always hear what's happening.
 
+## STAAR Test Format (4th Grade Math)
+
+Based on official TEA STAAR blueprint: 32 questions, 40 points.
+- 24 one-point questions (multiple-choice + non-multiple-choice)
+- 8 two-point questions (multipart, constructed response)
+- Answer choices are presented **vertically** — one per line, stacked
+
+### Reporting Categories
+
+| Category | TEKS Focus | Questions | Points |
+|----------|-----------|-----------|--------|
+| 1: Numerical Representations & Relationships | Fractions, comparing, equivalence, decimals | 7-9 | 8-12 |
+| 2: Computations & Algebraic Relationships | Operations, multi-step, patterns, input-output | 10-12 | 12-16 |
+| 3: Geometry & Measurement | Angles, perimeter, area, measurement | 8-10 | 9-13 |
+| 4: Data Analysis & Financial Literacy | Graphs, tables, income, expenses | 3-5 | 3-6 |
+
 ## Problem Format Variety
 
-Use a mix of problem types — not just plain A/B/C/D. STAAR uses multiple formats, and variety keeps students engaged.
+Use a mix of problem types — STAAR uses multiple formats. Variety keeps students engaged and prepares them for the real test.
 
-### Type 1: Multiple Choice (standard)
-4 choices labeled A, B, C, D with one correct answer and three plausible distractors.
+### Type 1: Multiple Choice (vertical — STAAR standard)
+4 choices labeled A, B, C, D — **stacked vertically**, one per line.
 
 ```
 Problem 1 — Adding Fractions
 Sofia ran 3/8 of a mile in the morning and 2/8 of a mile after school.
 How far did she run in total?
 
-A) 5/8    B) 1/8    C) 6/8    D) 5/16
+A   5/8
+B   1/8
+C   6/8
+D   5/16
 ```
 
 ### Type 2: Fill in the Blank (□)
@@ -83,7 +102,29 @@ What fraction does point P represent?
           ↑
      (point at 3/4)
 
-A) 1/4    B) 2/4    C) 3/4    D) 4/4
+A   1/4
+B   2/4
+C   3/4
+D   4/4
+```
+
+### Type 6: Multipart (2 points — STAAR format)
+Part A is multiple choice, Part B requires explanation or another answer.
+
+```
+Problem 6 — Multi-Step Fractions (2 points)
+
+Part A
+Sofia made 2/3 of a batch of cookies. She gave 1/3 to Luca.
+What fraction of the batch does she have left?
+
+A   1/3
+B   1/6
+C   3/3
+D   2/6
+
+Part B
+Explain how you found your answer to Part A. □
 ```
 
 ### Distractor Rules
@@ -98,7 +139,7 @@ After all problems:
 ```
 ---
 Answer Key
-1. A   2. 4   3. >   4. 4   5. C
+1. A   2. 4   3. >   4. 4   5. C   6. A + explanation
 ```
 
 ## STAAR-Aligned Problem Structure
