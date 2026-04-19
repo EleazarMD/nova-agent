@@ -3,7 +3,7 @@ name: pcg-memory
 description: >
   Personal Context Graph (PCG) client for reading and writing personal data, preferences, and goals.
   Single source of truth for user identity across all homelab agents.
-  Port 8765, unified PIC + KG-API + LIAM service.
+  Port 8765, unified PIC + PCG Knowledge Graph + LIAM service.
 ---
 
 # PCG Memory

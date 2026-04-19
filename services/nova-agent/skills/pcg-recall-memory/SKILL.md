@@ -4,7 +4,7 @@ tool_name: recall_memory
 description: >
   Search PCG (Personal Context Graph) for stored preferences, facts, or personal details about the user.
   Use when you need to check what you already know before asking the user.
-  Unified PIC + KG-API + LIAM service.
+  Unified PIC + PCG Knowledge Graph + LIAM service.
 parameters:
   type: object
   properties:

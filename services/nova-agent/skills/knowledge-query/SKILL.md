@@ -3,7 +3,7 @@ name: knowledge-query
 tool_name: knowledge_query
 description: >
   Query across PCG (Personal Context Graph) components through the Context Bridge.
-  Combines PIC (personal data), KG-API (knowledge), and LIAM (frameworks) in a single query.
+  Combines PIC (personal data), PCG Knowledge Graph (knowledge), and LIAM (frameworks) in a single query.
   This is the PRIMARY tool for complex knowledge synthesis.
   Port 8764 (Context Bridge), backed by PCG (8765) with Neo4j + ChromaDB.
 parameters:
@@ -18,7 +18,7 @@ parameters:
       default: true
     include_knowledge:
       type: boolean
-      description: "Include KG-API entities, facts, documents. Default: true"
+      description: "Include PCG Knowledge Graph entities, facts, documents. Default: true"
       default: true
     include_dimensions:
       type: boolean
@@ -51,7 +51,7 @@ Nova Agent
         ├─► PIC (port 8765)
         │   └─► Personal: identity, goals, preferences
         │
-        ├─► KG-API (port 8765)
+        ├─► PCG Knowledge Graph (port 8765)
         │   └─► Knowledge: entities, facts, documents
         │
         └─► LIAM
@@ -61,12 +61,12 @@ Nova Agent
 ## Instructions
 
 ### Step 1: Call knowledge_query with a natural language query
-Be specific about what you need. The query will be routed to PIC, KG-API, and LIAM.
+Be specific about what you need. The query will be routed to PIC, PCG Knowledge Graph, and LIAM.
 
 ### Step 2: Read the synthesized response
 Returns:
 - `personal`: PIC identity, goals, preferences relevant to query
-- `knowledge`: KG-API entities, facts, documents
+- `knowledge`: PCG Knowledge Graph entities, facts, documents
 - `applicable_dimensions`: LIAM frameworks detected
 - `synthesis`: Pre-formatted summary for LLM consumption
 
@@ -123,7 +123,7 @@ Assistant: Your goal "transition to AI engineering" connects to these knowledge 
 - Endpoint: `/v1/query`
 - Backend: Neo4j (graph) + ChromaDB (vectors)
 - Timeout: 10 seconds
-- Parallel queries to PIC, KG-API, and LIAM
+- Parallel queries to PIC, PCG Knowledge Graph, and LIAM
 
 ## References
 

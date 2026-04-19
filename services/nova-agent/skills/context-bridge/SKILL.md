@@ -2,7 +2,7 @@
 name: context-bridge
 tool_name: query_context
 description: >
-  Unified context retrieval across PCG (Personal Context Graph) components: PIC, KG-API, and LIAM.
+  Unified context retrieval across PCG (Personal Context Graph) components: PIC, PCG Knowledge Graph, and LIAM.
   Use for complex queries requiring multiple context sources. Returns synthesized results from all sources.
   Port 8764 orchestrates PCG (8765) with shared Neo4j + ChromaDB backend.
 parameters:
@@ -17,7 +17,7 @@ parameters:
       default: true
     include_knowledge:
       type: boolean
-      description: "Include KG-API entities and relationships (default: true)"
+      description: "Include PCG Knowledge Graph entities and relationships (default: true)"
       default: true
     include_dimensions:
       type: boolean
@@ -29,13 +29,13 @@ parameters:
 
 # Context Bridge
 
-Unified context retrieval service that bridges PCG components: PIC (personal data), KG-API (knowledge graph), and LIAM (life intelligence).
+Unified context retrieval service that bridges PCG components: PIC (personal data), PCG Knowledge Graph (knowledge graph), and LIAM (life intelligence).
 
 ## When to Invoke
 
 - Complex queries requiring multiple context sources
 - Questions needing both personal preferences AND knowledge frameworks
-- Synthesizing information across PIC, KG-API, and LIAM
+- Synthesizing information across PIC, PCG Knowledge Graph, and LIAM
 - Building comprehensive context for decision-making
 - Queries that span personal data and scientific frameworks
 
@@ -49,7 +49,7 @@ Nova Agent
         ├─► PIC (port 8765)
         │   └─► Personal data: identity, preferences, goals
         │
-        └─► KG-API (port 8765)
+        └─► PCG Knowledge Graph (port 8765)
             └─► Knowledge graph: entities, relationships
             
 Both share same Neo4j + ChromaDB backend
@@ -58,12 +58,12 @@ Both share same Neo4j + ChromaDB backend
 ## Instructions
 
 ### Step 1: Call query_context with a natural language query
-The query will be routed to PIC, KG-API, and LIAM in parallel.
+The query will be routed to PIC, PCG Knowledge Graph, and LIAM in parallel.
 
 ### Step 2: Read the synthesized response
 Returns:
 - `personal`: PIC identity, preferences, goals relevant to query
-- `knowledge`: KG-API entities and relationships
+- `knowledge`: PCG Knowledge Graph entities and relationships
 - `applicable_dimensions`: LIAM frameworks detected
 - `synthesis`: Pre-formatted summary for LLM consumption
 
@@ -100,11 +100,11 @@ Assistant: Your active goal is "transition to AI engineering" and the relevant f
 - Endpoint: `/v1/query`
 - URL: http://localhost:8764
 - Timeout: 10 seconds
-- Parallel queries to PIC, KG-API, and LIAM
+- Parallel queries to PIC, PCG Knowledge Graph, and LIAM
 - Shared backend: Neo4j (graph) + ChromaDB (vectors)
 
 ## References
 
 - Script: `nova/context_bridge.py`
 - Service: Context Bridge API at http://localhost:8764
-- Dependencies: PIC (8765), KG-API (8765), LIAM, Neo4j, ChromaDB
+- Dependencies: PIC (8765), PCG Knowledge Graph (8765), LIAM, Neo4j, ChromaDB

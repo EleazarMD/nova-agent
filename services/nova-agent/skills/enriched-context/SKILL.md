@@ -41,7 +41,7 @@ Nova Agent
         ├─► PIC (port 8765)
         │   └─► Identity, preferences, goals
         │
-        └─► KG-API (port 8765)
+        └─► PCG Knowledge Graph (port 8765)
             └─► Knowledge entities, relationships
             
 Both share same Neo4j + ChromaDB backend

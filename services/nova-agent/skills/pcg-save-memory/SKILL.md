@@ -4,7 +4,7 @@ tool_name: save_memory
 description: >
   Save user facts, preferences, or important details to PCG (Personal Context Graph).
   Use when the user explicitly tells you something you should remember.
-  Unified PIC + KG-API + LIAM service.
+  Unified PIC + PCG Knowledge Graph + LIAM service.
 parameters:
   type: object
   properties:

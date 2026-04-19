@@ -2,7 +2,7 @@
 name: knowledge-graph
 tool_name: kg_query
 description: >
-  Query the AI Homelab Knowledge Graph (KG-API) for infrastructure context, service dependencies, and entity relationships.
+  Query the AI Homelab Knowledge Graph (PCG Knowledge Graph) for infrastructure context, service dependencies, and entity relationships.
   Part of PCG (Personal Context Graph) on port 8765.
   Use for questions about homelab services, their relationships, and infrastructure knowledge.
 parameters:
@@ -21,7 +21,7 @@ parameters:
 
 # Knowledge Graph
 
-Query the AI Homelab Knowledge Graph (KG-API) for infrastructure context, service dependencies, and entity relationships.
+Query the AI Homelab Knowledge Graph (PCG Knowledge Graph) for infrastructure context, service dependencies, and entity relationships.
 
 ## When to Invoke
 
@@ -38,7 +38,7 @@ Nova Agent
     │
     └─► Context Bridge (port 8764)
         │
-        └─► KG-API (port 8765)
+        └─► PCG Knowledge Graph (port 8765)
             │
             ├─► Neo4j (graph storage)
             │   └─► :Service, :Component nodes with :DEPENDS_ON, :USES relationships
@@ -100,7 +100,7 @@ If any of those are down, email won't work. Want me to check their status?
 
 ## Technical Details
 
-- KG-API URL: http://localhost:8765
+- PCG Knowledge Graph URL: http://localhost:8765
 - Backend: Neo4j (graph) + ChromaDB (vectors)
 - Entity types: Service, Component, Database, Integration, Agent
 - Relationship types: DEPENDS_ON, USES, INTEGRATES_WITH
@@ -110,4 +110,4 @@ If any of those are down, email won't work. Want me to check their status?
 
 - Script: `nova/knowledge_graph.py`
 - Handler: `nova/tools.py` → `handle_kg_query`
-- KG-API: http://localhost:8765/api/kg
+- PCG Knowledge Graph: http://localhost:8765/api/kg

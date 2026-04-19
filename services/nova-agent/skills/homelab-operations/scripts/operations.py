@@ -43,65 +43,37 @@ AI_INFERENCING_ADMIN_KEY = os.environ.get("AI_INFERENCING_ADMIN_KEY", "ai-infere
 # Container allowlist — only these containers can be managed
 # ---------------------------------------------------------------------------
 
-# Managed Docker containers (aligned with component-registry.json)
+# Managed Docker containers (aligned with actual running containers)
 MANAGED_CONTAINERS = {
     # Hermes Intelligence
     "cig",
     "hermes-chromadb",
     "hermes-neo4j",
     
-    # OpenClaw (Docker components only)
-    "openclaw-novnc",
-    "openclaw-inference",
-    
-    # PIC/PKB (Personal Integration Core)
-    "pkb-api",
-    "pkb-neo4j",
-    "pkb-redis",
-    
     # AI Gateway
     "ai-gateway-postgres",
     "ai-gateway-redis",
     
     # AI/ML Services
-    "comfyui",
     "nim-embeddings",
-    "qwen-tts-api",
-    "goose-mind-whisper",
-    
-    # Clinical KB
-    "clinical-kb-api",
-    "clinical-kb-neo4j",
-    "clinical-kb-postgres",
-    "postgres-clinical",
-    "redis-clinical",
-    
-    # Story Intelligence
-    "story-intelligence",
-    "story-neo4j",
-    "story-pgvector",
-    
-    # Monitoring
-    "mlops-prometheus",
-    "mlops-grafana",
-    "mlops-metrics-api",
-    "mlops-pushgateway",
-    
-    # Other
-    "perplexica-searxng-1",
 }
 
-# Systemd services that can be managed (aligned with component-registry.json)
+# Systemd services that can be managed (aligned with actual running services)
 MANAGED_SYSTEMD_SERVICES = {
-    # User services (systemctl --user)
-    "openclaw-gateway.service",
-    "openclaw-memory-sync.service",
-    "tesla-relay.service",
-    
     # System services (sudo systemctl)
     "ai-inferencing.service",
-    "approval-service.service",
-    "homelab-monitor.timer",
+    "cig.service",
+    "context-bridge.service",
+    "hermes-heartbeat.service",
+    "neo4j.service",
+    "nova-agent.service",
+    "pcg.service",
+    "pi-workspace.service",
+    "rl-staging-api.service",
+    "staar-tutor.service",
+    "tesla-proxy.service",
+    "tesla-relay.service",
+    "tb-mbox-watcher.service",
 }
 
 # Containers that should NEVER be touched by any agent

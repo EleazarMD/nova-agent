@@ -25,7 +25,7 @@ parameters:
 
 # PCG Query Context
 
-Unified query interface for the Personal Context Graph (PCG). Orchestrates results across PIC (identity/preferences), KG-API (homelab facts), and LIAM (reasoning frameworks).
+Unified query interface for the Personal Context Graph (PCG). Orchestrates results across PIC (identity/preferences), PCG Knowledge Graph (homelab facts), and LIAM (reasoning frameworks).
 
 ## Triggers
 

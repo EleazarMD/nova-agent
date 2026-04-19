@@ -1322,7 +1322,7 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "knowledge_query",
             "description": (
-                "Query across personal knowledge (PIC) and general knowledge (KG-API) through the Personal Context Graph (PCG). "
+                "Query across personal knowledge (PIC) and general knowledge (PCG Knowledge Graph) through the Personal Context Graph (PCG). "
                 "Use for questions that might need both personal context AND general facts: "
                 "'What frameworks apply to my clinical workflow goal?', "
                 "'How should I approach the Coleman follow-up?', "
@@ -1342,7 +1342,7 @@ TOOL_DEFINITIONS = [
                     },
                     "include_knowledge": {
                         "type": "boolean",
-                        "description": "Include KG-API entities, facts, documents. Default: true",
+                        "description": "Include PCG Knowledge Graph entities, facts, documents. Default: true",
                     },
                     "include_dimensions": {
                         "type": "boolean",
@@ -1382,7 +1382,7 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "link_goal_to_knowledge",
             "description": (
-                "Create a bi-directional link between a PIC goal and a KG-API knowledge entity. "
+                "Create a bi-directional link between a PIC goal and a PCG Knowledge Graph knowledge entity. "
                 "Use when the user explicitly wants to connect a goal to relevant knowledge: "
                 "'Link my email workflow goal to the Filter Model framework'."
             ),
@@ -1395,7 +1395,7 @@ TOOL_DEFINITIONS = [
                     },
                     "entity_id": {
                         "type": "string",
-                        "description": "The KG-API entity ID to link",
+                        "description": "The PCG Knowledge Graph entity ID to link",
                     },
                     "relevance": {
                         "type": "number",
