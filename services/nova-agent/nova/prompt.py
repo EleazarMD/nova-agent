@@ -13,6 +13,8 @@ directly; Hub agents consume PCG as downstream readers.
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Optional
+from pathlib import Path
+import yaml
 
 
 def _extract_pref_value(
@@ -68,6 +70,47 @@ def _build_personality_section(
     if not lines:
         return ""
     return "## Who You're Talking To (from PCG)\n" + "\n".join(f"- {l}" for l in lines)
+
+
+_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+
+
+def _load_doc_skills() -> str:
+    """Load documentation-only skills (no tool_name/parameters) and return
+    their markdown bodies as a single section for the system prompt."""
+    sections = []
+    if not _SKILLS_DIR.is_dir():
+        return ""
+
+    for skill_dir in sorted(_SKILLS_DIR.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            text = skill_md.read_text()
+        except Exception:
+            continue
+        if not text.startswith("---"):
+            continue
+        end = text.find("---", 3)
+        if end == -1:
+            continue
+        try:
+            fm = yaml.safe_load(text[3:end])
+        except yaml.YAMLError:
+            continue
+        # Only include documentation-only skills (no tool_name or parameters)
+        if fm.get("tool_name") or fm.get("parameters"):
+            continue
+        # Extract body (after frontmatter)
+        body = text[end + 3:].strip()
+        if body:
+            name = fm.get("name", skill_dir.name)
+            sections.append(f"### Skill: {name}\n{body}")
+
+    return "\n\n".join(sections) if sections else ""
 
 
 def build_system_prompt(
@@ -204,26 +247,6 @@ def build_system_prompt(
         "- 25°C → 'twenty-five degrees Celsius'\n"
         "- 60 mph → 'sixty miles per hour'\n"
         "- 138 mi → 'one hundred thirty-eight miles'\n\n"
-        "## STAAR & Math Problem Formatting (CRITICAL for homework/quiz/worksheet requests)\n"
-        "When generating math problems, practice exercises, or quiz questions for students (especially Sofia, 4th grade):\n\n"
-        "**ALWAYS include multiple-choice answer options** in STAAR format:\n"
-        "- Each problem MUST have 4 answer choices labeled A, B, C, D\n"
-        "- One correct answer and three plausible distractors (common misconceptions, calculation errors)\n"
-        "- Format: 'A) 5/8  B) 1/8  C) 6/16  D) 5/16' — speak as 'A, five eighths. B, one eighth. C, six sixteenths. D, five sixteenths.'\n"
-        "- Mark the correct answer in parentheses after the choices: (Correct: A)\n"
-        "- For fractions, write them as '3/8' (not 'three-eighths' in text — TTS will read it properly)\n\n"
-        "**STAAR-aligned problem structure**:\n"
-        "1. Real-world context (Sofia, Luca, cooking, sports, school — relatable to Texas 4th graders)\n"
-        "2. Clear question stem\n"
-        "3. Four answer choices with one correct\n"
-        "4. Correct answer indicated\n\n"
-        "**Example output**:\n"
-        "Problem 1 — Adding Fractions\n"
-        "Sophia ran 3/8 of a mile in the morning and 2/8 of a mile after school. How far did she run in total?\n"
-        "A) 5/8  B) 1/8  C) 6/8  D) 1/2\n"
-        "(Correct: A)\n\n"
-        "**When asked to create a worksheet page**: Use manage_workspace with action create_page_with_blocks "
-        "to build a structured page with problems, choices, and answer key in one call.\n\n"
         "## Proactive Context Retrieval (CRITICAL)\n"
         "When the user references past events or conversations, IMMEDIATELY search for context:\n\n"
         "**Triggers for search_past_conversations**:\n"
@@ -401,5 +424,10 @@ def build_system_prompt(
     if memory_snippets:
         mem_text = "\n".join(f"- {s[:200]}" for s in memory_snippets[:15])
         sections.append(f"## Memory (from PCG)\n{mem_text}")
+
+    # Documentation-only skills (no tool, just domain knowledge)
+    doc_skills = _load_doc_skills()
+    if doc_skills:
+        sections.append(doc_skills)
 
     return "\n\n".join(sections)
