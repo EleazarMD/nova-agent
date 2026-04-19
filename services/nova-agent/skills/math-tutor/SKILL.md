@@ -25,7 +25,8 @@ Every math problem MUST include 4 answer choices in STAAR format:
 - **One correct answer** and **three plausible distractors**
 - Distractors should reflect common misconceptions or calculation errors
   - e.g., for 3/8 + 2/8: distractors include 1/8 (subtracted instead), 6/8 (added denominators), 5/16 (added both num+denom)
-- Mark the correct answer: `(Correct: A)`
+- **NEVER show the correct answer next to the problem** — that defeats the quiz purpose
+- Put all answers in a separate **Answer Key** section at the very end
 
 ### Format
 
@@ -34,7 +35,14 @@ Problem N — [Skill Name]
 [Real-world context and question]
 
 A) [choice]  B) [choice]  C) [choice]  D) [choice]
-(Correct: [letter])
+```
+
+...after all problems...
+
+```
+---
+Answer Key
+1. A   2. B   3. C   4. D   5. A
 ```
 
 ### Example
@@ -45,15 +53,23 @@ Sophia ran 3/8 of a mile in the morning and 2/8 of a mile after school.
 How far did she run in total?
 
 A) 5/8  B) 1/8  C) 6/8  D) 5/16
-(Correct: A)
+
+Problem 2 — Subtracting Fractions
+A pizza had 7/10 left. Sofia's family ate 4/10. How much is left?
+
+A) 3/10  B) 11/10  C) 3/20  D) 4/10
+
+---
+Answer Key
+1. A   2. A
 ```
 
 ## STAAR-Aligned Problem Structure
 
 1. **Real-world context** — Use relatable scenarios (Sofia, Luca, cooking, sports, school, pets)
 2. **Clear question stem** — One question per problem
-3. **Four answer choices** — A through D
-4. **Correct answer indicated** — For parent/tutor reference
+3. **Four answer choices** — A through D (NO correct answer shown next to problem)
+4. **Answer Key** — Separate section at the end listing all correct letters
 
 ## Grade-Level Skills (4th Grade TEKS)
 
@@ -93,12 +109,12 @@ manage_workspace(
     {"type": "heading_2", "content": "Problem 1 — Adding Fractions"},
     {"type": "paragraph", "content": "Sophia ran 3/8 of a mile in the morning and 2/8 of a mile after school. How far did she run in total?"},
     {"type": "paragraph", "content": "A) 5/8   B) 1/8   C) 6/8   D) 5/16"},
-    {"type": "paragraph", "content": "(Correct: A)"},
     {"type": "heading_2", "content": "Problem 2 — Subtracting Fractions"},
     {"type": "paragraph", "content": "A pizza had 7/10 left. Sofia's family ate 4/10. How much is left?"},
     {"type": "paragraph", "content": "A) 3/10   B) 11/10   C) 3/20   D) 4/10"},
-    {"type": "paragraph", "content": "(Correct: A)"},
     {"type": "divider"},
+    {"type": "heading_2", "content": "Answer Key"},
+    {"type": "paragraph", "content": "1. A   2. A"},
     {"type": "callout", "properties": {"icon": {"type": "emoji", "emoji": "✅"}, "calloutColor": "green", "title": [{"type": "text", "text": {"content": "Score: ___ / 2"}, "plainText": "Score: ___ / 2"}]}}
   ]}
 )
