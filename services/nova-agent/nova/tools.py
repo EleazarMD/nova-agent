@@ -2021,6 +2021,42 @@ async def handle_forget_memory(keyword: str = "", **kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Conversation compaction handler
+# ---------------------------------------------------------------------------
+
+async def handle_compact_conversations(user_id: str = "default", **kwargs) -> str:
+    """Run a compaction cycle on older conversations using negative exponential decay.
+    
+    Summarizes old messages into topics/subtopics, extracts facts to PCG.
+    """
+    from nova.store import run_compaction_cycle
+    results = await run_compaction_cycle(user_id=user_id)
+    
+    if not results:
+        return "No conversations needed compaction."
+    
+    compacted = [r for r in results if r.get("status") == "compacted"]
+    skipped = [r for r in results if r.get("status") == "skipped"]
+    failed = [r for r in results if r.get("status") == "failed"]
+    
+    total_facts = sum(r.get("facts_extracted", 0) for r in compacted)
+    
+    summary = f"Compaction cycle complete:\n"
+    summary += f"  Compacted: {len(compacted)} conversations\n"
+    summary += f"  Skipped: {len(skipped)} (too recent or too few messages)\n"
+    if failed:
+        summary += f"  Failed: {len(failed)}\n"
+    summary += f"  Facts extracted (stored in conversation metadata): {total_facts}\n"
+    summary += f"  Review facts and save important ones to PCG via save_memory.\n"
+    
+    for r in compacted[:5]:
+        topics = ", ".join(r.get("topics", [])[:3])
+        summary += f"\n  📋 {r.get('title', '?')[:40]}: {r.get('compacted', 0)} msgs → [{topics}]"
+    
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # PCG unified context handlers
 # ---------------------------------------------------------------------------
 
@@ -3985,6 +4021,8 @@ TOOL_HANDLERS = {
     "homelab_operations": handle_homelab_operations,
     # STAAR Tutor (TEKS-aligned problem generation)
     "staar_tutor": handle_staar_tutor,
+    # Conversation compaction (negative exponential decay + PCG fact extraction)
+    "compact_conversations": handle_compact_conversations,
     # EV Charging & Route Planning (NREL AFDC API)
     "ev_route_planner": handle_ev_route_planner,
     # Tesla location refresh

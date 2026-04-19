@@ -30,6 +30,11 @@ except ImportError:
 DB_PATH = os.environ.get("SQLITE_PATH", "./data/nova.db")
 PG_DSN = os.environ.get("DATABASE_URL", "postgresql://eleazar@localhost/ecosystem_unified")
 
+# NVIDIA NIM Embeddings (nv-embedqa-e5-v5, 1024-dim, TensorRT on RTX GPU)
+_NIM_EMBED_URL = os.environ.get("NIM_EMBED_URL", "http://localhost:8006/v1/embeddings")
+_NIM_EMBED_MODEL = os.environ.get("NIM_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+_nim_available: Optional[bool] = None
+
 # Reusable asyncpg pool (lazy-initialized)
 _pg_pool: Optional[asyncpg.Pool] = None
 
@@ -43,6 +48,56 @@ async def _get_pg_pool() -> asyncpg.Pool:
         raise RuntimeError("asyncpg not installed")
     _pg_pool = await asyncpg.create_pool(dsn=PG_DSN, min_size=1, max_size=5)
     return _pg_pool
+
+
+async def _check_nim_available() -> bool:
+    """Check if NVIDIA NIM embedding service is running."""
+    global _nim_available
+    if _nim_available is None:
+        try:
+            import httpx
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: __import__("httpx").get("http://localhost:8006/v1/models", timeout=5)
+            )
+            _nim_available = resp.status_code == 200
+        except Exception:
+            try:
+                import httpx as _hx
+                async with _hx.AsyncClient(timeout=5.0) as c:
+                    resp = await c.get("http://localhost:8006/v1/models")
+                    _nim_available = resp.status_code == 200
+            except Exception:
+                _nim_available = False
+        if _nim_available:
+            logger.info("NVIDIA NIM embeddings available (nv-embedqa-e5-v5, 1024-dim)")
+        else:
+            logger.warning("NVIDIA NIM embeddings not reachable")
+    return _nim_available
+
+
+async def generate_embedding(text: str, input_type: str = "passage") -> list[float] | None:
+    """Generate embedding via NVIDIA NIM (nv-embedqa-e5-v5, 1024-dim, TensorRT on RTX GPU).
+    
+    Truncates to 500 chars to stay under NIM's 512-token limit.
+    """
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                _NIM_EMBED_URL,
+                json={
+                    "model": _NIM_EMBED_MODEL,
+                    "input": [text[:500]],
+                    "input_type": input_type,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("data", [{}])[0].get("embedding")
+            logger.warning(f"NIM embedding error: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"NIM embedding request failed: {e}")
+    return None
 
 
 @dataclass
@@ -340,16 +395,32 @@ async def _sync_message_to_backend(
         importance = _calculate_importance(safe_content, role, bool(tool_calls))
         is_preserved = importance >= 70
         
-        # Insert message
-        await pool.execute(
-            """INSERT INTO workspace.ai_messages
-               (conversation_id, role, content, model, tokens_used, cost, metadata,
-                importance_score, is_preserved)
-               VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::jsonb, $7, $8)""",
-            pg_conv_id, role, safe_content, model, tokens_used or 0,
-            json.dumps({"tool_calls": tool_calls} if tool_calls else {}),
-            importance, is_preserved,
-        )
+        # Insert message (with embedding for user messages and important assistant messages)
+        embedding = None
+        if role == "user" or (role == "assistant" and importance >= 60):
+            embedding = await generate_embedding(safe_content, input_type="passage")
+
+        if embedding:
+            embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+            await pool.execute(
+                """INSERT INTO workspace.ai_messages
+                   (conversation_id, role, content, model, tokens_used, cost, metadata,
+                    importance_score, is_preserved, embedding)
+                   VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::jsonb, $7, $8, $9::vector)""",
+                pg_conv_id, role, safe_content, model, tokens_used or 0,
+                json.dumps({"tool_calls": tool_calls} if tool_calls else {}),
+                importance, is_preserved, embedding_str,
+            )
+        else:
+            await pool.execute(
+                """INSERT INTO workspace.ai_messages
+                   (conversation_id, role, content, model, tokens_used, cost, metadata,
+                    importance_score, is_preserved)
+                   VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::jsonb, $7, $8)""",
+                pg_conv_id, role, safe_content, model, tokens_used or 0,
+                json.dumps({"tool_calls": tool_calls} if tool_calls else {}),
+                importance, is_preserved,
+            )
         
         # Update conversation stats
         await pool.execute(
@@ -428,21 +499,27 @@ async def search_past_conversations(
     from_days: int | None = None,
     to_days: int | None = None,
 ) -> list[dict]:
-    """Search past conversations: SQLite first, then PostgreSQL directly.
+    """Search past conversations: PostgreSQL vector search first, then keyword fallbacks.
     
     No Dashboard dependency — Nova queries her own data directly.
+    
+    Search order:
+      1. PostgreSQL vector similarity (NVIDIA NIM embeddings + pgvector)
+      2. PostgreSQL ILIKE keyword search
+      3. SQLite keyword search (local fallback)
     
     Time intervals:
       days_back=7          → last 7 days from now
       from_days=90, to_days=7  → between 3 months ago and 1 week ago
     """
-    # 1. SQLite first — fast, always available, no external dependency
-    results = await _search_local_conversations(user_id, query, days_back, limit)
+    # 1. PostgreSQL vector search first (semantic — understands meaning, not just keywords)
+    results = await _search_postgres_direct(user_id, query, days_back, limit,
+                                             from_days=from_days, to_days=to_days)
+    if results:
+        return results
     
-    # 2. If SQLite had nothing, try PostgreSQL directly (not via Dashboard)
-    if not results:
-        results = await _search_postgres_direct(user_id, query, days_back, limit,
-                                                 from_days=from_days, to_days=to_days)
+    # 2. SQLite keyword search as local fallback
+    results = await _search_local_conversations(user_id, query, days_back, limit)
     
     return results
 
@@ -559,23 +636,95 @@ async def _search_postgres_direct(
     from_days: int | None = None,
     to_days: int | None = None,
 ) -> list[dict]:
-    """Search conversations directly in PostgreSQL via asyncpg.
-    
-    Bypasses the Dashboard API entirely — Nova owns her data.
+    """Search conversations in PostgreSQL via asyncpg using vector similarity.
+
+    Primary: NVIDIA NIM embedding → pgvector cosine similarity search.
+    Fallback: ILIKE keyword search if embeddings unavailable.
     Includes 'default' user's conversations for historical data.
     """
     if not _HAS_ASYNCPG:
         logger.debug("asyncpg not available, skipping direct PG search")
         return []
-    
+
     try:
         pool = await _get_pg_pool()
+
+        # Include 'default' user for historical data
+        user_filter = (
+            "c.user_id = $1" if user_id == "default"
+            else "c.user_id IN ($1, 'default')"
+        )
+
+        # Time window
+        if from_days is not None and to_days is not None:
+            interval_str = f"NOW() - INTERVAL '{min(from_days, 365)} days' AND NOW() - INTERVAL '{max(to_days, 0)} days'"
+            time_filter = f"c.created_at BETWEEN {interval_str}"
+        else:
+            time_filter = f"c.created_at >= NOW() - INTERVAL '{min(days_back, 365)} days'"
+
+        # ── Primary: Vector similarity search via NVIDIA NIM embeddings ──
+        query_embedding = await generate_embedding(query, input_type="query")
+        if query_embedding:
+            embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
+            async with pool.acquire() as conn:
+                # Search by cosine similarity on embedded messages, then get context
+                rows = await conn.fetch(
+                    f"""SELECT DISTINCT ON (c.id)
+                           c.id as conversation_id,
+                           c.title,
+                           m.content as snippet,
+                           1 - (m.embedding <=> $3::vector) as similarity,
+                           c.created_at,
+                           c.message_count
+                       FROM workspace.ai_conversations c
+                       JOIN workspace.ai_messages m ON m.conversation_id = c.id
+                       WHERE {user_filter}
+                         AND c.retention_tier != 'archived'
+                         AND {time_filter}
+                         AND m.embedding IS NOT NULL
+                       ORDER BY c.id, m.embedding <=> $3::vector
+                       LIMIT $2""",
+                    user_id, limit, embedding_str,
+                )
+
+                if rows:
+                    results = []
+                    for r in rows:
+                        # Get surrounding context for the best matching message
+                        snippet = (r["snippet"] or "")[:300]
+                        # Try to get more context from surrounding messages
+                        conv_id = r["conversation_id"]
+                        context_rows = await conn.fetch(
+                            """SELECT role, content FROM workspace.ai_messages
+                               WHERE conversation_id = $1::uuid
+                               ORDER BY created_at DESC LIMIT 5""",
+                            conv_id,
+                        )
+                        if context_rows:
+                            parts = []
+                            for cr in context_rows:
+                                label = "User" if cr["role"] == "user" else "Nova"
+                                parts.append(f"{label}: {cr['content'][:150]}")
+                            snippet = "\n".join(parts)[:400]
+
+                        results.append({
+                            "conversation_id": str(r["conversation_id"]),
+                            "title": r["title"] or "Untitled",
+                            "snippet": snippet,
+                            "relevance_score": float(r["similarity"]) if r["similarity"] else 0.5,
+                            "created_at": r["created_at"].isoformat() if r["created_at"] else "",
+                            "message_count": r["message_count"] or 0,
+                            "source": "postgres_vector",
+                        })
+
+                    logger.info(f"Vector search found {len(results)} conversations for '{query}'")
+                    return results
+
+        # ── Fallback: ILIKE keyword search ──
         terms = [t for t in query.split() if len(t) >= 2]
         if not terms:
             return []
-        
-        # Build parameterized ILIKE conditions ($3, $4, ... for search terms)
-        # Each term needs two placeholders (content + title)
+
         param_idx = 3  # $1=user_id, $2=limit
         conditions = []
         params = [user_id, limit]
@@ -585,26 +734,7 @@ async def _search_postgres_direct(
             params.append(like_val)
             param_idx += 1
         conditions_sql = " OR ".join(conditions)
-        
-        # Time window (parameterized)
-        if from_days is not None and to_days is not None:
-            from_interval = f"{min(from_days, 365)} days"
-            to_interval = f"{max(to_days, 0)} days"
-            time_filter = f"c.created_at >= NOW() - INTERVAL ${param_idx} AND c.created_at <= NOW() - INTERVAL ${param_idx + 1}"
-            params.extend([from_interval, to_interval])
-            param_idx += 2
-        else:
-            interval = f"{min(days_back, 365)} days"
-            time_filter = f"c.created_at >= NOW() - INTERVAL ${param_idx}"
-            params.append(interval)
-            param_idx += 1
-        
-        # Include 'default' user for historical data
-        user_filter = (
-            "c.user_id = $1" if user_id == "default"
-            else "c.user_id IN ($1, 'default')"
-        )
-        
+
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""SELECT DISTINCT ON (c.id)
@@ -624,7 +754,7 @@ async def _search_postgres_direct(
                    LIMIT $2""",
                 *params,
             )
-            
+
             results = []
             for r in rows:
                 results.append({
@@ -634,11 +764,11 @@ async def _search_postgres_direct(
                     "relevance_score": (r["relevance_score"] or 50) / 100,
                     "created_at": r["created_at"].isoformat() if r["created_at"] else "",
                     "message_count": r["message_count"] or 0,
-                    "source": "postgres_direct",
+                    "source": "postgres_keyword",
                 })
-            
+
             if results:
-                logger.info(f"Direct PG search found {len(results)} conversations for '{query}'")
+                logger.info(f"Keyword search found {len(results)} conversations for '{query}'")
             return results
     except Exception as e:
         logger.warning(f"Direct PG search error: {e}")
@@ -743,3 +873,365 @@ async def get_backend_conversation(
     except Exception as e:
         logger.warning(f"Get conversation error: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Conversation Compaction with Negative Exponential Decay
+# ---------------------------------------------------------------------------
+
+# Decay rate λ — controls how quickly conversation fidelity drops
+# weight = e^(-λ * age_days)
+# λ=0.05: half-life ~14 days, 30-day weight=0.22, 90-day weight=0.01
+# λ=0.03: half-life ~23 days, 30-day weight=0.41, 90-day weight=0.07
+_COMPACTION_LAMBDA = float(os.environ.get("COMPACTION_LAMBDA", "0.05"))
+_COMPACTION_MIN_AGE_DAYS = int(os.environ.get("COMPACTION_MIN_AGE_DAYS", "7"))
+_COMPACTION_BATCH_SIZE = int(os.environ.get("COMPACTION_BATCH_SIZE", "5"))
+
+AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/v1")
+AI_GATEWAY_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
+
+
+def _decay_weight(age_days: float) -> float:
+    """Negative exponential decay: e^(-λ * age_days). Returns 0..1."""
+    import math
+    return math.exp(-_COMPACTION_LAMBDA * age_days)
+
+
+async def _llm_summarize(prompt: str, system: str = "You are a precise summarizer.") -> str:
+    """Call the AI Gateway for a single summarization/extraction task."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{AI_GATEWAY_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {AI_GATEWAY_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "minimax-m2.5",
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2000,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+            logger.warning(f"LLM summarize error: {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"LLM summarize failed: {e}")
+    return ""
+
+
+async def compact_conversation(conv_id: str, pool=None) -> dict | None:
+    """Compact a single conversation using negative exponential decay.
+    
+    Recent messages (high weight) are preserved verbatim.
+    Older messages (low weight) are summarized into topics/subtopics.
+    Extracted facts are stored in conversation config metadata — 
+    Nova decides what to save to PCG via save_memory.
+    
+    Returns compaction result dict or None on failure.
+    """
+    if not _HAS_ASYNCPG:
+        return None
+    
+    _pool = pool or await _get_pg_pool()
+    
+    try:
+        # Get conversation metadata
+        conv = await _pool.fetchrow(
+            """SELECT id, title, user_id, message_count, created_at, 
+                      last_message_at, compacted_at, summary, topics
+               FROM workspace.ai_conversations WHERE id = $1::uuid""",
+            conv_id,
+        )
+        if not conv:
+            return None
+        
+        # Skip if already compacted recently (within 24h)
+        if conv["compacted_at"] and conv["compacted_at"] > datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24):
+            logger.debug(f"Skipping recently compacted: {conv_id}")
+            return {"status": "skipped", "reason": "recently_compacted"}
+        
+        # Get all messages
+        msgs = await _pool.fetch(
+            """SELECT id, role, content, importance_score, created_at
+               FROM workspace.ai_messages
+               WHERE conversation_id = $1::uuid
+               ORDER BY created_at ASC""",
+            conv_id,
+        )
+        
+        if len(msgs) < 6:
+            return {"status": "skipped", "reason": "too_few_messages", "count": len(msgs)}
+        
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
+        # ── Apply negative exponential decay ──
+        # Partition messages into: preserved (high weight) vs compacted (low weight)
+        preserved_msgs = []
+        compacted_msgs = []
+        
+        for m in msgs:
+            age_days = (now - m["created_at"]).total_seconds() / 86400
+            weight = _decay_weight(age_days)
+            
+            # Always preserve high-importance messages regardless of age
+            if m["importance_score"] >= 80:
+                preserved_msgs.append(m)
+            elif weight >= 0.3:  # Recent enough to keep verbatim
+                preserved_msgs.append(m)
+            else:
+                compacted_msgs.append(m)
+        
+        if not compacted_msgs:
+            return {"status": "skipped", "reason": "all_recent", "preserved": len(preserved_msgs)}
+        
+        # ── Summarize compacted messages into topics/subtopics ──
+        compacted_text = "\n".join(
+            f"{'User' if m['role']=='user' else 'Nova'}: {m['content'][:200]}"
+            for m in compacted_msgs
+        )[:2500]  # Limit to avoid LLM output truncation
+        
+        summary_prompt = f"""Summarize this conversation segment into a structured format.
+
+CONVERSATION (older messages, being compacted):
+{compacted_text}
+
+Respond in this EXACT JSON format:
+{{
+  "summary": "1-2 sentence overview of what was discussed",
+  "topics": [
+    {{"topic": "Topic Name", "subtopics": ["subtopic 1", "subtopic 2"], "key_points": ["point 1", "point 2"]}}
+  ],
+  "facts": [
+    {{"category": "preference|identity|schedule|relationship|health|work|home|other", "key": "short_key", "value": "the fact", "context": "how it came up"}}
+  ]
+}}
+
+Extract ALL important facts the user stated — preferences, names, dates, habits, health info, 
+work details, home details, relationships. These will be saved to long-term memory."""
+
+        summary_text = await _llm_summarize(
+            summary_prompt,
+            system="You are a precise conversation analyst. Extract structured summaries and facts. Always respond with valid JSON.",
+        )
+        
+        if not summary_text:
+            return {"status": "failed", "reason": "llm_error"}
+        
+        # Parse the summary — handle markdown code blocks and nested braces
+        import re as _re
+        # Strip markdown code fences if present
+        cleaned = _re.sub(r'```(?:json)?\s*', '', summary_text)
+        cleaned = cleaned.strip()
+        # Try to find the outermost JSON object
+        depth = 0
+        start = None
+        for i, ch in enumerate(cleaned):
+            if ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and start is not None:
+                    json_str = cleaned[start:i+1]
+                    try:
+                        summary_data = json.loads(json_str)
+                        break
+                    except json.JSONDecodeError:
+                        start = None
+                        continue
+        else:
+            return {"status": "failed", "reason": "json_error", "raw": summary_text[:300]}
+        
+        # ── Store extracted facts in conversation metadata (for Nova to review) ──
+        # Facts are NOT auto-saved to PCG. Nova decides what's important via save_memory.
+        facts = summary_data.get("facts", [])
+        
+        # ── Update conversation in PostgreSQL ──
+        topics_list = [t.get("topic", "") for t in summary_data.get("topics", []) if t.get("topic")]
+        summary_str = summary_data.get("summary", "")
+        
+        # Store facts in config JSONB so Nova can review them later
+        existing_config = await _pool.fetchval(
+            "SELECT config FROM workspace.ai_conversations WHERE id = $1::uuid", conv_id
+        ) or {}
+        if isinstance(existing_config, str):
+            try:
+                existing_config = json.loads(existing_config)
+            except Exception:
+                existing_config = {}
+        existing_config["extracted_facts"] = facts
+        existing_config["compaction_count"] = existing_config.get("compaction_count", 0) + 1
+        
+        await _pool.execute(
+            """UPDATE workspace.ai_conversations
+               SET summary = $2,
+                   topics = $3,
+                   config = $4::jsonb,
+                   compacted_at = NOW(),
+                   retention_tier = CASE 
+                       WHEN EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400 > 90 THEN 'cold'
+                       WHEN EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400 > 30 THEN 'warm'
+                       ELSE retention_tier
+                   END
+               WHERE id = $1::uuid""",
+            conv_id, summary_str, topics_list, json.dumps(existing_config),
+        )
+        
+        # ── Mark compacted messages as not preserved (they're now in the summary) ──
+        # Keep them in DB for vector search, but mark as compacted
+        compacted_ids = [m["id"] for m in compacted_msgs]
+        if compacted_ids:
+            await _pool.execute(
+                """UPDATE workspace.ai_messages
+                   SET is_preserved = false
+                   WHERE id = ANY($1::uuid[])""",
+                compacted_ids,
+            )
+        
+        result = {
+            "status": "compacted",
+            "conversation_id": str(conv_id),
+            "title": conv["title"],
+            "total_messages": len(msgs),
+            "preserved": len(preserved_msgs),
+            "compacted": len(compacted_msgs),
+            "topics": topics_list,
+            "summary": summary_str,
+            "facts_extracted": len(facts),
+            "facts_stored_in_metadata": len(facts),
+        }
+        
+        logger.info(
+            f"Compacted {conv['title'][:40]}: {len(compacted_msgs)}/{len(msgs)} msgs → "
+            f"{len(topics_list)} topics, {len(facts)} facts in metadata"
+        )
+        return result
+        
+    except Exception as e:
+        logger.error(f"Compaction error for {conv_id}: {e}")
+        return {"status": "error", "reason": str(e)}
+
+
+async def run_compaction_cycle(user_id: str = "default") -> list[dict]:
+    """Run a compaction cycle over all conversations for a user.
+    
+    Uses negative exponential decay to determine which conversations need compaction.
+    Only processes conversations older than _COMPACTION_MIN_AGE_DAYS.
+    """
+    if not _HAS_ASYNCPG:
+        return []
+    
+    pool = await _get_pg_pool()
+    results = []
+    
+    try:
+        # Find conversations eligible for compaction
+        # Not recently compacted, older than min age, have enough messages
+        rows = await pool.fetch(
+            """SELECT id, title, message_count, created_at, compacted_at
+               FROM workspace.ai_conversations
+               WHERE user_id IN ($1, 'default')
+                 AND retention_tier != 'archived'
+                 AND message_count >= 6
+                 AND created_at < NOW() - ($2 || ' days')::interval
+                 AND (compacted_at IS NULL OR compacted_at < NOW() - INTERVAL '24 hours')
+               ORDER BY created_at ASC
+               LIMIT $3""",
+            user_id, str(_COMPACTION_MIN_AGE_DAYS), _COMPACTION_BATCH_SIZE,
+        )
+        
+        if not rows:
+            logger.debug("No conversations need compaction")
+            return []
+        
+        logger.info(f"Compaction cycle: {len(rows)} conversations to process")
+        
+        for row in rows:
+            result = await compact_conversation(str(row["id"]), pool=pool)
+            if result:
+                results.append(result)
+            # Small delay between compactions
+            await asyncio.sleep(0.5)
+        
+        compacted = sum(1 for r in results if r.get("status") == "compacted")
+        logger.info(f"Compaction cycle complete: {compacted}/{len(rows)} compacted")
+        
+    except Exception as e:
+        logger.error(f"Compaction cycle error: {e}")
+    
+    return results
+
+
+async def get_compacted_context(
+    conversation_id: str,
+    user_id: str,
+    max_recent_turns: int = 20,
+) -> list[dict]:
+    """Get conversation context with compaction-aware retrieval.
+    
+    Returns messages with negative exponential decay applied:
+    - Recent messages (high weight): full verbatim
+    - Older messages (low weight): replaced by compacted summary
+    - Very old (weight < 0.05): just topic headers
+    
+    This is the function that should be used when building LLM context
+    instead of raw get_history().
+    """
+    if not _HAS_ASYNCPG:
+        return []
+    
+    pool = await _get_pg_pool()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    messages = []
+    
+    try:
+        pg_id = await _resolve_or_create_conversation(conversation_id, user_id, pool)
+        if not pg_id:
+            return []
+        
+        # Get conversation metadata (summary, topics from compaction)
+        conv = await pool.fetchrow(
+            """SELECT summary, topics, compacted_at FROM workspace.ai_conversations WHERE id = $1::uuid""",
+            pg_id,
+        )
+        
+        # Get recent messages (verbatim)
+        recent_msgs = await pool.fetch(
+            """SELECT role, content, importance_score, created_at
+               FROM workspace.ai_messages
+               WHERE conversation_id = $1::uuid
+               ORDER BY created_at DESC
+               LIMIT $2""",
+            pg_id, max_recent_turns,
+        )
+        
+        # Add recent messages in chronological order
+        for m in reversed(recent_msgs):
+            messages.append({"role": m["role"], "content": m["content"]})
+        
+        # If there's a compacted summary, prepend it as context
+        if conv and conv["summary"]:
+            topics_str = ""
+            if conv["topics"]:
+                topics_str = "\nTopics: " + ", ".join(conv["topics"])
+            
+            compacted_context = (
+                f"[Earlier conversation summary: {conv['summary']}{topics_str}]"
+            )
+            # Insert after system message position
+            messages.insert(0, {"role": "assistant", "content": compacted_context})
+        
+        return messages
+        
+    except Exception as e:
+        logger.warning(f"Get compacted context error: {e}")
+        return []

@@ -239,7 +239,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -338,6 +338,8 @@ async def run_bot(
             elif action == "get_progress":
                 return "Checking progress."
             return "Working on STAAR problems."
+        elif tool_name == "compact_conversations":
+            return "Compacting older conversations and extracting facts."
         return None
 
     def _build_thinking_text(tool_name: str, args: dict) -> str:
@@ -356,6 +358,7 @@ async def run_bot(
             "homelab_diagnostics": "Running homelab diagnostics...",
             "manage_workspace": f"📝 Workspace: {args.get('action', 'processing')}...",
             "staar_tutor": f"📚 STAAR: {args.get('action', 'generating')} problems...",
+            "compact_conversations": "🧠 Compacting conversations & extracting facts...",
         }
         return desc_map.get(tool_name, f"Executing {tool_name}...")
 
@@ -536,6 +539,9 @@ async def run_bot(
 
     # ── STAAR Tutor (TEKS-aligned problem generation) ───────────────────
     llm.register_function("staar_tutor", make_tool_handler("staar_tutor"))
+
+    # ── Conversation Compaction (negative exponential decay + PCG facts) ──
+    llm.register_function("compact_conversations", make_tool_handler("compact_conversations"))
 
     # ── Context with history restoration ─────────────────────────────────
     messages = [{"role": "system", "content": system_prompt}]
