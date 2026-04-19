@@ -15,6 +15,7 @@ parameters:
       enum:
         - list_pages
         - create_page
+        - create_page_with_blocks
         - get_page
         - add_block
         - search
@@ -205,68 +206,46 @@ User: "Create a bug tracker database"
 - Client: `nova/pi_workspace.py`
 - Database: PostgreSQL with pgvector for semantic search
 - Context: Auto-grounded with CIG (Neo4j) and PCG (Postgres)
-- Configuring project settings
 
-## Status
+## create_page_with_blocks
 
-**Note**: This skill is currently a placeholder. Full implementation pending workspace management system integration.
+Create a page with multiple content blocks in a single call — ideal for worksheets, quizzes, and structured documents.
 
-## Planned Actions
+**Parameters (via `properties.blocks`):**
+- `properties.blocks`: Array of `{type, content?, properties?}` objects
+  - `type`: paragraph, heading_1, heading_2, heading_3, to_do, bulleted_list_item, numbered_list_item, callout, quote, code, divider, planner_task
+  - `content`: Text content (auto-wrapped into richText)
+  - `properties`: Override block properties
 
-### create
-Create a new workspace or project.
+**Example:**
+```
+manage_workspace(
+  action="create_page_with_blocks",
+  title="Geometry Quiz",
+  icon="📐",
+  properties={"blocks": [
+    {"type": "heading_2", "content": "Problem 1 — Angles"},
+    {"type": "paragraph", "content": "An angle measures 45 degrees. What type is it?"},
+    {"type": "paragraph", "content": "Answer: ___________"},
+    {"type": "heading_2", "content": "Problem 2 — Shapes"},
+    {"type": "paragraph", "content": "A shape has 4 equal sides and 4 right angles. What is it?"},
+    {"type": "paragraph", "content": "Answer: ___________"},
+    {"type": "divider"},
+    {"type": "callout", "properties": {"icon": {"type": "emoji", "emoji": "✅"}, "calloutColor": "green", "title": [{"type": "text", "text": {"content": "Score: ___ / 2"}, "plainText": "Score: ___ / 2"}]}}
+  ]}
+)
+```
 
-**Parameters:**
-- `name` (required): Workspace name
-- `type`: Project type (python, node, rust, etc.)
-- `template`: Template to use
-- `path`: Workspace path
+## Templates
 
-### list
-List available workspaces.
+Available page templates for one-shot creation:
+- `tpl-math-worksheet` — Practice worksheet with problems, answer spaces, and difficulty tracking
+- `tpl-meeting-notes` — Auto-populated with CIG calendar data
+- `tpl-daily-briefing` — Morning briefing with email triage, calendar, and goals
+- `tpl-email-draft` — Draft emails in your voice
+- `tpl-goal-tracker` — Track goals with PCG-linked progress
+- `tpl-research-notes` — Research a topic with AI-assisted findings
+- `tpl-weekly-planner` — Weekly plan with calendar integration
+- `tpl-blank` — Start from scratch
 
-**Parameters:**
-- `type`: Filter by project type
-- `status`: Filter by status (active, archived)
-
-### activate
-Activate a workspace.
-
-**Parameters:**
-- `workspace_id` (required): Workspace identifier
-
-### configure
-Configure workspace settings.
-
-**Parameters:**
-- `workspace_id` (required): Workspace identifier
-- `settings`: Configuration object
-
-### install_dependencies
-Install workspace dependencies.
-
-**Parameters:**
-- `workspace_id` (required): Workspace identifier
-- `package_manager`: Package manager to use (pip, npm, cargo, etc.)
-
-## Examples
-
-User: Create a new Python workspace for the API project
-Assistant: Invoking @workspace-manager action=create, name="api-project", type=python
-
-User: List my active workspaces
-Assistant: Invoking @workspace-manager action=list, status=active
-
-User: Install dependencies for the current workspace
-Assistant: Invoking @workspace-manager action=install_dependencies, workspace_id="current"
-
-## Technical Details
-
-- Backend: Workspace management API (pending integration)
-- Possible integrations: VS Code workspaces, tmux sessions, Docker containers
-- Configuration: JSON or YAML workspace definitions
-
-## References
-
-- Script: `scripts/` (implementation pending)
-- Integration: Awaiting workspace management system specification
+Use `create_from_template` with a `template_id` to create a page from any template.

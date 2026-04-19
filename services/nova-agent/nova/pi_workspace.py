@@ -90,6 +90,48 @@ async def create_page(title: str, parent_id: str = "", icon: str = "") -> dict:
     return await _ws_post(f"/api/workspaces/{ws_id}/pages", body) or {}
 
 
+async def create_page_with_blocks(title: str, blocks: list[dict], icon: str = "", parent_id: str = "") -> dict:
+    """Create a page and populate it with multiple blocks in one call.
+
+    Args:
+        title: Page title
+        blocks: List of {type, content?, properties?} dicts.
+                type: paragraph, heading_1, heading_2, heading_3, to_do,
+                      bulleted_list_item, numbered_list_item, callout, quote,
+                      code, divider, planner_task
+                content: Text content (auto-wrapped into richText)
+                properties: Override block properties (merged with content)
+        icon: Emoji icon for the page
+        parent_id: Parent page ID
+
+    Returns:
+        Created page dict with block_ids list
+    """
+    page = await create_page(title, parent_id=parent_id, icon=icon)
+    if not page or "id" not in page:
+        return {}
+    page_id = page["id"]
+    root_block_id = page.get("rootBlockId", "")
+    block_ids = []
+
+    for i, blk in enumerate(blocks):
+        block_type = blk.get("type", "paragraph")
+        content = blk.get("content", "")
+        props = blk.get("properties", {})
+
+        # Auto-wrap plain content into richText if not already provided
+        if content and "richText" not in props and "title" not in props:
+            props["richText"] = [{"type": "text", "text": {"content": content}, "plainText": content}]
+
+        block = await create_block(page_id, block_type, props, parent_id=root_block_id)
+        if block and "id" in block:
+            block_ids.append(block["id"])
+
+    page["block_ids"] = block_ids
+    page["block_count"] = len(block_ids)
+    return page
+
+
 async def list_pages() -> list:
     ws_id = await _get_workspace_id()
     result = await _ws_get(f"/api/workspaces/{ws_id}/pages")

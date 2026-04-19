@@ -640,8 +640,10 @@ async def run_bot(
                     # Step 2: Strip markdown for TTS (bold, headers, pipes, emojis)
                     # iOS TTS reads raw markdown verbatim — pipes become "pipe", dashes become "minus"
                     from nova.text_utils import strip_markdown_for_speech
+                    pre_strip = cleaned
                     cleaned = strip_markdown_for_speech(cleaned)
-                    if cleaned != original:
+                    if cleaned != pre_strip:
+                        logger.debug(f"🧼 Stripped markdown from LLM text: '{pre_strip[:80]}' → '{cleaned[:80]}'")
                         frame.text = cleaned
 
                 # Log LLMFullResponseStartFrame/EndFrame

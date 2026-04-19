@@ -835,6 +835,7 @@ TOOL_DEFINITIONS = [
                 "Actions: "
                 "list_pages (browse all pages/notes), "
                 "create_page (new note or document), "
+                "create_page_with_blocks (new page with multiple content blocks in one call — ideal for worksheets, quizzes, structured docs), "
                 "get_page (read page content and blocks), "
                 "add_block (add content block to a page), "
                 "search (hybrid FTS + vector search across all content), "
@@ -863,7 +864,7 @@ TOOL_DEFINITIONS = [
                     "action": {
                         "type": "string",
                         "enum": [
-                            "list_pages", "create_page", "get_page", "add_block",
+                            "list_pages", "create_page", "create_page_with_blocks", "get_page", "add_block",
                             "search",
                             "list_databases", "create_database", "add_row", "update_row", "list_rows",
                             "create_form", "submit_form",
@@ -3446,7 +3447,7 @@ async def handle_manage_workspace(
 ) -> str:
     """Handle Pi Workspace operations via the Workspace API (port 8762)."""
     from nova.pi_workspace import (
-        create_page, list_pages, get_page, get_page_blocks, create_block,
+        create_page, create_page_with_blocks, list_pages, get_page, get_page_blocks, create_block,
         create_database, list_databases, list_database_rows, create_database_row,
         update_database_row, create_form, submit_form,
         get_planner_day, create_task, update_task, delete_task,
@@ -3480,7 +3481,21 @@ async def handle_manage_workspace(
                 await create_block(page["id"], "paragraph",
                                    {"richText": [{"type": "text", "text": {"content": content}, "plainText": content}]},
                                    parent_id=page.get("rootBlockId", ""))
-            return f"✅ Page created: \"{title}\" (id: {page['id'][:8]}...)"
+            return f"\u2705 Page created: \"{title}\" (id: {page['id'][:8]}...)"
+
+        elif action == "create_page_with_blocks":
+            if not title:
+                return "Title is required to create a page."
+            if not properties or not isinstance(properties, dict):
+                return "properties with 'blocks' array is required. Format: {\"blocks\": [{\"type\": \"heading_2\", \"content\": \"Problem 1\"}, {\"type\": \"paragraph\", \"content\": \"What is 3x4?\"}]}"
+            blocks = properties.get("blocks", [])
+            if not blocks:
+                return "'blocks' array in properties is required. Each block: {type, content?, properties?}"
+            page = await create_page_with_blocks(title, blocks, icon=icon, parent_id=parent_id)
+            if not page:
+                return "Failed to create page with blocks."
+            bc = page.get("block_count", 0)
+            return f"\u2705 Page created: \"{title}\" with {bc} blocks (id: {page['id'][:8]}...)"
 
         elif action == "get_page":
             if not page_id:
