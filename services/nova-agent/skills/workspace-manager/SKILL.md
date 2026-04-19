@@ -128,6 +128,14 @@ Your persistent Notion-like workspace for personal knowledge management, note-ta
 - **Daily planning** — view tasks, events, and notes for any day
 - **AI chat** — ask questions grounded in workspace + CIG/PCG context
 
+## Progress Narration
+
+When using this skill, you MUST speak to the user before and during tool calls:
+- **Before calling manage_workspace**: Say what you're doing — "Creating that page for you." / "Searching your workspace."
+- **After the tool returns**: Confirm the result — "Done — page created." / "Found 3 matching pages."
+- **Multi-step tasks**: Narrate each step — "Creating the page first... now adding the content blocks."
+Never go silent while a tool is running. The user should always hear what's happening.
+
 ## Key Concepts
 
 - **Pages**: Notion-style documents with blocks (paragraphs, headings, to-dos, callouts, code, etc.)

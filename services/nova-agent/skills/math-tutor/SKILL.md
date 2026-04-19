@@ -21,6 +21,14 @@ description: >
 - "Give me some problems" / "Generate exercises" / "Quiz Sofia" → **speak the problems inline** — no tool call, just respond with the problems
 - "Create a worksheet page" / "Make a math page in my workspace" / "Build a quiz I can print" → **use manage_workspace** to create a page
 
+## Progress Narration
+
+When this skill requires a tool call (e.g., creating a workspace page), you MUST speak to the user before and during the task:
+- **Before calling the tool**: Say what you're doing — "Let me build that worksheet page for you."
+- **After the tool returns**: Confirm the result — "Done — I created 'Fraction Practice' in your workspace."
+- **If the task takes multiple steps**: Narrate each step — "Adding the problems now... and the answer key at the bottom."
+Never go silent while a tool is running. The user should always hear what's happening.
+
 ## STAAR Multiple-Choice Format (MANDATORY)
 
 Every math problem MUST include 4 answer choices in STAAR format:
