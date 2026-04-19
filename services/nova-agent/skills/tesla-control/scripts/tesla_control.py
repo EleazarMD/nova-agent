@@ -205,42 +205,42 @@ async def _get_single_vehicle_status(vin: str) -> str:
     
     model = data.get("model", _get_model_from_vin(vin))
     model_str = f" ({model})" if model and model != "Unknown" else ""
-    lines = [f"Tesla Status ({data.get('display_name', vin)}{model_str}) [VIN: {vin}]"]
-    
-    # Battery & Charging (flattened format)
+    header = f"**{data.get('display_name', vin)}{model_str}** [VIN: {vin}]"
+
+    # Build table rows
     battery = data.get("battery_level", "?")
     range_mi = data.get("battery_range", "?")
     charging = data.get("charging_state", "Unknown")
-    lines.append(f"🔋 Battery: {battery}% ({range_mi} miles)")
-    lines.append(f"⚡ Charging: {charging}")
-    
+    charging_str = charging
     if charging == "Charging":
         rate = data.get("charge_rate", 0)
         time_left = data.get("minutes_to_full_charge", 0)
-        lines.append(f"   Rate: {rate} mi/hr, {time_left} min to full")
-    
-    # Climate (flattened format)
+        charging_str = f"Charging — {rate} mi/hr, {time_left} min to full"
+
     inside_temp = data.get("inside_temp")
-    if inside_temp:
-        inside_f = round(inside_temp * 9/5 + 32, 1)
-        lines.append(f"🌡️ Interior: {inside_f}°F")
-    
+    inside_str = f"{round(inside_temp * 9/5 + 32, 1)}°F" if inside_temp else "N/A"
     hvac_on = data.get("is_climate_on", False)
-    lines.append(f"❄️ Climate: {'On' if hvac_on else 'Off'}")
-    
-    # Security (flattened format)
     locked = data.get("locked", None)
     sentry = data.get("sentry_mode", False)
-    lines.append(f"🔒 Locked: {'Yes' if locked else 'No'}")
-    lines.append(f"👁️ Sentry Mode: {'On' if sentry else 'Off'}")
-    
-    # Location (flattened format)
+
+    rows = [
+        ("🔋 Battery", f"{battery}% / {range_mi} mi"),
+        ("⚡ Charging", charging_str),
+        ("🌡️ Interior", inside_str),
+        ("❄️ Climate", "On" if hvac_on else "Off"),
+        ("🔒 Locked", "Yes" if locked else "No"),
+        ("👁️ Sentry", "On" if sentry else "Off"),
+    ]
+
     lat = data.get("latitude")
     lon = data.get("longitude")
     if lat and lon:
-        lines.append(f"📍 Location: {lat:.4f}, {lon:.4f}")
-    
-    return "\n".join(lines)
+        rows.append(("📍 Location", f"{lat:.4f}, {lon:.4f}"))
+
+    table = f"{header}\n| Stat | Value |\n|------|-------|\n"
+    for label, value in rows:
+        table += f"| {label} | {value} |\n"
+    return table.rstrip()
 
 
 async def handle_tesla_charge_control(

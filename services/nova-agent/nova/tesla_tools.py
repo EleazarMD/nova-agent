@@ -8,6 +8,7 @@ OAuth tokens, vehicle polling, and SSE streams.
 
 import os
 import json
+import asyncio
 import aiohttp
 from typing import Optional
 from loguru import logger
@@ -18,12 +19,12 @@ TESLA_RELAY_URL = os.environ.get("TESLA_RELAY_URL", "http://localhost:18810")
 # Helper: Call Tesla Relay Service
 # ---------------------------------------------------------------------------
 
-async def _tesla_api(method: str, path: str, body: dict = None) -> dict:
+async def _tesla_api(method: str, path: str, body: dict = None, timeout: float = 15.0) -> dict:
     """Call Tesla API via Tesla Relay Service."""
     url = f"{TESLA_RELAY_URL}{path}"
     
     async with aiohttp.ClientSession() as session:
-        async with session.request(method, url, json=body) as resp:
+        async with session.request(method, url, json=body, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             if resp.status == 401:
                 return {"error": "Tesla account not connected", "needs_auth": True}
             if resp.status != 200:
@@ -209,42 +210,42 @@ async def _get_single_vehicle_status(vin: str) -> str:
     
     model = data.get("model", _get_model_from_vin(vin))
     model_str = f" ({model})" if model and model != "Unknown" else ""
-    lines = [f"Tesla Status ({data.get('display_name', vin)}{model_str}) [VIN: {vin}]"]
-    
-    # Battery & Charging (flattened format)
+    header = f"**{data.get('display_name', vin)}{model_str}** [VIN: {vin}]"
+
+    # Build table rows
     battery = data.get("battery_level", "?")
     range_mi = data.get("battery_range", "?")
     charging = data.get("charging_state", "Unknown")
-    lines.append(f"🔋 Battery: {battery}% ({range_mi} miles)")
-    lines.append(f"⚡ Charging: {charging}")
-    
+    charging_str = charging
     if charging == "Charging":
         rate = data.get("charge_rate", 0)
         time_left = data.get("minutes_to_full_charge", 0)
-        lines.append(f"   Rate: {rate} mi/hr, {time_left} min to full")
-    
-    # Climate (flattened format)
+        charging_str = f"Charging — {rate} mi/hr, {time_left} min to full"
+
     inside_temp = data.get("inside_temp")
-    if inside_temp:
-        inside_f = round(inside_temp * 9/5 + 32, 1)
-        lines.append(f"🌡️ Interior: {inside_f}°F")
-    
+    inside_str = f"{round(inside_temp * 9/5 + 32, 1)}°F" if inside_temp else "N/A"
     hvac_on = data.get("is_climate_on", False)
-    lines.append(f"❄️ Climate: {'On' if hvac_on else 'Off'}")
-    
-    # Security (flattened format)
     locked = data.get("locked", None)
     sentry = data.get("sentry_mode", False)
-    lines.append(f"🔒 Locked: {'Yes' if locked else 'No'}")
-    lines.append(f"👁️ Sentry Mode: {'On' if sentry else 'Off'}")
-    
-    # Location (flattened format)
+
+    rows = [
+        ("🔋 Battery", f"{battery}% / {range_mi} mi"),
+        ("⚡ Charging", charging_str),
+        ("🌡️ Interior", inside_str),
+        ("❄️ Climate", "On" if hvac_on else "Off"),
+        ("🔒 Locked", "Yes" if locked else "No"),
+        ("👁️ Sentry", "On" if sentry else "Off"),
+    ]
+
     lat = data.get("latitude")
     lon = data.get("longitude")
     if lat and lon:
-        lines.append(f"📍 Location: {lat:.4f}, {lon:.4f}")
-    
-    return "\n".join(lines)
+        rows.append(("📍 Location", f"{lat:.4f}, {lon:.4f}"))
+
+    table = f"{header}\n| Stat | Value |\n|------|-------|\n"
+    for label, value in rows:
+        table += f"| {label} | {value} |\n"
+    return table.rstrip()
 
 
 async def handle_tesla_charge_control(
@@ -392,7 +393,7 @@ async def handle_tesla_trunk_control(
 
 
 async def handle_tesla_wake(user_id: str, vin: Optional[str] = None) -> str:
-    """Wake up Tesla vehicle."""
+    """Wake up Tesla vehicle and poll until online (up to 3 attempts)."""
     if not vin:
         vehicles_result = await _tesla_api("GET", "/vehicles")
         if isinstance(vehicles_result, dict) and vehicles_result.get("error"):
@@ -401,15 +402,27 @@ async def handle_tesla_wake(user_id: str, vin: Optional[str] = None) -> str:
         if not vehicles:
             return "No Tesla vehicles found."
         vin = vehicles[0].get("vin")
-    
+
     result = await _tesla_api("POST", f"/vehicles/{vin}/command", {
         "command": "wake_up"
-    })
-    
+    }, timeout=20.0)
+
     if result.get("error"):
         return result["error"]
-    
-    return "Wake command sent. Vehicle should be online shortly."
+
+    # Poll for vehicle to come online (3 attempts, 5s apart)
+    for attempt in range(3):
+        await asyncio.sleep(5)
+        status = await _tesla_api("GET", f"/vehicles/{vin}/data", timeout=10.0)
+        if not status.get("error"):
+            return "Vehicle is now online and ready."
+        if status.get("error") == "vehicle_unavailable":
+            logger.info(f"Wake poll attempt {attempt + 1}/3: vehicle still offline")
+            continue
+        # Some other error — stop polling
+        break
+
+    return "Wake command sent, but the vehicle isn't responding yet. It may be in a deep sleep cycle — try again in a few minutes or use the Tesla app when you're near the car."
 
 
 async def handle_tesla_honk_flash(

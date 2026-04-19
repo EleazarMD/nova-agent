@@ -8,6 +8,9 @@ Based on: https://github.com/pipecat-ai/pipecat-examples/tree/main/p2p-webrtc/vo
 """
 
 import os
+import json
+import time
+import asyncio
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -240,17 +243,63 @@ async def run_bot(
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
-    # Tool iteration tracking — prevent runaway tool chains
+    # Tool iteration tracking — runaway loop guard only (not a quality throttle)
     _tool_calls_this_turn: list[int] = [0]
-    _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 3
-    _MAX_TOOL_CALLS_BEFORE_WARN = 6
-    _MAX_TOOL_CALLS_HARD_LIMIT = 10
+    _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 5
+    _MAX_TOOL_CALLS_HARD_LIMIT = 25  # Pure infinite-loop guard
+    # Per-tool-per-turn rate limits — differentiated by provider cost/risk
+    # Cloud APIs (paid, rate-limited externally): tight limits
+    # Local/homelab APIs (free, internal): generous limits
+    _PER_TOOL_LIMITS: dict[str, int] = {
+        # ── Cloud / paid APIs ──────────────────────────────────────────────
+        "web_search": 2,            # Perplexity Sonar — paid per call
+        "get_weather": 2,           # OpenWeatherMap — paid API
+        "query_cig": 2,             # CIG analytics — AI gateway internally
+        "hub_delegate": 2,          # Hub RPC — approval-gated, expensive
+        # ── Local / homelab ───────────────────────────────────────────────
+        "check_studio": 4,          # Local CIG/Hermes
+        "query_frameworks": 3,      # Local LIAM/PCG
+        "recall_memory": 4,         # Local PCG
+        "search_past_conversations": 2,  # Local DB but guards loop
+        "tesla_control": 4,         # Local relay → Tesla cloud (relay handles its own limits)
+        "service_status": 6,        # Local Docker API
+        "homelab_diagnostics": 3,   # Local Docker API — heavy
+        "homelab_operations": 4,    # Local Docker API
+    }
+    _per_tool_call_counts: dict[str, int] = {}
     # Track recent tool calls to detect duplicates
     # Note: hub_delegate is excluded from dedup because each delegation
     # is a unique long-running task — even if args look similar, the context
     # and state differ between calls.
-    _DEDUP_EXCLUDED_TOOLS = {"hub_delegate"}
+    _DEDUP_EXCLUDED_TOOLS = {"hub_delegate", "tesla_wake"}
     _last_tool_call: dict = {"name": None, "args": None, "result": None}
+    # Traffic telemetry — emitted to logger for monitoring/grepping
+    # Format: NOVA_TRAFFIC | tool=<name> | provider=<class> | latency=<ms> | bytes_out=<n> | status=<ok|error|rate_limited|timeout>
+    _PROVIDER_CLASS: dict[str, str] = {
+        "web_search": "cloud:perplexity",
+        "get_weather": "cloud:openweathermap",
+        "query_cig": "local:cig",
+        "hub_delegate": "local:pi-hub",
+        "check_studio": "local:cig",
+        "query_frameworks": "local:pcg",
+        "recall_memory": "local:pcg",
+        "save_memory": "local:pcg",
+        "search_past_conversations": "local:sqlite",
+        "tesla_control": "local:tesla-relay",
+        "tesla_wake": "local:tesla-relay",
+        "tesla_navigation": "local:tesla-relay",
+        "tesla_stream_monitor": "local:tesla-relay",
+        "tesla_location_refresh": "local:tesla-relay",
+        "service_status": "local:docker",
+        "homelab_diagnostics": "local:docker",
+        "homelab_operations": "local:docker",
+        "control_lights": "local:homeassistant",
+        "get_workstation_status": "local:workstation",
+        "manage_workspace": "local:pi-workspace",
+        "manage_notes": "local:pi-workspace",
+        "manage_timer": "local:nova",
+        "set_reminder": "local:nova",
+    }
 
     def _build_spoken_ack(tool_name: str, args: dict) -> str | None:
         """Generate a contextual spoken acknowledgment from tool name + args.
@@ -266,6 +315,8 @@ async def run_bot(
             if query:
                 return f"Searching for {query}."
             return "Searching the web."
+        elif tool_name == "tesla_wake":
+            return "Waking up your Tesla."
         return None
 
     def _build_thinking_text(tool_name: str, args: dict) -> str:
@@ -292,8 +343,7 @@ async def run_bot(
             
             # Check for duplicate tool call (same tool with same args)
             # Skip dedup for long-running delegation tools where each call is unique
-            import json as _json
-            args_str = _json.dumps(args, sort_keys=True, default=str)
+            args_str = json.dumps(args, sort_keys=True, default=str)
             if (tool_name not in _DEDUP_EXCLUDED_TOOLS and
                 _last_tool_call["name"] == tool_name and 
                 _last_tool_call["args"] == args_str and
@@ -305,14 +355,27 @@ async def run_bot(
             
             _tool_calls_this_turn[0] += 1
             call_num = _tool_calls_this_turn[0]
-            logger.info(f"🔥 Tool call #{call_num}: {tool_name} args={str(args)[:100]}")
+            provider_class = _PROVIDER_CLASS.get(tool_name, "local:unknown")
+            logger.info(f"🔥 Tool call #{call_num}: {tool_name} [{provider_class}] args={str(args)[:100]}")
 
-            # ── Hard limit: prevent runaway tool chains ──
+            # ── Hard limit: pure runaway-loop guard (not a quality throttle) ──
             if call_num > _MAX_TOOL_CALLS_HARD_LIMIT:
-                logger.warning(f"Tool call hard limit reached ({call_num}), forcing response")
+                logger.warning(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | status=hard_limit_exceeded | total_calls={call_num}")
                 await params.result_callback(
-                    "SYSTEM: Tool call limit reached. You MUST respond to the user now "
+                    "SYSTEM: Runaway tool loop detected. You MUST respond to the user now "
                     "with whatever information you have gathered so far. Do NOT call any more tools."
+                )
+                return
+
+            # ── Per-tool rate limit (cloud=tight, local=generous) ──
+            tool_count = _per_tool_call_counts.get(tool_name, 0) + 1
+            _per_tool_call_counts[tool_name] = tool_count
+            tool_limit = _PER_TOOL_LIMITS.get(tool_name, 99)  # no limit for unlisted tools
+            if tool_count > tool_limit:
+                logger.warning(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | status=rate_limited | call={tool_count}/{tool_limit}")
+                await params.result_callback(
+                    f"[{tool_name} rate-limited: already called {tool_count - 1}x this turn, limit={tool_limit}] "
+                    "Use the data you already have to answer the user."
                 )
                 return
 
@@ -321,10 +384,6 @@ async def run_bot(
                 _ack_sent_this_turn[0] = True
                 await _send_server_msg({"type": "heartbeat", "text": "Still working on it..."})
                 logger.info(f"Auto-heartbeat at tool call #{call_num}")
-
-            # ── Soft warning: tell LLM to wrap up ──
-            if call_num == _MAX_TOOL_CALLS_BEFORE_WARN:
-                logger.warning(f"Soft tool limit reached ({call_num}), injecting wrap-up hint")
 
             # ── Fast path: instant spoken acknowledgment (once per turn) ──
             if tool_name in _SLOW_TOOLS and not _ack_sent_this_turn[0]:
@@ -344,25 +403,31 @@ async def run_bot(
                 })
 
             # ── Background path: tool executes ──
+            _t_start = time.monotonic()
             try:
                 # Add timeout to prevent tools from hanging indefinitely
-                import asyncio
                 # Slow delegation tools need much longer timeouts
                 _SLOW_TOOL_TIMEOUTS = {
                     "hub_delegate": 300,        # 5 min — Hub RPC with approval flow
                     "web_search": 30,           # 30s — Perplexity Sonar
+                    "tesla_wake": 60,           # 60s — wake + poll for vehicle online
                     "service_status": 30,       # 30s — Docker API
                     "homelab_diagnostics": 60,  # 60s — Full diagnostics
                 }
                 tool_timeout = _SLOW_TOOL_TIMEOUTS.get(tool_name, 30.0)
                 result = await asyncio.wait_for(dispatch_tool(tool_name, args), timeout=tool_timeout)
                 result_str = str(result)
+                _latency_ms = int((time.monotonic() - _t_start) * 1000)
+                _bytes_out = len(result_str.encode())
+                logger.info(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out={_bytes_out} | status=ok")
                 logger.info(f"Tool {tool_name} returned type={type(result).__name__}, len={len(result_str)}, content={result_str[:200]}")
             except asyncio.TimeoutError:
-                logger.error(f"Tool {tool_name} timed out after {tool_timeout}s")
+                _latency_ms = int((time.monotonic() - _t_start) * 1000)
+                logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=timeout")
                 result = f"Tool {tool_name} timed out after {tool_timeout:.0f}s. The operation took too long to complete."
             except Exception as e:
-                logger.error(f"Tool {tool_name} execution failed: {e}", exc_info=True)
+                _latency_ms = int((time.monotonic() - _t_start) * 1000)
+                logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=error | err={e}")
                 result = f"Tool execution error: {str(e)}"
             
             # Validate result is not empty
@@ -377,14 +442,6 @@ async def run_bot(
             if tool_name in _SLOW_TOOLS:
                 await _send_server_msg({"phase": "done"})
 
-            # ── Inject wrap-up hint at soft limit ──
-            if call_num >= _MAX_TOOL_CALLS_BEFORE_WARN:
-                result = (
-                    result + "\n\nSYSTEM: You have made many tool calls this turn. "
-                    "Summarize what you've found so far and respond to the user. "
-                    "Do not make additional tool calls unless absolutely critical."
-                )
-
             # ── Result path: feed back to LLM for comprehensive spoken response ──
             logger.info(f"🔥 Calling result_callback for {tool_name} with {len(str(result))} chars: {str(result)[:150]}")
             try:
@@ -392,11 +449,10 @@ async def run_bot(
                 logger.info(f"🔥 result_callback completed for {tool_name}")
                 # Cache the result for deduplication
                 _last_tool_call["name"] = tool_name
-                _last_tool_call["args"] = _json.dumps(args, sort_keys=True, default=str)
+                _last_tool_call["args"] = json.dumps(args, sort_keys=True, default=str)
                 _last_tool_call["result"] = result
                 logger.info(f"🔥 Cached result for {tool_name}")
                 # Small delay to ensure Pipecat processes the result before handler returns
-                import asyncio
                 await asyncio.sleep(0.1)
                 logger.info(f"🔥 HANDLER COMPLETE for {tool_name}")
             except Exception as e:
@@ -412,7 +468,7 @@ async def run_bot(
     llm.register_function("web_search", make_tool_handler("web_search"))
     # Conversation search (recall past discussions)
     llm.register_function("search_past_conversations", make_tool_handler("search_past_conversations"))
-    # Memory tools (PIC — Personal Integration Core)
+    # Memory tools (PCG — Personal Context Graph)
     llm.register_function("save_memory", make_tool_handler("save_memory"))
     llm.register_function("recall_memory", make_tool_handler("recall_memory"))
     llm.register_function("forget_memory", make_tool_handler("forget_memory"))
@@ -435,8 +491,6 @@ async def run_bot(
     llm.register_function("link_goal_to_knowledge", make_tool_handler("link_goal_to_knowledge"))
 
     # ── Personal Context Graph (PCG) ────────────────────────────────────────
-    llm.register_function("save_memory", make_tool_handler("save_memory"))
-    llm.register_function("recall_memory", make_tool_handler("recall_memory"))
     llm.register_function("query_context", make_tool_handler("query_context"))
     llm.register_function("kg_query", make_tool_handler("kg_query"))
     llm.register_function("knowledge_query", make_tool_handler("knowledge_query"))
@@ -661,9 +715,10 @@ async def run_bot(
                     role = msg.get("role", "")
                     content = msg.get("content", "")
                     if role == "user" and content:
-                        # New user turn — reset per-turn dedup, tool counter, and dedup cache
+                        # New user turn — reset per-turn dedup, tool counter, per-tool counts, and dedup cache
                         _ack_sent_this_turn[0] = False
                         _tool_calls_this_turn[0] = 0
+                        _per_tool_call_counts.clear()
                         _last_tool_call.update({"name": None, "args": None, "result": None})
                         await append_turn(session.session_id, "user", content)
                         await _sync_message_to_backend(
