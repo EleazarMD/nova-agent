@@ -14,8 +14,12 @@ description: >
 
 - User asks for math problems, practice exercises, or quiz questions
 - User mentions STAAR prep, homework help, or tutoring
-- User asks to create a worksheet or quiz page in the workspace
 - User mentions Sofia and math/fractions/numbers in the same request
+
+## Intent Disambiguation
+
+- "Give me some problems" / "Generate exercises" / "Quiz Sofia" → **speak the problems inline** — no tool call, just respond with the problems
+- "Create a worksheet page" / "Make a math page in my workspace" / "Build a quiz I can print" → **use manage_workspace** to create a page
 
 ## STAAR Multiple-Choice Format (MANDATORY)
 
@@ -93,7 +97,7 @@ Answer Key
 
 ## Creating Worksheet Pages
 
-When the user wants a worksheet in the workspace, use `manage_workspace` with:
+When the user asks for a workspace page, use `manage_workspace` with:
 - `action="create_page_with_blocks"` — builds a structured page with all problems in one call
 - `action="create_from_template"` with `template_id="tpl-math-worksheet"` — uses the Math Worksheet template
 

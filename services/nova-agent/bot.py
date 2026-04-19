@@ -239,7 +239,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -317,6 +317,18 @@ async def run_bot(
             return "Searching the web."
         elif tool_name == "tesla_wake":
             return "Waking up your Tesla."
+        elif tool_name == "manage_workspace":
+            action = args.get("action", "")
+            title = args.get("title", "")[:40]
+            if action == "create_page_with_blocks" and title:
+                return f"Creating {title} in your workspace."
+            elif action == "create_from_template" and title:
+                return f"Building {title} from template."
+            elif action in ("create_page", "create_database", "create_form"):
+                return f"Setting up {title or 'new ' + action.replace('create_', '')}."
+            elif action == "search":
+                return "Searching your workspace."
+            return "Working on your workspace."
         return None
 
     def _build_thinking_text(tool_name: str, args: dict) -> str:
@@ -333,6 +345,7 @@ async def run_bot(
             "query_frameworks": f"🧠 Querying LIAM frameworks for {args.get('problem_description', 'decision support')[:40]}...",
             "service_status": f"Checking status of {args.get('container', 'services')}...",
             "homelab_diagnostics": "Running homelab diagnostics...",
+            "manage_workspace": f"📝 Workspace: {args.get('action', 'processing')}...",
         }
         return desc_map.get(tool_name, f"Executing {tool_name}...")
 
