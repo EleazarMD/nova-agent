@@ -120,30 +120,32 @@ async def search_cig_kg(
     entity_type: str = "any",
     limit: int = 5,
 ) -> dict[str, Any]:
-    """Search CIG v2 knowledge graph for entities and relationships.
+    """Search CIG for emails/entities matching a natural-language query.
 
-    Returns matched entities (people, organizations, topics) with relationship context.
+    Uses `/v1/search/emails` (semantic email search backed by vector embeddings)
+    which is the correct NL-search surface. The older `/v1/kg/query` endpoint
+    requires admin auth + raw Cypher and is not appropriate for LLM tools.
     """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"{CIG_URL}/v1/kg/query",
+                f"{CIG_URL}/v1/search/emails",
                 headers=_HEADERS,
-                json={
-                    "query": query,
-                    "entity_type": entity_type,
-                    "limit": limit,
-                },
+                json={"query": query, "limit": limit},
                 timeout=_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    data = await resp.json()
+                    # Normalize: expose as "results" for the caller.
+                    if "results" not in data:
+                        data["results"] = data.get("emails", [])
+                    return data
                 else:
                     text = await resp.text()
-                    logger.warning(f"CIG KG search failed: {resp.status} {text[:100]}")
+                    logger.warning(f"CIG search failed: {resp.status} {text[:100]}")
                     return {"error": f"CIG returned {resp.status}", "results": []}
     except Exception as e:
-        logger.warning(f"CIG KG search error: {e}")
+        logger.warning(f"CIG search error: {e}")
         return {"error": str(e), "results": []}
 
 
