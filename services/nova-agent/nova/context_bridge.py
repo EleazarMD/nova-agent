@@ -1,7 +1,7 @@
 """
 Context Bridge client for Nova Agent.
 
-Orchestrates PIC (Personal Identity Core) and KG-API for unified knowledge access.
+Orchestrates PIC (Personal Identity Core) and PCG Knowledge Graph for unified knowledge access.
 Provides Nova with single-entry access to both personal and general knowledge.
 
 Port: 8764
@@ -23,11 +23,11 @@ async def query_knowledge(
     include_dimensions: bool = True,
 ) -> dict[str, Any]:
     """
-    Query across PIC and KG-API through Context Bridge.
+    Query across PIC and PCG Knowledge Graph through Context Bridge.
     
     Returns unified results with:
     - personal: PIC identity, goals, context
-    - knowledge: KG-API entities, facts
+    - knowledge: PCG Knowledge Graph entities, facts
     - applicable_dimensions: LIAM dimensions matching query
     - synthesis: pre-formatted summary
     """
@@ -112,7 +112,7 @@ async def link_goal_to_entity(
     context: str = "",
 ) -> dict[str, Any]:
     """
-    Create bi-directional link between PIC goal and KG-API entity.
+    Create bi-directional link between PIC goal and PCG Knowledge Graph entity.
     """
     url = f"{CONTEXT_BRIDGE_URL}/v1/link/goal-to-entity"
     params = {
@@ -145,7 +145,7 @@ async def link_goal_to_entity(
 
 async def get_goal_related_knowledge(goal_id: str) -> dict[str, Any]:
     """
-    Get KG-API entities related to a specific PIC goal.
+    Get PCG Knowledge Graph entities related to a specific PIC goal.
     """
     url = f"{CONTEXT_BRIDGE_URL}/v1/goal/{goal_id}/related-knowledge"
     

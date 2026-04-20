@@ -15,6 +15,8 @@ from loguru import logger
 
 TESLA_RELAY_URL = os.environ.get("TESLA_RELAY_URL", "http://localhost:18810")
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://localhost:8404")
+# Standalone approval-service microservice (handles /api/notifications/send)
+APPROVAL_SERVICE_URL = os.environ.get("APPROVAL_SERVICE_URL", "http://127.0.0.1:8407")
 
 # Active monitors storage
 _active_monitors: Dict[str, "MonitorConfig"] = {}
@@ -397,7 +399,7 @@ async def _trigger_notification(config: MonitorConfig, event_desc: str, vehicle_
         
         async with aiohttp.ClientSession() as session:
             await session.post(
-                f"{DASHBOARD_URL}/api/notifications/send",
+                f"{APPROVAL_SERVICE_URL}/api/notifications/send",
                 json={
                     "user_id": config.user_id,
                     "title": f"Tesla Alert: {display_name}",

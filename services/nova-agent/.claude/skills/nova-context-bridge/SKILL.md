@@ -11,7 +11,7 @@ Bridges context and shares state between different agents and services in the AI
 
 - Transferring context between agents
 - Sharing state across services
-- "Pass this to OpenClaw"
+- "Pass this to the Hub"
 - Context synchronization needs
 - Agent-to-agent communication
 
@@ -33,7 +33,7 @@ Bridges context and shares state between different agents and services in the AI
 User: "Send this to the dashboard"
 Assistant: Invoking @nova-context-bridge to transfer context...
 
-User: "Sync my context with OpenClaw"
+User: "Sync my context with the Hub"
 Assistant: Invoking @nova-context-bridge to synchronize context...
 
 ## References

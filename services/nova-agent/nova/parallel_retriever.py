@@ -22,7 +22,7 @@ from loguru import logger
 
 class RetrievalSource(str, Enum):
     """Data sources for parallel retrieval."""
-    HERMES_CORE = "hermes_core"       # Calendar, Email, Tasks
+    CIG = "cig"               # Calendar, Email, Tasks
     WEB_SEARCH = "web_search"         # News, facts, general web
     KNOWLEDGE_GRAPH = "knowledge"     # PIC, LIAM, vector store
     WEATHER = "weather"               # Weather API
@@ -187,9 +187,9 @@ class ParallelRetriever:
     def _get_default_sources(self, domain: str) -> list[RetrievalSource]:
         """Get default sources for a domain."""
         mapping = {
-            "productivity": [RetrievalSource.HERMES_CORE],
+            "productivity": [RetrievalSource.CIG],
             "news": [RetrievalSource.WEB_SEARCH],
-            "tasks": [RetrievalSource.HERMES_CORE],
+            "tasks": [RetrievalSource.CIG],
             "knowledge": [RetrievalSource.KNOWLEDGE_GRAPH, RetrievalSource.WEB_SEARCH],
             "weather": [RetrievalSource.WEATHER],
         }
@@ -206,8 +206,8 @@ class ParallelRetriever:
         start_time = time.monotonic()
         
         try:
-            if source == RetrievalSource.HERMES_CORE:
-                return await self._retrieve_hermes(query, domain, user_id, start_time)
+            if source == RetrievalSource.CIG:
+                return await self._retrieve_cig(query, domain, user_id, start_time)
             elif source == RetrievalSource.WEB_SEARCH:
                 return await self._retrieve_web(query, domain, start_time)
             elif source == RetrievalSource.KNOWLEDGE_GRAPH:
@@ -241,14 +241,14 @@ class ParallelRetriever:
                 error=str(e),
             )
     
-    async def _retrieve_hermes(
+    async def _retrieve_cig(
         self,
         query: str,
         domain: str,
         user_id: str,
         start_time: float,
     ) -> RetrievalResult:
-        """Retrieve from Hermes Core (calendar, email, tasks)."""
+        """Retrieve from CIG (calendar, email, tasks)."""
         
         # Determine what to fetch based on query
         if any(kw in query.lower() for kw in ["schedule", "meeting", "calendar", "appointments"]):
@@ -272,19 +272,19 @@ class ParallelRetriever:
             result_text = result if isinstance(result, str) else str(result)
             
             return RetrievalResult(
-                source=RetrievalSource.HERMES_CORE,
+                source=RetrievalSource.CIG,
                 data=result_text,
                 success=True,
                 duration_ms=int((time.monotonic() - start_time) * 1000),
-                citations=[{"source": "Hermes Core", "type": domain}],
+                citations=[{"source": "CIG", "type": domain}],
             )
         except asyncio.TimeoutError:
             return RetrievalResult(
-                source=RetrievalSource.HERMES_CORE,
+                source=RetrievalSource.CIG,
                 data="",
                 success=False,
                 duration_ms=int((time.monotonic() - start_time) * 1000),
-                error="Hermes Core timeout",
+                error="CIG timeout",
             )
     
     async def _retrieve_web(

@@ -41,8 +41,8 @@ from nova.operational_mode import (
 # ---------------------------------------------------------------------------
 
 DASHBOARD_URL = os.environ.get("ECOSYSTEM_URL", "http://localhost:8404")
-# Use dashboard approval API directly (port 8404) - standalone approval-service removed
-APPROVAL_SERVICE_URL = os.environ.get("APPROVAL_SERVICE_URL", DASHBOARD_URL)
+# Standalone approval-service microservice (JIT Zero-Tolerance Infrastructure Approvals)
+APPROVAL_SERVICE_URL = os.environ.get("APPROVAL_SERVICE_URL", "http://127.0.0.1:8407")
 APPROVAL_SERVICE_API_KEY = os.environ.get("APPROVAL_SERVICE_API_KEY", "ai-gateway-api-key-2024")
 _AGENT_JWT = os.environ.get("HERMES_JWT_TOKEN", "")
 APPROVAL_POLL_INTERVAL = 3  # seconds between status polls
@@ -234,7 +234,7 @@ async def handle_service_start(
     if err:
         return err
     
-    # Handle systemd user services (like openclaw-browser)
+    # Handle systemd user services
     if container in SYSTEMD_USER_SERVICES:
         import subprocess
         # Check if already running

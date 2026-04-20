@@ -31,8 +31,8 @@ from nova.hermes_auth import generate_hermes_jwt
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Hermes Core — email/calendar intelligence service
-HERMES_CORE_URL = os.environ.get("HERMES_CORE_URL", "http://localhost:8780")
+# CIG — email/calendar intelligence service
+CIG_URL = os.environ.get("CIG_URL", os.environ.get("HERMES_CORE_URL", "http://localhost:8780"))
 
 # AI Inferencing — centralized API key vault and telemetry
 AI_INFERENCING_URL = os.environ.get("AI_INFERENCING_URL", "http://localhost:9000")
@@ -153,12 +153,10 @@ def _validate_container(container: str, allowlist: set[str] | None = None) -> st
 async def handle_service_status(container: str = "") -> str:
     """Get status of homelab containers. No approval needed (read-only)."""
     if container:
-        if container in ["cig", "pcg", "tesla-relay", "openclaw-browser"]:
+        if container in ["cig", "pcg", "tesla-relay"]:
             import subprocess
             try:
-                # Use --user flag for user services like openclaw-browser
-                user_flag = ["--user"] if container == "openclaw-browser" else []
-                res = subprocess.run(["systemctl"] + user_flag + ["is-active", container], capture_output=True, text=True, timeout=2)
+                res = subprocess.run(["systemctl", "is-active", container], capture_output=True, text=True, timeout=2)
                 st = "Up (healthy)" if res.returncode == 0 else "Exited (down)"
                 return f"{container}: {st} [systemd]"
             except:
@@ -199,12 +197,10 @@ async def handle_service_status(container: str = "") -> str:
         lines.append(f"- {name}: {st}{marker}")
 
     # Add systemd services
-    for svc in ["cig", "pcg", "tesla-relay", "openclaw-browser"]:
+    for svc in ["cig", "pcg", "tesla-relay"]:
         import subprocess
         try:
-            # Use --user flag for user services like openclaw-browser
-            user_flag = ["--user"] if svc == "openclaw-browser" else []
-            res = subprocess.run(["systemctl"] + user_flag + ["is-active", svc], capture_output=True, text=True, timeout=2)
+            res = subprocess.run(["systemctl", "is-active", svc], capture_output=True, text=True, timeout=2)
             st = "Up (healthy)" if res.returncode == 0 else "Exited (down)"
             lines.append(f"- {svc}: {st} [systemd]")
         except:
@@ -240,7 +236,7 @@ async def handle_service_logs(container: str, lines: int = 50) -> str:
 
 
 async def _probe_hermes_health() -> dict[str, Any]:
-    """Probe Hermes Core application-level health: email, calendar, databases.
+    """Probe CIG application-level health: email, calendar, databases.
 
     Returns a structured dict with status, email counts, calendar stats,
     and component health (Neo4j, ChromaDB, LLM gateway).
@@ -255,7 +251,7 @@ async def _probe_hermes_health() -> dict[str, Any]:
         async with aiohttp.ClientSession() as session:
             # 1. Core health endpoint — email counts + component status
             async with session.get(
-                f"{HERMES_CORE_URL}/health", timeout=timeout
+                f"{CIG_URL}/health", timeout=timeout
             ) as resp:
                 if resp.status != 200:
                     result["error"] = f"HTTP {resp.status}"
@@ -274,7 +270,7 @@ async def _probe_hermes_health() -> dict[str, Any]:
             # 2. Calendar stats (non-fatal if unavailable)
             try:
                 async with session.get(
-                    f"{HERMES_CORE_URL}/v1/calendar/neo4j/stats",
+                    f"{CIG_URL}/v1/calendar/neo4j/stats",
                     headers=hermes_headers,
                     timeout=timeout,
                 ) as cal_resp:
@@ -289,7 +285,7 @@ async def _probe_hermes_health() -> dict[str, Any]:
                 result["calendar"] = {"error": "calendar stats unavailable"}
 
     except asyncio.TimeoutError:
-        result["error"] = "timeout (Hermes Core not responding)"
+        result["error"] = "timeout (CIG not responding)"
     except Exception as e:
         result["error"] = str(e)
 
@@ -344,7 +340,7 @@ async def _probe_ai_inferencing_health() -> dict[str, Any]:
 async def handle_service_health_check(container: str = "") -> str:
     """Deep health check: container status + ports + application-level probes.
 
-    When no container is specified, also probes Hermes Core's application
+    When no container is specified, also probes CIG's application
     health to report email/calendar/database status alongside container state.
     """
     if container:
@@ -420,7 +416,7 @@ async def handle_service_health_check(container: str = "") -> str:
     # Application-level probes for data services
     app_probes = []
     
-    # Probe Hermes Core
+    # Probe CIG
     hermes = await _probe_hermes_health()
     if hermes.get("reachable"):
         comps = hermes.get("components", {})
@@ -429,7 +425,7 @@ async def handle_service_health_check(container: str = "") -> str:
         chroma_ok = comps.get("chromadb", "?") in ("connected", "healthy", "ok")
         llm_ok = comps.get("llm_gateway", "?") in ("connected", "healthy", "ok", "reachable")
         app_probes.append(
-            f"- Hermes Email: {hermes.get('status', '?')} — "
+            f"- CIG Email: {hermes.get('status', '?')} — "
             f"{emails.get('total', 0):,} emails indexed "
             f"({emails.get('inbox', 0):,} inbox, {emails.get('sent', 0):,} sent)"
         )
@@ -441,12 +437,12 @@ async def handle_service_health_check(container: str = "") -> str:
         cal = hermes.get("calendar", {})
         if cal and not cal.get("error"):
             app_probes.append(
-                f"- Hermes Calendar: {cal.get('calendars', 0)} calendars, "
+                f"- CIG Calendar: {cal.get('calendars', 0)} calendars, "
                 f"{cal.get('events', 0)} events, last sync: {cal.get('last_sync', '?')}"
             )
     else:
         app_probes.append(
-            f"- Hermes Core: UNREACHABLE — {hermes.get('error', 'cannot connect to ' + HERMES_CORE_URL)}"
+            f"- CIG: UNREACHABLE — {hermes.get('error', 'cannot connect to ' + CIG_URL)}"
         )
 
     # Probe AI Inferencing

@@ -113,7 +113,7 @@ class HouseholdManager:
         return {
             "tesla_*": PermissionLevel.OWNER_ONLY,
             "service_*": PermissionLevel.OWNER_ONLY,
-            "openclaw_delegate": PermissionLevel.ALLOW,
+            "hub_delegate": PermissionLevel.ALLOW,
             "web_search": PermissionLevel.ALLOW,
             "manage_notes": PermissionLevel.ALLOW,
         }
@@ -127,7 +127,7 @@ class HouseholdManager:
             return {
                 "tesla_*": PermissionLevel.ALLOW,
                 "service_*": PermissionLevel.ALLOW,
-                "openclaw_delegate": PermissionLevel.ALLOW,
+                "hub_delegate": PermissionLevel.ALLOW,
                 "web_search": PermissionLevel.ALLOW,
                 "manage_notes": PermissionLevel.ALLOW,
             }
@@ -137,7 +137,7 @@ class HouseholdManager:
                 "tesla_*": PermissionLevel.ASK,  # Ask for vehicle commands
                 "service_restart": PermissionLevel.DENY,
                 "service_stop": PermissionLevel.DENY,
-                "openclaw_delegate": PermissionLevel.ALLOW,
+                "hub_delegate": PermissionLevel.ALLOW,
                 "web_search": PermissionLevel.ALLOW,
                 "manage_notes": PermissionLevel.ALLOW,
             }
@@ -146,7 +146,7 @@ class HouseholdManager:
             return {
                 "tesla_*": PermissionLevel.DENY,
                 "service_*": PermissionLevel.DENY,
-                "openclaw_delegate": PermissionLevel.ASK,
+                "hub_delegate": PermissionLevel.ASK,
                 "web_search": PermissionLevel.ALLOW,
                 "manage_notes": PermissionLevel.ALLOW,
             }

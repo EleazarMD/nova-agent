@@ -99,11 +99,11 @@ class KnowledgeGraphClient:
             "cig": {
                 "id": "cig-001",
                 "type": "Service",
-                "name": "Hermes Core",
+                "name": "CIG",
                 "properties": {
-                    "port": 8001,
+                    "port": 8780,
                     "databases": ["Neo4j", "ChromaDB"],
-                    "purpose": "Email and calendar management",
+                    "purpose": "Email, calendar, and contact intelligence",
                     "status": "active",
                 },
                 "labels": ["Service", "Email", "Calendar"],
@@ -131,7 +131,7 @@ class KnowledgeGraphClient:
         entity_id = args.get("entity_id", "")
         relationship_type = args.get("relationship_type", "")
         
-        # Mock: Nova Agent depends on AI Gateway and Hermes Core
+        # Mock: Nova Agent depends on AI Gateway and CIG
         if "nova-agent" in entity_id:
             return {
                 "results": [
@@ -168,7 +168,7 @@ class KnowledgeGraphClient:
             results.append({
                 "id": "cig-001",
                 "type": "Service",
-                "name": "Hermes Core",
+                "name": "CIG",
                 "score": 0.92,
             })
         
@@ -188,9 +188,9 @@ class KnowledgeGraphClient:
                 },
                 "direct_relationships": [
                     {"to": "AI Gateway", "type": "depends on"},
-                    {"to": "Hermes Core", "type": "uses for email/calendar"},
+                    {"to": "CIG", "type": "uses for email/calendar"},
                     {"to": "Tesla Relay", "type": "integrates with"},
-                    {"to": "OpenClaw", "type": "delegates to"},
+                    {"to": "Pi Agent Hub", "type": "delegates to"},
                 ],
                 "dependents": [
                     {"from": "Dashboard", "type": "uses"},
@@ -256,7 +256,7 @@ class KnowledgeGraphClient:
         """
         Get all services integrated with a given service.
         
-        Useful for answering: "What integrates with Hermes Core?"
+        Useful for answering: "What integrates with CIG?"
         """
         service = await self.find_service(service_name)
         if not service:

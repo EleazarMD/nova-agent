@@ -18,8 +18,12 @@ from datetime import datetime
 from loguru import logger
 
 
-# Dashboard API configuration
-DASHBOARD_BASE_URL = "http://localhost:3000"  # Dashboard runs on :3000
+# Standalone approval-service microservice configuration
+import os
+DASHBOARD_BASE_URL = os.environ.get(
+    "APPROVAL_SERVICE_URL",
+    os.environ.get("DASHBOARD_URL", "http://127.0.0.1:8407"),
+)
 NOTIFICATIONS_ENDPOINT = "/api/notifications/send"
 
 

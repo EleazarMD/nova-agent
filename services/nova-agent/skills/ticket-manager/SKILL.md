@@ -48,9 +48,9 @@ parameters:
     delegate_to:
       type: string
       enum:
-        - openclaw
+        - hub
         - windsurf
-      description: "Delegate ticket to OpenClaw (minor fixes) or Windsurf (structural) (for delegate)"
+      description: "Delegate ticket to Hub agent (minor fixes) or Windsurf (structural) (for delegate)"
     limit:
       type: string
       description: "Max tickets to return (for list, default 10)"

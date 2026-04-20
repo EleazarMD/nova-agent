@@ -414,19 +414,19 @@ VALIDATION_TOOLS = {
     "service_health_check",  # Homelab - validates infrastructure claims
 }
 
-# OpenClaw delegation - special case: can be BOTH action AND validation
+# Hub delegation - special case: can be BOTH action AND validation
 # depending on the task. When task involves research/lookup, it's validation.
-DELEGATED_VALIDATION_TOOL = "openclaw_delegate"
+DELEGATED_VALIDATION_TOOL = "hub_delegate"
 
-# OpenClaw skills that provide validation data (grounded facts)
-OPENCLAW_VALIDATION_SKILLS = {
-    "browser-search",       # Web research via browser
+# Hub agent skills that provide validation data (grounded facts)
+HUB_VALIDATION_SKILLS = {
+    "browser-search",       # Web research via Argus
     "browser-navigate",     # Page content extraction
     "hermes-email",         # Email search/read
     "hermes-calendar",      # Calendar lookup
     "homelab-diagnostics",  # Infrastructure investigation
-    "research",             # Deep research tasks
-    "fact-check",           # Fact verification
+    "research",             # Deep research tasks (Atlas)
+    "fact-check",           # Fact verification (Atlas)
 }
 
 # Tools that are actions, not validations (don't use for hypothesis)
@@ -435,7 +435,7 @@ ACTION_TOOLS = {
     "set_reminder",
     "save_memory",
     "forget_memory",
-    # Note: openclaw_delegate is handled specially - can be action OR validation
+    # Note: hub_delegate is handled specially - can be action OR validation
     "service_restart",
     "service_start",
     "service_stop",
@@ -471,13 +471,13 @@ def classify_tool(tool_name: str) -> str:
     return "unknown"
 
 
-def is_openclaw_validation_task(task: str) -> bool:
+def is_hub_validation_task(task: str) -> bool:
     """
-    Determine if an OpenClaw delegation task is for validation (research/lookup)
+    Determine if a Hub delegation task is for validation (research/lookup)
     vs action (purchase, send email, etc.).
     
     Args:
-        task: The task description passed to openclaw_delegate.
+        task: The task description passed to hub_delegate.
     
     Returns:
         True if the task appears to be research/validation oriented.
@@ -510,41 +510,41 @@ def is_openclaw_validation_task(task: str) -> bool:
     return has_validation
 
 
-def get_openclaw_citation(task: str, skills_used: Optional[list[str]] = None) -> Citation:
+def get_hub_citation(task: str, skills_used: Optional[list[str]] = None) -> Citation:
     """
-    Generate a citation for OpenClaw delegation based on task and skills.
+    Generate a citation for Hub delegation based on task and skills.
     
     Args:
         task: The task description.
-        skills_used: Optional list of OpenClaw skills that were invoked.
+        skills_used: Optional list of Hub agent skills that were invoked.
     
     Returns:
-        A Citation object for the OpenClaw result.
+        A Citation object for the Hub agent result.
     """
     task_lower = task.lower()
     
     # Determine source type based on task/skills
     if skills_used:
         if any(s in skills_used for s in ["browser-search", "browser-navigate"]):
-            return Citation("OpenClaw Browser Research", source_type="web")
+            return Citation("Argus Browser Research", source_type="web")
         elif any(s in skills_used for s in ["hermes-email"]):
-            return Citation("OpenClaw Email Search", source_type="api")
+            return Citation("CIG Email Search", source_type="api")
         elif any(s in skills_used for s in ["hermes-calendar"]):
-            return Citation("OpenClaw Calendar", source_type="api")
+            return Citation("CIG Calendar", source_type="api")
         elif any(s in skills_used for s in ["homelab-diagnostics"]):
-            return Citation("OpenClaw Infrastructure Analysis", source_type="api")
+            return Citation("Infra Agent Diagnostics", source_type="api")
     
     # Infer from task description
     if "email" in task_lower:
-        return Citation("OpenClaw Email Research", source_type="api")
+        return Citation("CIG Email Research", source_type="api")
     elif "calendar" in task_lower or "schedule" in task_lower or "meeting" in task_lower:
-        return Citation("OpenClaw Calendar Research", source_type="api")
+        return Citation("CIG Calendar Research", source_type="api")
     elif "price" in task_lower or "cost" in task_lower or "buy" in task_lower:
-        return Citation("OpenClaw Market Research", source_type="web")
+        return Citation("Argus Market Research", source_type="web")
     elif "homelab" in task_lower or "container" in task_lower or "service" in task_lower:
-        return Citation("OpenClaw Infrastructure Analysis", source_type="api")
+        return Citation("Infra Agent Diagnostics", source_type="api")
     
-    return Citation("OpenClaw Research", source_type="web")
+    return Citation("Hub Agent Research", source_type="web")
 
 
 def should_use_hypothesis(tool_names: list[str]) -> bool:

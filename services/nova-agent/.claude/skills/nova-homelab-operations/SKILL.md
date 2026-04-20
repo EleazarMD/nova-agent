@@ -31,7 +31,7 @@ Manage Docker containers and infrastructure services with tiered safety controls
 ## Managed Containers
 
 - Hermes Intelligence: cig, hermes-chromadb, hermes-neo4j
-- OpenClaw: openclaw-novnc, openclaw-inference
+- Pi Agent Hub: pi-agent-hub
 - PIC/PKB: pkb-api, pkb-neo4j, pkb-redis
 - AI Inferencing: ai-inferencing
 - Dashboard: ecosystem-dashboard

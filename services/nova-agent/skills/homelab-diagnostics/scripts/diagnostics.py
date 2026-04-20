@@ -3,9 +3,9 @@
 Homelab Diagnostics Script for Nova Agent
 
 Provides comprehensive infrastructure health monitoring:
-- OpenClaw gateway status
+- Pi Agent Hub status
 - AI Inferencing service health
-- Hermes Core connectivity
+- CIG connectivity
 - Component status checks
 - Hermy score calculation
 - Error investigation
@@ -24,9 +24,9 @@ import aiohttp
 
 
 # Service URLs
-OPENCLAW_URL = os.environ.get("OPENCLAW_URL", "http://127.0.0.1:18793")
+PI_AGENT_HUB_URL = os.environ.get("PI_AGENT_HUB_URL", "http://127.0.0.1:18793")
 AI_INFERENCING_URL = os.environ.get("AI_INFERENCING_URL", "http://localhost:9000")
-HERMES_CORE_URL = os.environ.get("HERMES_CORE_URL", "http://localhost:8780")
+CIG_URL = os.environ.get("CIG_URL", os.environ.get("HERMES_CORE_URL", "http://localhost:8780"))
 AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1")
 AI_INFERENCING_ADMIN_KEY = os.environ.get("AI_INFERENCING_ADMIN_KEY", "ai-inferencing-admin-key-2024")
 
@@ -44,18 +44,18 @@ def load_component_registry() -> Dict[str, Any]:
         return {"components": {}}
 
 
-async def check_openclaw_health() -> Dict[str, Any]:
-    """Check OpenClaw gateway health and status."""
+async def check_pi_agent_hub_health() -> Dict[str, Any]:
+    """Check Pi Agent Hub health and status."""
     result = {
         "status": "unknown",
-        "gateway_running": False,
+        "hub_running": False,
         "details": {}
     }
     
     try:
-        # Check if openclaw-gateway service is running
+        # Check if pi-agent-hub service is running
         proc = await asyncio.create_subprocess_exec(
-            "systemctl", "--user", "is-active", "openclaw-gateway",
+            "systemctl", "is-active", "pi-agent-hub",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -63,32 +63,7 @@ async def check_openclaw_health() -> Dict[str, Any]:
         is_active = stdout.decode().strip() == "active"
         
         if is_active:
-            result["gateway_running"] = True
-            
-            # Get service status details
-            proc = await asyncio.create_subprocess_exec(
-                "systemctl", "--user", "status", "openclaw-gateway", "--no-pager",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await proc.communicate()
-            status_output = stdout.decode()
-            
-            # Parse PID and uptime from status
-            for line in status_output.split('\n'):
-                if 'Main PID:' in line:
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        result["details"]["gateway_pid"] = int(parts[2])
-                elif 'Active:' in line and 'since' in line:
-                    result["details"]["last_start"] = line.split('since')[1].split(';')[0].strip()
-            
-            # Check config file
-            config_path = os.path.expanduser("~/.openclaw/openclaw.json")
-            if os.path.exists(config_path):
-                result["details"]["config_valid"] = True
-                result["details"]["config_path"] = config_path
-            
+            result["hub_running"] = True
             result["status"] = "healthy"
         else:
             result["status"] = "stopped"
@@ -130,8 +105,8 @@ async def check_ai_inferencing_health() -> Dict[str, Any]:
     return result
 
 
-async def check_hermes_health() -> Dict[str, Any]:
-    """Check Hermes Core health."""
+async def check_cig_health() -> Dict[str, Any]:
+    """Check CIG health."""
     result = {
         "status": "unknown",
         "service_running": False,
@@ -141,7 +116,7 @@ async def check_hermes_health() -> Dict[str, Any]:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"{HERMES_CORE_URL}/health",
+                f"{CIG_URL}/health",
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
                 if resp.status == 200:
@@ -248,14 +223,14 @@ async def full_diagnostics() -> Dict[str, Any]:
     """Run full homelab diagnostics."""
     
     # Check all components
-    openclaw = await check_openclaw_health()
+    hub = await check_pi_agent_hub_health()
     ai_inferencing = await check_ai_inferencing_health()
-    hermes = await check_hermes_health()
+    cig = await check_cig_health()
     
     components = {
-        "openclaw": openclaw,
+        "pi_agent_hub": hub,
         "ai_inferencing": ai_inferencing,
-        "hermes_core": hermes
+        "cig": cig
     }
     
     # Calculate Hermy score
@@ -296,24 +271,24 @@ async def main():
     """Main entry point."""
     if len(sys.argv) < 2:
         print("Usage: diagnostics.py <action>")
-        print("Actions: full_diagnostics, openclaw_health, ai_inferencing_health, hermes_health, hermy_score")
+        print("Actions: full_diagnostics, pi_agent_hub_health, ai_inferencing_health, cig_health, hermy_score")
         sys.exit(1)
     
     action = sys.argv[1]
     
     if action == "full_diagnostics":
         result = await full_diagnostics()
-    elif action == "openclaw_health":
-        result = await check_openclaw_health()
+    elif action == "pi_agent_hub_health":
+        result = await check_pi_agent_hub_health()
     elif action == "ai_inferencing_health":
         result = await check_ai_inferencing_health()
-    elif action == "hermes_health":
-        result = await check_hermes_health()
+    elif action == "cig_health":
+        result = await check_cig_health()
     elif action == "hermy_score":
         components = {
-            "openclaw": await check_openclaw_health(),
+            "pi_agent_hub": await check_pi_agent_hub_health(),
             "ai_inferencing": await check_ai_inferencing_health(),
-            "hermes_core": await check_hermes_health()
+            "cig": await check_cig_health()
         }
         result = await calculate_hermy_score(components)
     else:

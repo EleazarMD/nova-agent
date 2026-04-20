@@ -11,7 +11,7 @@ Data flow:
   Mid-session   → get_preferences() / get_identity() (from cache)
   User states   → record_observation() → PCG → cache invalidated
   Knowledge     → query() → PCG /api/kg/search + /api/pcg/preferences
-  OpenClaw task → POST /api/pcg/learn → PCG (write-through)
+  Hub agent task → POST /api/pcg/learn → PCG (write-through)
 """
 
 import os
@@ -272,7 +272,7 @@ async def create_preference(
 
 
 # ---------------------------------------------------------------------------
-# Knowledge graph queries (formerly KG-API)
+# Knowledge graph queries
 # ---------------------------------------------------------------------------
 
 async def search_knowledge(query: str, entity_types: Optional[list[str]] = None) -> list[dict]:

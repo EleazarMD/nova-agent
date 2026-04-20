@@ -456,6 +456,25 @@ async def run_bot(
                 logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=error | err={e}")
                 result = f"Tool execution error: {str(e)}"
             
+            # Structured-card support: tools may return a dict of the shape
+            #   {"speakable": "<text for LLM/TTS>", "card": {"kind": "...", ...}}
+            # in which case we forward the card to iOS as a server message and
+            # only feed the speakable text back to the LLM. Falls through to
+            # normal string handling for every other tool.
+            if isinstance(result, dict) and "card" in result and "speakable" in result:
+                card_payload = result.get("card") or {}
+                try:
+                    await _send_server_msg({
+                        "type": "card",
+                        "kind": card_payload.get("kind", "generic"),
+                        "tool": tool_name,
+                        "data": card_payload,
+                    })
+                    logger.info(f"Emitted card ({card_payload.get('kind')}) for tool {tool_name}")
+                except Exception as e:
+                    logger.error(f"Failed to emit card for {tool_name}: {e}")
+                result = str(result.get("speakable") or "")
+
             # Validate result is not empty
             result_str = str(result) if result is not None else ""
             if not result_str or not result_str.strip():
@@ -529,6 +548,7 @@ async def run_bot(
     llm.register_function("service_start", make_tool_handler("service_start"))
     llm.register_function("service_stop", make_tool_handler("service_stop"))
     llm.register_function("service_health_check", make_tool_handler("service_health_check"))
+    llm.register_function("homelab_heartbeat", make_tool_handler("homelab_heartbeat"))
 
     # ── Tesla vehicle control (unified tool + legacy compatibility) ───────
     llm.register_function("tesla_control", make_tool_handler("tesla_control"))

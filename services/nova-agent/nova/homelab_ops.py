@@ -31,8 +31,8 @@ from nova.hermes_auth import generate_hermes_jwt
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Hermes Core — email/calendar intelligence service
-HERMES_CORE_URL = os.environ.get("HERMES_CORE_URL", "http://localhost:8780")
+# CIG (Communications Intelligence Graph) — email/calendar/contact intelligence
+CIG_URL = os.environ.get("CIG_URL", os.environ.get("HERMES_CORE_URL", "http://localhost:8780"))
 
 # AI Inferencing — centralized API key vault and telemetry
 AI_INFERENCING_URL = os.environ.get("AI_INFERENCING_URL", "http://localhost:9000")
@@ -47,23 +47,15 @@ MANAGED_CONTAINERS = {
     "cig",
     "hermes-chromadb",
     "hermes-neo4j",
-    "openclaw",
-    "openclaw-novnc",
-    "openclaw-inference",
     "ai-gateway-postgres",
     "ai-gateway-redis",
     "ai-inferencing",
-    "comfyui",
     "nim-embeddings",
-    "story-intelligence",
-    "story-neo4j",
-    "story-pgvector",
-    "openclaw-browser",  # systemd user service (not Docker)
 }
 
 # Systemd user services that need --user flag
 SYSTEMD_USER_SERVICES = {
-    "openclaw-browser",
+    # Currently empty — add user-scoped services here if needed
 }
 
 # Containers that should NEVER be touched by any agent
@@ -246,8 +238,8 @@ async def handle_service_logs(container: str, lines: int = 50) -> str:
     return f"Last {lines} log lines from {container}:\n{output}"
 
 
-async def _probe_hermes_health() -> dict[str, Any]:
-    """Probe Hermes Core application-level health: email, calendar, databases.
+async def _probe_cig_health() -> dict[str, Any]:
+    """Probe CIG application-level health: email, calendar, databases.
 
     Returns a structured dict with status, email counts, calendar stats,
     and component health (Neo4j, ChromaDB, LLM gateway).
@@ -262,7 +254,7 @@ async def _probe_hermes_health() -> dict[str, Any]:
         async with aiohttp.ClientSession() as session:
             # 1. Core health endpoint — email counts + component status
             async with session.get(
-                f"{HERMES_CORE_URL}/health", timeout=timeout
+                f"{CIG_URL}/health", timeout=timeout
             ) as resp:
                 if resp.status != 200:
                     result["error"] = f"HTTP {resp.status}"
@@ -281,7 +273,7 @@ async def _probe_hermes_health() -> dict[str, Any]:
             # 2. Calendar stats (non-fatal if unavailable)
             try:
                 async with session.get(
-                    f"{HERMES_CORE_URL}/v1/calendar/neo4j/stats",
+                    f"{CIG_URL}/v1/calendar/neo4j/stats",
                     headers=hermes_headers,
                     timeout=timeout,
                 ) as cal_resp:
@@ -296,7 +288,7 @@ async def _probe_hermes_health() -> dict[str, Any]:
                 result["calendar"] = {"error": "calendar stats unavailable"}
 
     except asyncio.TimeoutError:
-        result["error"] = "timeout (Hermes Core not responding)"
+        result["error"] = "timeout (CIG not responding)"
     except Exception as e:
         result["error"] = str(e)
 
@@ -351,7 +343,7 @@ async def _probe_ai_inferencing_health() -> dict[str, Any]:
 async def handle_service_health_check(container: str = "") -> str:
     """Deep health check: container status + ports + application-level probes.
 
-    When no container is specified, also probes Hermes Core's application
+    When no container is specified, also probes CIG's application
     health to report email/calendar/database status alongside container state.
     """
     if container:
@@ -374,13 +366,13 @@ async def handle_service_health_check(container: str = "") -> str:
         if rc == 0 and stdout:
             parts.append(f"  Ports: {stdout.replace(chr(10), ', ')}")
 
-        # If checking a Hermes container, also probe application health
+        # If checking CIG container, also probe application health
         if container == "cig":
-            hermes = await _probe_hermes_health()
-            if hermes.get("reachable"):
-                comps = hermes.get("components", {})
-                emails = hermes.get("emails", {})
-                parts.append(f"  App Status: {hermes.get('status', '?')}")
+            cig = await _probe_cig_health()
+            if cig.get("reachable"):
+                comps = cig.get("components", {})
+                emails = cig.get("emails", {})
+                parts.append(f"  App Status: {cig.get('status', '?')}")
                 parts.append(
                     f"  Emails: {emails.get('total', 0):,} total "
                     f"({emails.get('inbox', 0):,} inbox, {emails.get('sent', 0):,} sent)"
@@ -390,7 +382,7 @@ async def handle_service_health_check(container: str = "") -> str:
                     f"ChromaDB: {comps.get('chromadb', '?')}, "
                     f"LLM: {comps.get('llm_gateway', '?')}"
                 )
-                cal = hermes.get("calendar", {})
+                cal = cig.get("calendar", {})
                 if cal and not cal.get("error"):
                     parts.append(
                         f"  Calendar: {cal.get('calendars', 0)} calendars, "
@@ -398,7 +390,7 @@ async def handle_service_health_check(container: str = "") -> str:
                         f"last sync: {cal.get('last_sync', '?')}"
                     )
             else:
-                parts.append(f"  App Probe: FAILED — {hermes.get('error', 'unreachable')}")
+                parts.append(f"  App Probe: FAILED — {cig.get('error', 'unreachable')}")
 
         return "\n".join(parts)
 
@@ -418,16 +410,16 @@ async def handle_service_health_check(container: str = "") -> str:
     # Application-level probes for data services
     app_probes = []
     
-    # Probe Hermes Core
-    hermes = await _probe_hermes_health()
-    if hermes.get("reachable"):
-        comps = hermes.get("components", {})
-        emails = hermes.get("emails", {})
+    # Probe CIG
+    cig = await _probe_cig_health()
+    if cig.get("reachable"):
+        comps = cig.get("components", {})
+        emails = cig.get("emails", {})
         neo4j_ok = comps.get("neo4j", "?") in ("connected", "healthy", "ok")
         chroma_ok = comps.get("chromadb", "?") in ("connected", "healthy", "ok")
         llm_ok = comps.get("llm_gateway", "?") in ("connected", "healthy", "ok", "reachable")
         app_probes.append(
-            f"- Hermes Email: {hermes.get('status', '?')} — "
+            f"- CIG Email: {cig.get('status', '?')} — "
             f"{emails.get('total', 0):,} emails indexed "
             f"({emails.get('inbox', 0):,} inbox, {emails.get('sent', 0):,} sent)"
         )
@@ -436,15 +428,15 @@ async def handle_service_health_check(container: str = "") -> str:
             f"ChromaDB={'OK' if chroma_ok else comps.get('chromadb', '?')}, "
             f"LLM Gateway={'OK' if llm_ok else comps.get('llm_gateway', '?')}"
         )
-        cal = hermes.get("calendar", {})
+        cal = cig.get("calendar", {})
         if cal and not cal.get("error"):
             app_probes.append(
-                f"- Hermes Calendar: {cal.get('calendars', 0)} calendars, "
+                f"- CIG Calendar: {cal.get('calendars', 0)} calendars, "
                 f"{cal.get('events', 0)} events, last sync: {cal.get('last_sync', '?')}"
             )
     else:
         app_probes.append(
-            f"- Hermes Core: UNREACHABLE — {hermes.get('error', 'cannot connect to ' + HERMES_CORE_URL)}"
+            f"- CIG: UNREACHABLE — {cig.get('error', 'cannot connect to ' + CIG_URL)}"
         )
 
     # Probe AI Inferencing

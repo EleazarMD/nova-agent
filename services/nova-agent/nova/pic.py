@@ -2,7 +2,7 @@
 PIC (Personal Identity Core) client for Nova Agent.
 
 PIC is the **single source of truth** for personal data across all homelab agents.
-Architecture: Option B — Nova has direct bidirectional access to PIC. OpenClaw
+Architecture: Option B — Nova has direct bidirectional access to PIC. Hub agents
 consumes PIC data (read-only MEMORY.md rendered from PIC) and writes discoveries
 back through PIC's observation API.
 
@@ -10,7 +10,7 @@ Data flow:
   Session start → build_pic_context() → system prompt (cached in-process)
   Mid-session   → get_preferences() / get_identity() (from cache)
   User states   → record_observation() → PIC → cache invalidated
-  OpenClaw task → POST /api/pic/learn → PIC (write-through)
+  Hub agent task → POST /api/pic/learn → PIC (write-through)
 
 Backed by: Neo4j (graph) + Redis (cache) at :8765
 """

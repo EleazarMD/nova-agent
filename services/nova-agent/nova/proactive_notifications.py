@@ -5,7 +5,7 @@ Integrates EventBus with push notifications and real-time streaming.
 Provides:
 - Calendar alerts (meeting approaching)
 - Email notifications (urgent emails)
-- Job completions (OpenClaw, background tasks)
+- Job completions (Pi Agent Hub, background tasks)
 - Service alerts (system issues)
 - Tesla status (charge complete, climate ready)
 

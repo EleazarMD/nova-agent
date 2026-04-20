@@ -30,12 +30,12 @@ from loguru import logger
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Use dashboard approval API (port 8404) - standalone approval-service removed
+# Standalone approval-service microservice (JIT Zero-Tolerance Infrastructure Approvals, port 8407)
 APPROVAL_SERVICE_URL = os.environ.get(
-    "APPROVAL_SERVICE_URL", "http://localhost:8404"
+    "APPROVAL_SERVICE_URL", "http://127.0.0.1:8407"
 )
 DASHBOARD_API_URL = os.environ.get(
-    "DASHBOARD_API_URL", "http://localhost:8404"
+    "DASHBOARD_API_URL", "http://127.0.0.1:8407"
 )
 
 # Operational mode expires after this duration
@@ -51,7 +51,7 @@ VOICE_AGENT_OPERATIONAL_SCOPE = {
     "list_processes",
     
     # Repairs (voice verification required)
-    "restart_service",           # Hermes, OpenClaw, Dashboard
+    "restart_service",           # CIG, Dashboard, etc.
     "refresh_config",
     "reload_nginx",
     "clear_cache",

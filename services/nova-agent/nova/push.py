@@ -11,15 +11,18 @@ from loguru import logger
 
 from nova.events import Event, event_bus
 
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://127.0.0.1:8404")
-# Use AI_GATEWAY_API_KEY for the dashboard's X-API-Key auth (matches ecosystem-dashboard)
+# Standalone approval-service microservice (JIT Zero-Tolerance Infrastructure Approvals)
+APPROVAL_SERVICE_URL = os.environ.get(
+    "APPROVAL_SERVICE_URL",
+    os.environ.get("DASHBOARD_URL", "http://127.0.0.1:8407"),
+)
+# Matches INTERNAL_API_KEY on approval-service; kept name for backward-compat.
 DASHBOARD_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
 
 
 async def send_push(user_id: str, title: str, body: str, data: dict | None = None):
-    """Send a push notification via the Dashboard APNs proxy."""
-    # Correct endpoint is /api/notifications/send (not /api/push/send)
-    url = f"{DASHBOARD_URL}/api/notifications/send"
+    """Send a push notification via the approval-service APNs endpoint."""
+    url = f"{APPROVAL_SERVICE_URL}/api/notifications/send"
     headers = {
         "Content-Type": "application/json",
         "X-API-Key": DASHBOARD_API_KEY,

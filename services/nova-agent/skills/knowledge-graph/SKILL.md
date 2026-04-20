@@ -67,24 +67,24 @@ Weave the graph context into your answer about infrastructure.
 <example>
 User: What services depend on AI Gateway?
 Assistant: [call kg_query query="AI Gateway dependencies"]
-Result: Nova Agent, Hermes Core, OpenClaw all depend on AI Gateway
-Assistant: AI Gateway is used by Nova Agent, Hermes Core, and OpenClaw for LLM routing.
+Result: Nova Agent, CIG, Pi Agent Hub all depend on AI Gateway
+Assistant: AI Gateway is used by Nova Agent, CIG, and Pi Agent Hub for LLM routing.
 </example>
 
 <example>
 User: What does Nova integrate with?
 Assistant: [call kg_query query="Nova Agent integrations"]
-Result: AI Gateway (LLM routing), Hermes Core (email/calendar), Tesla Relay, OpenClaw
-Assistant: Nova integrates with AI Gateway for LLM calls, Hermes Core for email and calendar,
-Tesla Relay for vehicle control, and delegates complex tasks to OpenClaw.
+Result: AI Gateway (LLM routing), CIG (email/calendar), Tesla Relay, Pi Agent Hub
+Assistant: Nova integrates with AI Gateway for LLM calls, CIG for email and calendar,
+Tesla Relay for vehicle control, and delegates complex tasks to Pi Agent Hub.
 </example>
 
 <example>
 User: Why is my email not working?
 Assistant: Let me check the email service dependencies—
-[call kg_query query="Hermes Core dependencies"]
-Result: Hermes Core depends on Neo4j, ChromaDB, and AI Gateway
-Assistant: Hermes Core (email service) depends on Neo4j, ChromaDB, and AI Gateway.
+[call kg_query query="CIG dependencies"]
+Result: CIG depends on Neo4j, ChromaDB, and AI Gateway
+Assistant: CIG (email/calendar service) depends on Neo4j, ChromaDB, and AI Gateway.
 If any of those are down, email won't work. Want me to check their status?
 </example>
 
@@ -96,7 +96,7 @@ If any of those are down, email won't work. Want me to check their status?
 | `Component` | Infrastructure components (databases, queues) |
 | `Database` | Data stores (Neo4j, ChromaDB, PostgreSQL) |
 | `Integration` | External integrations (Tesla, email providers) |
-| `Agent` | AI agents (Nova, OpenClaw worker) |
+| `Agent` | AI agents (Nova, Hub agents) |
 
 ## Technical Details
 

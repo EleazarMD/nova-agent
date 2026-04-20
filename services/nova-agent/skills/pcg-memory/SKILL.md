@@ -27,7 +27,7 @@ PIC is the **single source of truth** for personal data across all homelab agent
 - Session start → `build_pic_context()` → system prompt (cached)
 - Mid-session → `get_preferences()` / `get_identity()` (from cache)
 - User states preference → `record_observation()` → PIC → cache invalidated
-- OpenClaw discoveries → POST `/api/pic/learn` → PIC (write-through)
+- Hub agent discoveries → POST `/api/pic/learn` → PIC (write-through)
 
 **Backend:** Neo4j (graph) + Redis (cache)
 

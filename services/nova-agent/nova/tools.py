@@ -133,7 +133,7 @@ AI_GATEWAY_BUDGET_OVERRIDE = os.environ.get("AI_GATEWAY_BUDGET_OVERRIDE", "")
 WORKSTATION_MONITOR_URL = os.environ.get("WORKSTATION_MONITOR_URL", "http://localhost:8404")
 NETDIAG_URL = os.environ.get("NETDIAG_URL", "http://localhost:8405")
 ECOSYSTEM_URL = os.environ.get("ECOSYSTEM_URL", "http://localhost:8404")
-HERMES_CORE_URL = os.environ.get("HERMES_CORE_URL", "http://localhost:8780")
+CIG_URL = os.environ.get("CIG_URL", os.environ.get("HERMES_CORE_URL", "http://localhost:8780"))
 HERMES_JWT_TOKEN = os.environ.get("HERMES_JWT_TOKEN", "")
 ECOSYSTEM_API_KEY = os.environ.get("ECOSYSTEM_API_KEY", "ai-gateway-api-key-2024")
 ECOSYSTEM_USER_ID = os.environ.get("ECOSYSTEM_USER_ID", "dfd9379f-a9cd-4241-99e7-140f5e89e3cd")
@@ -667,7 +667,7 @@ TOOL_DEFINITIONS = [
             "name": "service_health_check",
             "description": (
                 "Deep health check on homelab infrastructure — container state, ports, image, "
-                "PLUS application-level probes for Hermes Core (email counts, calendar stats, "
+                "PLUS application-level probes for CIG (email counts, calendar stats, "
                 "Neo4j/ChromaDB/LLM Gateway database status). "
                 "Use for: 'health check all services', 'homelab status', 'is hermes healthy', "
                 "'how are the email and calendar databases', 'deep check on hermes'. Read-only. "
@@ -1432,9 +1432,18 @@ for _sd in _skill_defs:
 # Tool handlers
 # ---------------------------------------------------------------------------
 
-async def handle_get_weather(location: str) -> str:
+async def handle_get_weather(location: str):
     """Get weather using OpenWeatherMap API (industry standard, reliable geocoding).
-    API key fetched from AI Inferencing Service (centralized key vault)."""
+    API key fetched from AI Inferencing Service (centralized key vault).
+
+    Returns a dict with:
+      - ``speakable``: short prose string fed back to the LLM as the tool result
+        (what the model paraphrases for the voice reply).
+      - ``card``: structured payload (``kind='weather'``) that bot.py forwards to
+        the iOS client as a ``{"type":"card"}`` server message so Hyperspace can
+        render a real weather card in the transcript bubble. This is how we get
+        "table-style" rendering without polluting TTS output with markdown pipes.
+    Falls back to a plain string on error paths (LLM-only, no card)."""
     api_key = await _fetch_provider_key("openweathermap")
     if not api_key:
         logger.error("OpenWeatherMap key unavailable from AI Inferencing, falling back to wttr.in")
@@ -1477,14 +1486,45 @@ async def handle_get_weather(location: str) -> str:
                 main = data.get("main", {})
                 weather = data.get("weather", [{}])[0]
                 wind = data.get("wind", {})
-                
-                temp = main.get("temp", "?")
-                humidity = main.get("humidity", "?")
-                wind_speed = wind.get("speed", "?")
+
+                temp = main.get("temp")
+                feels_like = main.get("feels_like")
+                temp_min = main.get("temp_min")
+                temp_max = main.get("temp_max")
+                humidity = main.get("humidity")
+                pressure = main.get("pressure")
+                wind_speed = wind.get("speed")
+                wind_deg = wind.get("deg")
                 desc = weather.get("description", "Unknown conditions").capitalize()
-                
+                icon = weather.get("icon")
+                weather_main = weather.get("main")
+
                 place = f"{name}, {country}" if country else name
-                return f"{place}: {desc}, {temp}°F, {humidity}% humidity, wind {wind_speed} mph"
+                speakable = (
+                    f"{place}: {desc}, "
+                    f"{temp if temp is not None else '?'}°F, "
+                    f"{humidity if humidity is not None else '?'}% humidity, "
+                    f"wind {wind_speed if wind_speed is not None else '?'} mph"
+                )
+                return {
+                    "speakable": speakable,
+                    "card": {
+                        "kind": "weather",
+                        "location": place,
+                        "condition": desc,
+                        "conditionCode": weather_main,
+                        "iconCode": icon,
+                        "tempF": temp,
+                        "feelsLikeF": feels_like,
+                        "tempMinF": temp_min,
+                        "tempMaxF": temp_max,
+                        "humidityPct": humidity,
+                        "pressureHpa": pressure,
+                        "windMph": wind_speed,
+                        "windDeg": wind_deg,
+                        "source": "openweathermap",
+                    },
+                }
     except Exception as e:
         logger.error(f"OpenWeatherMap error: {e}")
         return await _wttr_fallback(location)
@@ -1723,6 +1763,7 @@ async def handle_hub_delegate(
         "infra": {
             "health": "health",
             "status": "health",
+            "diagnose": "agents.run",
             "restart": "agents.run",
             "monitor": "agents.run",
         },
@@ -2202,14 +2243,14 @@ async def handle_check_studio(
     """Read status/results from homelab studios via ecosystem dashboard API."""
     base = ECOSYSTEM_URL
     headers = {"X-API-Key": ECOSYSTEM_API_KEY}
-    hermes = HERMES_CORE_URL
-    # Generate JWT token dynamically for Hermes Core authentication
+    hermes = CIG_URL
+    # Generate JWT token dynamically for CIG authentication
     hermes_token = generate_hermes_jwt()
     hermes_headers = {"Authorization": f"Bearer {hermes_token}"}
     try:
         async with aiohttp.ClientSession() as session:
 
-            # --- Calendar (via Hermes Core :8780) ---
+            # --- Calendar (via CIG :8780) ---
             if studio == "calendar":
                 timeout = aiohttp.ClientTimeout(total=12)
 
@@ -2345,7 +2386,7 @@ async def handle_check_studio(
                             lines.append(f"- {title} ({start})")
                         return f"{len(events)} upcoming events:\n" + "\n".join(lines)
 
-            # --- Email Intelligence (via Hermes Core :8780) ---
+            # --- Email Intelligence (via CIG :8780) ---
             elif studio == "email":
                 timeout = aiohttp.ClientTimeout(total=12)
 
@@ -2354,7 +2395,7 @@ async def handle_check_studio(
                     url = f"{hermes}/health"
                     async with session.get(url, timeout=timeout) as resp:
                         if resp.status != 200:
-                            return None, f"Hermes Core returned HTTP {resp.status}."
+                            return None, f"CIG returned HTTP {resp.status}."
                         return await resp.json(), None
 
                 if action == "briefing":
@@ -4522,14 +4563,14 @@ HOMELAB_DIAGNOSTICS_TOOL = {
     "type": "function",
     "function": {
         "name": "homelab_diagnostics",
-        "description": "Run comprehensive AI Homelab infrastructure diagnostics. Check Argus status, AI Inferencing health, Hermes Core connectivity, and calculate Hermy score (overall health 0-100). Use for system health queries, error investigations, or component status checks.",
+        "description": "Run comprehensive AI Homelab infrastructure diagnostics. Check Pi Agent Hub status, AI Inferencing health, CIG connectivity, and calculate Hermy score (overall health 0-100). Use for system health queries, error investigations, or component status checks.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["full_diagnostics", "argus_health", "ai_inferencing_health", "hermes_health", "hermy_score"],
-                    "description": "Diagnostic action: full_diagnostics (complete report), argus_health (browser agent status), ai_inferencing_health (key vault), hermes_health (email/calendar), hermy_score (0-100 health score)",
+                    "enum": ["full_diagnostics", "hub_health", "ai_inferencing_health", "cig_health", "hermy_score"],
+                    "description": "Diagnostic action: full_diagnostics (complete report), hub_health (Pi Agent Hub status), ai_inferencing_health (key vault), cig_health (email/calendar), hermy_score (0-100 health score)",
                 },
             },
             "required": ["action"],
@@ -4542,6 +4583,99 @@ TOOL_DEFINITIONS.append(HOMELAB_DIAGNOSTICS_TOOL)
 
 # Register handler
 TOOL_HANDLERS["homelab_diagnostics"] = handle_homelab_diagnostics
+
+# ---------------------------------------------------------------------------
+# Homelab Heartbeat — instant ecosystem status from monitor (Tier 0)
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_STATE_PATH = Path(
+    os.getenv("HOMELAB_MEMORY_DIR", "/home/eleazar/Projects/AIHomelab/memory")
+) / "heartbeat-state.json"
+
+async def handle_homelab_heartbeat(**kwargs) -> str:
+    """Read the latest ecosystem heartbeat from the homelab monitor.
+
+    Tier 0 — reads a local file, no network calls, instant response.
+    The homelab-monitor systemd timer writes heartbeat-state.json every 2 minutes
+    with the status of all 15 monitored services.
+    """
+    try:
+        if not HEARTBEAT_STATE_PATH.exists():
+            return (
+                "Homelab heartbeat not available yet. "
+                "The monitor service (homelab-monitor.timer) may not have run yet. "
+                "Use service_health_check for a live probe instead."
+            )
+
+        with open(HEARTBEAT_STATE_PATH) as f:
+            data = json.load(f)
+
+        status = data.get("status", "unknown")
+        last_check = data.get("lastCheck", "unknown")
+        services = data.get("services", {})
+        alerts = data.get("alerts", [])
+        metrics = data.get("metrics", {})
+
+        # Count by status
+        healthy = sum(1 for s in services.values() if s == "healthy")
+        degraded = sum(1 for s in services.values() if s == "degraded")
+        unhealthy = sum(1 for s in services.values() if s == "unhealthy")
+        total = len(services)
+
+        # Build summary
+        lines = [f"Ecosystem status: {status.upper()}"]
+        lines.append(f"Last check: {last_check}")
+        lines.append(f"Services: {healthy}/{total} healthy, {degraded} degraded, {unhealthy} unhealthy")
+
+        if alerts:
+            lines.append(f"Alerts ({len(alerts)}):")
+            for a in alerts:
+                lines.append(f"  - {a}")
+        else:
+            lines.append("No active alerts.")
+
+        if metrics:
+            lines.append(
+                f"System: CPU {metrics.get('cpuPercent', '?')}%, "
+                f"MEM {metrics.get('memoryPercent', '?')}%, "
+                f"DISK {metrics.get('diskPercent', '?')}%"
+            )
+
+        # List unhealthy/degraded services
+        problem_svcs = {n: s for n, s in services.items() if s in ("unhealthy", "degraded", "not_found")}
+        if problem_svcs:
+            lines.append("Problem services:")
+            for name, st in sorted(problem_svcs.items()):
+                lines.append(f"  - {name}: {st}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Heartbeat read error: {e}")
+        return f"Error reading heartbeat: {e}. Use service_health_check for a live probe."
+
+HOMELAB_HEARTBEAT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "homelab_heartbeat",
+        "description": (
+            "Instant ecosystem health status from the homelab monitor. "
+            "Reads the latest heartbeat (updated every 2 minutes by homelab-monitor timer). "
+            "Tier 0 — no network calls, instant response. "
+            "Use for: 'how's the homelab?', 'is everything ok?', 'quick status', "
+            "'any services down?', 'ecosystem health'. "
+            "For DEEP diagnostics on a specific problem, use hub_delegate(agent='infra', method='diagnose') instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+}
+
+TOOL_DEFINITIONS.append(HOMELAB_HEARTBEAT_TOOL)
+TOOL_HANDLERS["homelab_heartbeat"] = handle_homelab_heartbeat
 
 # ---------------------------------------------------------------------------
 # Query Frameworks Tool (Dynamic LIAM Framework Discovery)

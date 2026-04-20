@@ -1,10 +1,10 @@
-"""Secure authentication handoff for OpenClaw browser sessions.
+"""Secure authentication handoff for Hub agent browser sessions.
 
 This module provides a secure mechanism for users to authenticate on websites
-without Nova or OpenClaw ever seeing or storing passwords.
+without Nova or Hub agents ever seeing or storing passwords.
 
 Security Principles:
-1. Nova/OpenClaw NEVER sees, stores, or transmits passwords
+1. Nova/Hub agents NEVER see, store, or transmit passwords
 2. User enters credentials directly in the browser via VNC
 3. Session cookies/tokens are preserved for subsequent automation
 4. All authentication happens in the user's direct control
@@ -21,10 +21,10 @@ async def pause_for_authentication(
     progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> str:
     """
-    Pause OpenClaw automation to allow user to authenticate securely.
+    Pause Hub agent automation to allow user to authenticate securely.
     
     Flow:
-    1. OpenClaw navigates to login page
+    1. Argus agent navigates to login page
     2. Nova instructs user to sign in via VNC
     3. Waits for user confirmation
     4. Resumes automation with authenticated session
@@ -128,22 +128,22 @@ USER COMMUNICATION:
 async def handle_authenticated_task(
     task: str,
     site_name: str,
-    openclaw_delegate_fn,
+    hub_delegate_fn,
     progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> str:
     """
-    Example of how to integrate secure auth into an OpenClaw task.
+    Example of how to integrate secure auth into a Hub delegation task.
     
     Usage:
         result = await handle_authenticated_task(
             task="Order coffee from Starbucks",
             site_name="Starbucks",
-            openclaw_delegate_fn=handle_openclaw_delegate,
+            hub_delegate_fn=handle_hub_delegate,
             progress_callback=my_callback
         )
     """
     # Step 1: Navigate to site and check if auth needed
-    initial_result = await openclaw_delegate_fn(
+    initial_result = await hub_delegate_fn(
         task=f"Navigate to {site_name} and check if user is signed in. "
              f"If login page appears, stop and report 'AUTH_REQUIRED'.",
         progress_callback=progress_callback
@@ -166,4 +166,4 @@ async def handle_authenticated_task(
         )
     
     # Already authenticated or no auth needed
-    return await openclaw_delegate_fn(task=task, progress_callback=progress_callback)
+    return await hub_delegate_fn(task=task, progress_callback=progress_callback)

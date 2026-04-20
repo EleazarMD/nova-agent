@@ -134,7 +134,7 @@ def parse_args():
             "examples": [
                 "execute.py 'homelab diagnostics'",
                 "execute.py 'Tesla integration' days_back=90",
-                "execute.py 'OpenClaw' from_days=7 to_days=0",
+                "execute.py 'Hub delegation' from_days=7 to_days=0",
             ],
         }
     

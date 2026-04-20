@@ -1,6 +1,6 @@
 ---
 name: nova-homelab-diagnostics
-description: Run comprehensive infrastructure health checks on AI Homelab services. Check OpenClaw, AI Inferencing, Hermes Core, and calculate Hermy scores.
+description: Run comprehensive infrastructure health checks on AI Homelab services. Check Pi Agent Hub, AI Inferencing, CIG, and calculate Hermy scores.
 ---
 
 # Homelab Diagnostics
@@ -20,16 +20,16 @@ Performs comprehensive infrastructure health monitoring across all AI Homelab se
 
 - **full_check**: Run all diagnostic checks
 - **service_check**: Check specific service health
-- **gateway_status**: Check OpenClaw gateway
+- **hub_status**: Check Pi Agent Hub
 - **ai_inferencing**: Check AI Inferencing service
-- **hermes_core**: Check Hermes Core connectivity
+- **cig**: Check CIG connectivity
 - **hermy_score**: Calculate overall Hermy score
 
 ## Services Checked
 
-- OpenClaw Gateway (port 18793)
+- Pi Agent Hub (port 18793)
 - AI Inferencing Service (port 9000)
-- Hermes Core API (port 8780)
+- CIG (port 8780)
 - AI Gateway (port 8777)
 - Ecosystem Dashboard (port 8404)
 - Nova Agent itself (port 18800)

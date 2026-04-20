@@ -2,7 +2,7 @@
 Error Handling & Fallback System for Nova Agent.
 
 Provides:
-- Automatic web_search fallback when browser/OpenClaw fails
+- Automatic web_search fallback when browser/Hub delegation fails
 - Circuit breakers for external APIs (Tesla, Perplexity, etc.)
 - Graceful degradation to local responses
 - Retry logic with exponential backoff
@@ -131,7 +131,7 @@ class FallbackOrchestrator:
     Orchestrates fallback strategies when primary tools fail.
     
     Fallback chain:
-    1. Primary tool (e.g., browser/OpenClaw)
+    1. Primary tool (e.g., browser/Hub delegation)
     2. Web search fallback
     3. Local knowledge / cache
     4. Graceful "I don't know" with suggestions
@@ -221,7 +221,7 @@ _fallback_orchestrator = FallbackOrchestrator()
 
 async def web_search_fallback(query: str, **kwargs) -> Optional[str]:
     """
-    Web search fallback for browser/OpenClaw failures.
+    Web search fallback for browser/Hub delegation failures.
     
     When browser automation fails (safety blocks, navigation errors),
     fall back to web search for current information.
@@ -297,9 +297,9 @@ async def graceful_degradation_response(query: str, **kwargs) -> str:
 
 
 # Register fallbacks
-_fallback_orchestrator.register_fallback("openclaw_delegate", web_search_fallback)
-_fallback_orchestrator.register_fallback("openclaw_delegate", local_knowledge_fallback)
-_fallback_orchestrator.register_fallback("openclaw_delegate", graceful_degradation_response)
+_fallback_orchestrator.register_fallback("hub_delegate", web_search_fallback)
+_fallback_orchestrator.register_fallback("hub_delegate", local_knowledge_fallback)
+_fallback_orchestrator.register_fallback("hub_delegate", graceful_degradation_response)
 
 _fallback_orchestrator.register_fallback("browser_navigate", web_search_fallback)
 _fallback_orchestrator.register_fallback("browser_navigate", graceful_degradation_response)
@@ -316,8 +316,8 @@ async def execute_with_fallback(
     
     Example:
         result = await execute_with_fallback(
-            "openclaw_delegate",
-            openclaw_tool,
+            "hub_delegate",
+            hub_delegate_tool,
             task="Check my recent Amazon orders"
         )
         

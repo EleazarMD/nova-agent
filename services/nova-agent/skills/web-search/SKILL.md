@@ -99,7 +99,7 @@ Result: Restaurant recommendations with ratings and sources.
 - Connection failures → inform user, suggest retry
 - Timeouts → recommend simpler/more specific query
 - No results → "Search returned no results"
-- Errors do NOT trigger OpenClaw delegation
+- Errors do NOT trigger Hub delegation
 
 ## References
 

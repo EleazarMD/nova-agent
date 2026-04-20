@@ -1,11 +1,11 @@
 ---
-name: nova-openclaw-delegate
-description: Delegate complex tasks to OpenClaw agent. Use for browser automation, file operations, code editing, and multi-step tasks requiring desktop environment access.
+name: nova-hub-delegate
+description: Delegate complex tasks to Pi Agent Hub. Use for browser automation (Argus), research (Atlas), infrastructure diagnostics (Infra), and multi-step tasks.
 ---
 
-# OpenClaw Delegate
+# Hub Delegate
 
-Delegates complex multi-step tasks to the OpenClaw agent. OpenClaw can perform browser automation, file operations, code editing, and other desktop-based tasks.
+Delegates complex multi-step tasks to the Pi Agent Hub. Hub agents include Argus (browser), Atlas (research), and Infra (diagnostics).
 
 ## When to Invoke
 
@@ -19,7 +19,7 @@ Delegates complex multi-step tasks to the OpenClaw agent. OpenClaw can perform b
 
 ## Actions
 
-- **delegate**: Send task to OpenClaw
+- **delegate**: Send task to Pi Agent Hub
 - **status**: Check delegation status
 - **result**: Get delegation result
 
@@ -32,10 +32,10 @@ Delegates complex multi-step tasks to the OpenClaw agent. OpenClaw can perform b
 ## Examples
 
 User: "Can you look up the latest React docs?"
-Assistant: Invoking @nova-openclaw-delegate to search the React documentation...
+Assistant: Invoking @nova-hub-delegate to search the React documentation...
 
 User: "Edit the config file to add port 8080"
-Assistant: Invoking @nova-openclaw-delegate to modify the configuration file...
+Assistant: Invoking @nova-hub-delegate to modify the configuration file...
 
 ## Notes
 
@@ -45,5 +45,5 @@ Assistant: Invoking @nova-openclaw-delegate to modify the configuration file...
 
 ## References
 
-- Handler: `handle_openclaw_delegate()` in tools.py
-- Service: OpenClaw (port 18793)
+- Handler: `handle_hub_delegate()` in tools.py
+- Service: Pi Agent Hub (port 18793)

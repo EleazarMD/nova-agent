@@ -98,7 +98,7 @@ async def startup():
     from nova.warming import init_warming_service
     from nova.tools import dispatch_tool
     await init_warming_service(dispatch_tool)
-    # Initialize OpenClaw cache orchestrator
+    # Initialize cache orchestrator
     from nova.cache_orchestrator import init_orchestrator
     await init_orchestrator()
     logger.info(f"Nova Text Chat API starting on port {TEXT_CHAT_PORT}")
@@ -187,19 +187,19 @@ async def warming_seasonal():
 
 
 # =============================================================================
-# OpenClaw Cache Orchestrator Endpoints
+# Cache Orchestrator Endpoints
 # =============================================================================
 
 @app.get("/orchestrator/status")
 async def orchestrator_status():
-    """Get OpenClaw cache orchestrator status."""
+    """Get cache orchestrator status."""
     from nova.cache_orchestrator import get_orchestrator_status
     return get_orchestrator_status()
 
 
 @app.get("/orchestrator/recommendations")
 async def orchestrator_recommendations():
-    """Get latest OpenClaw cache recommendations."""
+    """Get latest cache recommendations."""
     from nova.cache_orchestrator import get_orchestrator
     orch = get_orchestrator()
     if orch is None:
@@ -209,7 +209,7 @@ async def orchestrator_recommendations():
 
 @app.post("/orchestrator/analyze")
 async def orchestrator_analyze():
-    """Manually trigger OpenClaw cache analysis."""
+    """Manually trigger cache analysis."""
     from nova.cache_orchestrator import trigger_analysis
     result = await trigger_analysis()
     return {"status": "ok", "result": result}
@@ -284,16 +284,16 @@ async def hypothesis_protocol():
             "tesla_status", "service_health_check"
         ],
         "delegated_validation": {
-            "tool": "openclaw_delegate",
-            "description": "OpenClaw delegation can serve as validation when task is research/lookup oriented",
+            "tool": "hub_delegate",
+            "description": "Hub delegation can serve as validation when task is research/lookup oriented",
             "validation_keywords": ["search", "find", "look up", "research", "check", "verify", "investigate", "analyze"],
             "action_keywords": ["order", "buy", "purchase", "send", "create", "schedule", "restart", "delete"],
             "citation_types": {
-                "browser-search": {"title": "OpenClaw Browser Research", "type": "web"},
-                "hermes-email": {"title": "OpenClaw Email Search", "type": "api"},
-                "hermes-calendar": {"title": "OpenClaw Calendar", "type": "api"},
-                "homelab-diagnostics": {"title": "OpenClaw Infrastructure Analysis", "type": "api"},
-                "default": {"title": "OpenClaw Research", "type": "web"}
+                "browser-search": {"title": "Argus Browser Research", "type": "web"},
+                "hermes-email": {"title": "CIG Email Search", "type": "api"},
+                "hermes-calendar": {"title": "CIG Calendar", "type": "api"},
+                "homelab-diagnostics": {"title": "Infra Agent Diagnostics", "type": "api"},
+                "default": {"title": "Hub Agent Research", "type": "web"}
             }
         }
     }

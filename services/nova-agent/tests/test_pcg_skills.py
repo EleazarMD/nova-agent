@@ -2,7 +2,7 @@
 Test PCG (Personal Context Graph) skills for Nova Agent.
 
 Tests:
-- query_context (Context Bridge: PIC + KG-API + LIAM)
+- query_context (Context Bridge: PIC + PCG Knowledge Graph + LIAM)
 - save_memory (PIC write)
 - recall_memory (PIC read)
 - kg_query (Knowledge Graph)
@@ -12,11 +12,11 @@ Architecture:
         │
         ├─► Context Bridge (port 8764) → query_context
         │   ├─► PIC (port 8765) → save_memory / recall_memory
-        │   └─► KG-API (port 8765) → kg_query
+        │   └─► PCG KG (port 8765) → kg_query
         │
         └─► Direct PIC access (port 8765) → save_memory / recall_memory
 
-Both PIC and KG-API share Neo4j + ChromaDB backend at port 8765.
+Both PIC and PCG Knowledge Graph share Neo4j + ChromaDB backend at port 8765.
 """
 
 import asyncio
@@ -38,7 +38,7 @@ from pic_memory import (
 
 
 # -----------------------------------------------------------------------------
-# Context Bridge Tests (Unified PIC + KG-API + LIAM)
+# Context Bridge Tests (Unified PIC + PCG KG + LIAM)
 # -----------------------------------------------------------------------------
 
 async def test_query_context_basic():
@@ -129,7 +129,7 @@ async def test_pic_build_context():
 
 
 # -----------------------------------------------------------------------------
-# Knowledge Graph Tests (KG-API)
+# Knowledge Graph Tests (PCG KG)
 # -----------------------------------------------------------------------------
 
 async def test_kg_query_basic():

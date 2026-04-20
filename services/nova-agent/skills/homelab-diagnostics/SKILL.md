@@ -28,7 +28,7 @@ Deep health monitoring for AI Homelab infrastructure with component-level diagno
 - Checking overall homelab health
 - Investigating service failures
 - Calculating Hermy score (homelab health metric)
-- Diagnosing OpenClaw, AI Inferencing, or Hermes issues
+- Diagnosing Pi Agent Hub, AI Inferencing, or CIG issues
 - Running comprehensive infrastructure checks
 
 ## Actions
@@ -42,14 +42,14 @@ Run complete homelab health check with Hermy score calculation.
 - Warnings and errors
 - Service health details
 
-### openclaw_health
-Check OpenClaw gateway status and configuration.
+### pi_agent_hub_health
+Check Pi Agent Hub status.
 
 ### ai_inferencing_health
 Check AI Inferencing service health.
 
-### hermes_health
-Check Hermes Core connectivity and status.
+### cig_health
+Check CIG connectivity and status.
 
 ### hermy_score
 Calculate overall homelab health score using formalized component registry.
@@ -64,9 +64,9 @@ Calculate overall homelab health score using formalized component registry.
 
 ## Monitored Components
 
-- **OpenClaw**: Gateway service, configuration validity
+- **Pi Agent Hub**: Hub service status
 - **AI Inferencing**: Service health, endpoint availability
-- **Hermes Core**: Connectivity, health status
+- **CIG**: Connectivity, health status
 - **Component Registry**: Weighted scoring by importance
 
 ## Examples
@@ -77,20 +77,20 @@ Assistant: Invoking @homelab-diagnostics action=full_diagnostics
 User: What's the Hermy score?
 Assistant: Invoking @homelab-diagnostics action=hermy_score
 
-User: Check if OpenClaw is running
-Assistant: Invoking @homelab-diagnostics action=openclaw_health
+User: Check if the Pi Agent Hub is running
+Assistant: Invoking @homelab-diagnostics action=pi_agent_hub_health
 
 ## Technical Details
 
 - Component registry: `templates/component-registry.json`
 - Weighted scoring by component importance
-- Systemd service checks for OpenClaw
+- Systemd service checks for Pi Agent Hub
 - HTTP health endpoints for AI services
 - Timeout: 5 seconds per component
 
 ## References
 
 - Script: `scripts/diagnostics.py`
-- OpenClaw: http://127.0.0.1:18793
+- Pi Agent Hub: http://127.0.0.1:18793
 - AI Inferencing: http://localhost:9000
-- Hermes Core: http://localhost:8780
+- CIG: http://localhost:8780

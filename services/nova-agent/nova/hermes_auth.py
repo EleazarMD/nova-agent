@@ -1,7 +1,7 @@
 """
-Hermes Core JWT authentication helper.
+CIG JWT authentication helper.
 
-Generates JWT tokens for authenticating with Hermes Core API.
+Generates JWT tokens for authenticating with CIG API.
 Supports multi-tenant architecture by accepting user_id parameter.
 """
 
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 
 def generate_hermes_jwt(user_id: str | None = None, user_email: str | None = None) -> str:
-    """Generate JWT token for Hermes Core authentication.
+    """Generate JWT token for CIG authentication.
     
     Args:
         user_id: User ID for multi-tenant isolation. If None, uses environment default.

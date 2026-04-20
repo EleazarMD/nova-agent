@@ -3,11 +3,11 @@ Nova Agent ticket management handlers.
 
 Direct PostgreSQL CRUD — no Dashboard dependency.
 Tickets are the structured way Nova reports issues discovered
-during conversations so they can be triaged, analyzed by OpenClaw, and
-fixed by Windsurf or OpenClaw with approval gating.
+during conversations so they can be triaged, analyzed by Hub agents, and
+fixed by Windsurf or Hub agents with approval gating.
 
 Ticket lifecycle:
-  Nova creates (open) → triage → OpenClaw analyzes → proposed fix →
+  Nova creates (open) → triage → Hub agent analyzes → proposed fix →
   approval engine → implement → resolved
 """
 
@@ -257,12 +257,12 @@ async def handle_update_ticket(
 
 async def handle_delegate_ticket(
     ticket_id: str,
-    delegate_to: str = "openclaw",
+    delegate_to: str = "hub",
     task_description: str = "",
 ) -> str:
-    """Delegate a ticket to OpenClaw or Windsurf for analysis/fix."""
+    """Delegate a ticket to a Hub agent or Windsurf for analysis/fix."""
     try:
-        new_status = "analyzing" if delegate_to == "openclaw" else "in_progress"
+        new_status = "analyzing" if delegate_to == "hub" else "in_progress"
         pool = await _get_pool()
         row = await pool.fetchrow(
             """UPDATE tickets
@@ -279,11 +279,11 @@ async def handle_delegate_ticket(
         title = (row["title"] or "?")[:60]
         logger.info(f"Ticket {tid} delegated to {delegate_to}")
 
-        if delegate_to == "openclaw":
+        if delegate_to == "hub":
             return (
-                f"Ticket {tid} delegated to OpenClaw for analysis.\n"
+                f"Ticket {tid} delegated to Hub agent for analysis.\n"
                 f"Title: {title}\n"
-                "OpenClaw will analyze the codebase, identify root cause, "
+                "The Hub agent will analyze the codebase, identify root cause, "
                 "and propose a fix. Any code changes will require approval."
             )
         elif delegate_to == "windsurf":

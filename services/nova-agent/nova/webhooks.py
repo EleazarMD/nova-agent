@@ -2,13 +2,13 @@
 Webhook HTTP server for receiving external events.
 
 Runs alongside the Pipecat bot as a lightweight FastAPI app on a separate port.
-External services (Hermes Core, OpenClaw, cron) POST events here, which get
+External services (CIG, Pi Agent Hub, cron) POST events here, which get
 routed through the EventBus to connected Pipecat sessions.
 
 Endpoints:
-    POST /webhooks/email     — Hermes Core email notifications
-    POST /webhooks/calendar  — Hermes Core calendar reminders
-    POST /webhooks/job       — OpenClaw async job status updates
+    POST /webhooks/email     — CIG email notifications
+    POST /webhooks/calendar  — CIG calendar reminders
+    POST /webhooks/job       — Pi Agent Hub async job status updates
     POST /webhooks/custom    — Generic event
     GET  /api/events         — SSE stream for iOS proactive notifications
     GET  /health             — Health check
@@ -107,7 +107,7 @@ async def sse_events(request: Request, user_id: str = "default"):
 
 @app.post("/webhooks/email")
 async def webhook_email(request: Request):
-    """Hermes Core sends email notifications here.
+    """CIG sends email notifications here.
 
     Expected body:
     {
@@ -139,7 +139,7 @@ async def webhook_email(request: Request):
 
 @app.post("/webhooks/calendar")
 async def webhook_calendar(request: Request):
-    """Hermes Core sends calendar reminders here.
+    """CIG sends calendar reminders here.
 
     Expected body:
     {
@@ -171,7 +171,7 @@ async def webhook_calendar(request: Request):
 
 @app.post("/webhooks/job")
 async def webhook_job(request: Request):
-    """OpenClaw posts job status updates here.
+    """Pi Agent Hub posts job status updates here.
 
     Expected body:
     {
