@@ -149,6 +149,34 @@ async def search_cig_kg(
         return {"error": str(e), "results": []}
 
 
+async def get_latest_briefing(briefing_type: Optional[str] = None) -> dict[str, Any]:
+    """Fetch the most recent persisted briefing from CIG.
+
+    Briefings are synthesized by Hermes (pi-agent running MiniMax M2.7) and
+    POSTed to `/v1/briefings`. They live as :Briefing nodes in Neo4j and
+    can be filtered by type (e.g. `morning`, `evening`, `heartbeat`,
+    `meeting-prep`, `urgency-scan`). Returns `{"briefing": None}` when no
+    briefing of that type exists yet.
+    """
+    params = {"briefing_type": briefing_type} if briefing_type else {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/briefings/latest",
+                params=params,
+                headers=_HEADERS,
+                timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                text = await resp.text()
+                logger.warning(f"CIG latest briefing failed: {resp.status} {text[:100]}")
+                return {"error": f"CIG returned {resp.status}", "briefing": None}
+    except Exception as e:
+        logger.warning(f"CIG latest briefing error: {e}")
+        return {"error": str(e), "briefing": None}
+
+
 async def get_nova_context() -> dict[str, Any]:
     """Get Nova-specific briefing context from CIG.
 
@@ -248,5 +276,26 @@ async def query_cig(
             lines.append(f"  - {name} ({etype}) — {context}")
         return "\n".join(lines)
 
+    elif domain in ("briefing", "briefings"):
+        # `query` doubles as the optional briefing_type filter
+        # (morning | evening | heartbeat | meeting-prep | urgency-scan).
+        briefing_type = (query or "").strip() or None
+        data = await get_latest_briefing(briefing_type)
+        if "error" in data:
+            return f"Briefing unavailable: {data['error']}"
+        b = data.get("briefing")
+        if not b:
+            filt = f" of type '{briefing_type}'" if briefing_type else ""
+            return f"No persisted briefing{filt} found yet."
+        header = (
+            f"Latest {b.get('briefing_type', 'briefing')} briefing "
+            f"(by {b.get('source_agent', 'hermes')}, "
+            f"generated {b.get('generated_at', '?')}):"
+        )
+        return header + "\n\n" + (b.get("content") or "").strip()
+
     else:
-        return f"Unknown CIG domain '{domain}'. Use: email, calendar, contacts, search."
+        return (
+            f"Unknown CIG domain '{domain}'. "
+            "Use: email, calendar, contacts, search, briefing."
+        )

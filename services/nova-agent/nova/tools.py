@@ -317,7 +317,12 @@ TOOL_DEFINITIONS = [
                 "Use for: email urgency/prioritization (domain='email'), "
                 "calendar/meeting patterns (domain='calendar'), "
                 "contact relationship health (domain='contacts'), "
-                "knowledge graph search for people/orgs (domain='search'). "
+                "knowledge graph search for people/orgs (domain='search'), "
+                "or the latest synthesized briefing from Hermes (domain='briefing'). "
+                "For domain='briefing' the optional `query` param filters by briefing_type "
+                "(morning | evening | heartbeat | meeting-prep | urgency-scan) — leave empty for the "
+                "most recent of any type. Use this when the user asks for their morning briefing, "
+                "EOD summary, meeting prep, or 'what's urgent right now'. "
                 "For DRAFTING emails or scheduling meetings, use hub_delegate(agent='hermes', ...) instead. "
                 "This tool is for READ-ONLY analytics and insights."
             ),
@@ -326,12 +331,17 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "domain": {
                         "type": "string",
-                        "enum": ["email", "calendar", "contacts", "search"],
+                        "enum": ["email", "calendar", "contacts", "search", "briefing"],
                         "description": "Which analytics domain to query",
                     },
                     "query": {
                         "type": "string",
-                        "description": "Search query (required for domain='search', optional for others)",
+                        "description": (
+                            "Search query (required for domain='search'). "
+                            "For domain='briefing' this is an optional briefing_type filter "
+                            "(morning, evening, heartbeat, meeting-prep, urgency-scan). "
+                            "Optional for email/calendar/contacts."
+                        ),
                     },
                 },
                 "required": ["domain"],
