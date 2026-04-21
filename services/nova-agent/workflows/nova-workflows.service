@@ -1,0 +1,29 @@
+[Unit]
+Description=Nova Hatchet Workflows Worker (Phase 3 — notifyUser / askUser)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eleazar
+Group=eleazar
+WorkingDirectory=/home/eleazar/Projects/AIHomelab/services/nova-agent/services/nova-agent
+Environment=PATH=/home/eleazar/Projects/AIHomelab/services/nova-agent/services/nova-agent/workflows/venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/eleazar/Projects/AIHomelab/services/nova-agent/services/nova-agent/workflows/.env
+ExecStart=/home/eleazar/Projects/AIHomelab/services/nova-agent/services/nova-agent/workflows/venv/bin/python workflows/worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nova-workflows
+
+# No GPU needed; keep resource footprint modest.
+MemoryMax=512M
+CPUQuota=100%
+
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
