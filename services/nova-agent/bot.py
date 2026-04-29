@@ -63,15 +63,12 @@ AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/v1")
 AI_GATEWAY_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
 LLM_MODEL = os.environ.get("LLM_MODEL", "minimax-m2.7")
 
-# Map iOS device UUIDs to real user IDs (iOS sends device identifier as user_id)
-DEVICE_USER_MAP: dict[str, str] = {
-    "DEAA114F-315F-420F-9C7C-C0A6D5F6C8DA": "eleazar",
-}
-
-
-def _resolve_user_id(raw_user_id: str) -> str:
-    """Resolve device UUID to real user ID, or return as-is if not a device."""
-    return DEVICE_USER_MAP.get(raw_user_id, raw_user_id)
+# All known aliases for the primary human collapse into ONE canonical
+# user_id (see nova/user_resolver.py). Without this, the same iOS
+# conversation could be stored under 'eleazar', the device UUID, AND
+# the PIC canonical UUID — which is exactly the bug that made Nova
+# look like she'd lost memory between reconnects.
+from nova.user_resolver import canonical_user_id as _resolve_user_id  # noqa: E402
 
 # Tool names for prompt builder
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS if "function" in t]
@@ -158,6 +155,7 @@ async def run_bot(
         memory_snippets=pcg_ctx.get("memory_snippets"),
         preferences_by_category=pcg_ctx.get("preferences_by_category"),
         identity=pcg_ctx.get("identity"),
+        daily_snapshot=pcg_ctx.get("daily_snapshot"),
     )
 
     # ── Transport ────────────────────────────────────────────────────────
@@ -252,7 +250,7 @@ async def run_bot(
     # Local/homelab APIs (free, internal): generous limits
     _PER_TOOL_LIMITS: dict[str, int] = {
         # ── Cloud / paid APIs ──────────────────────────────────────────────
-        "web_search": 2,            # Perplexity Sonar — paid per call
+        "web_search": 3,            # Perplexity Sonar — paid per call; allow 1 natural LLM retry
         "get_weather": 2,           # OpenWeatherMap — paid API
         "query_cig": 2,             # CIG analytics — AI gateway internally
         "hub_delegate": 2,          # Hub RPC — approval-gated, expensive
@@ -591,6 +589,61 @@ async def run_bot(
         content = msg.get("content", "")
         logger.info(f"  [{i+1}] {role}: {content[:100]}...")
 
+    # ── Persistence interceptor (sits before assistant_aggregator) ────────
+    # The LLMAssistantContextAggregator swallows LLMTextFrame / LLMFullResponse*
+    # frames without re-emitting them, so the task-level downstream observer
+    # never fires.  This lightweight processor intercepts those frames BEFORE
+    # they are consumed.
+    _pi_buffer: list[str] = []
+    _pi_thinking_sent: list[bool] = [False]
+    _pi_first_text: list[bool] = [False]
+
+    class PersistenceInterceptor(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+
+            if isinstance(frame, LLMFullResponseStartFrame):
+                _pi_thinking_sent[0] = True
+                _pi_first_text[0] = False
+                await _send_server_msg({"phase": "thinking"})
+                await ctx_watcher.check_and_persist()
+
+            elif isinstance(frame, LLMTextFrame):
+                _pi_buffer.append(frame.text)
+                if not _pi_first_text[0]:
+                    _pi_first_text[0] = True
+                    await _send_server_msg({"phase": "responding"})
+
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                if _pi_buffer:
+                    full_text = "".join(_pi_buffer)
+                    _pi_buffer.clear()
+                    if full_text.strip():
+                        await append_turn(session.session_id, "assistant", full_text)
+                        asyncio.create_task(_sync_message_to_backend(
+                            conversation_id, user_id, "assistant", full_text,
+                            model=LLM_MODEL,
+                        ))
+                        logger.info(f"Persisted assistant turn ({len(full_text)} chars)")
+                        from nova.text_utils import strip_markdown_for_speech
+                        speech_text = strip_markdown_for_speech(full_text)
+                        await _send_server_msg({
+                            "type": "validated",
+                            "text": full_text,
+                            "speechText": speech_text,
+                            "result": "direct",
+                            # RTVI already streams each LLMTextFrame to iOS as bot-llm-text
+                            # (which iOS speaks natively). suppressSpeech=True prevents the
+                            # validated event from triggering a second TTS pass.
+                            "suppressSpeech": True,
+                        })
+                await _send_server_msg({"type": "turn_complete"})
+                if _pi_thinking_sent[0]:
+                    await _send_server_msg({"phase": "done"})
+                    _pi_thinking_sent[0] = False
+
+            await self.push_frame(frame, direction)
+
     # Build pipeline based on audio mode
     if use_server_audio:
         # Server-side STT/TTS mode using local Whisper + Qwen TTS
@@ -613,6 +666,7 @@ async def run_bot(
             stt,
             user_aggregator,
             llm,
+            PersistenceInterceptor(),
             tts,
             transport.output(),
             assistant_aggregator,
@@ -714,8 +768,9 @@ async def run_bot(
             transport.input(),
             user_aggregator,
             llm,
+            PersistenceInterceptor(),
             assistant_aggregator,
-            text_bridge,  # Log output frames after assistant_aggregator
+            text_bridge,
             transport.output(),
         ])
 
@@ -746,20 +801,6 @@ async def run_bot(
     set_server_msg_fn(_send_server_msg)
     # Default to medium thinking; NativeTextBridge updates this per message based on MODE POLICY
 
-    # ── Conversation persistence ─────────────────────────────────────────
-    # Buffer assistant text chunks, persist complete turns on boundaries.
-    # Uses Pipecat's task-level frame observation API:
-    #   task.set_reached_downstream_filter() + on_frame_reached_downstream
-    # (LLMService only exposes on_function_calls_started and on_completion_timeout)
-    _assistant_buffer: list[str] = []
-
-    # Tell the PipelineTask which frame types we want to observe
-    task.set_reached_downstream_filter((
-        LLMTextFrame,
-        LLMFullResponseStartFrame,
-        LLMFullResponseEndFrame,
-    ))
-
     # Persist user messages by hooking the context aggregator
     _original_context_messages = context.messages
 
@@ -788,55 +829,6 @@ async def run_bot(
                 self._last_len = len(msgs)
 
     ctx_watcher = _ContextWatcher()
-
-    # Track whether we've sent a thinking phase for the current LLM response
-    _thinking_phase_sent: list[bool] = [False]
-    _first_text_sent: list[bool] = [False]
-
-    @task.event_handler("on_frame_reached_downstream")
-    async def on_frame_downstream(task_ref, frame):
-        if isinstance(frame, LLMTextFrame):
-            _assistant_buffer.append(frame.text)
-            # First text chunk: transition from thinking → responding
-            if not _first_text_sent[0]:
-                _first_text_sent[0] = True
-                await _send_server_msg({"phase": "responding"})
-        elif isinstance(frame, LLMFullResponseStartFrame):
-            logger.info("🎯 LLMFullResponseStartFrame reached downstream → RTVI should send bot-llm-started")
-            # Send thinking phase so iOS shows orange stop button + thinking card
-            _thinking_phase_sent[0] = True
-            _first_text_sent[0] = False
-            await _send_server_msg({"phase": "thinking"})
-            await ctx_watcher.check_and_persist()
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            logger.info("🎯 LLMFullResponseEndFrame reached downstream → RTVI should send bot-llm-stopped")
-            if _assistant_buffer:
-                full_text = "".join(_assistant_buffer)
-                _assistant_buffer.clear()
-                if full_text.strip():
-                    await append_turn(session.session_id, "assistant", full_text)
-                    await _sync_message_to_backend(
-                        conversation_id, user_id, "assistant", full_text,
-                        model=LLM_MODEL,
-                    )
-                    logger.debug(f"Persisted assistant turn ({len(full_text)} chars)")
-
-                    # Send validated event for iOS response card + speech
-                    from nova.text_utils import strip_markdown_for_speech
-                    speech_text = strip_markdown_for_speech(full_text)
-                    await _send_server_msg({
-                        "type": "validated",
-                        "text": full_text,
-                        "speechText": speech_text,
-                        "result": "direct",
-                        "suppressSpeech": False,
-                    })
-
-            # Signal turn complete and done phase
-            await _send_server_msg({"type": "turn_complete"})
-            if _thinking_phase_sent[0]:
-                await _send_server_msg({"phase": "done"})
-                _thinking_phase_sent[0] = False
 
     # Event bus: proactive notifications while user is connected
     event_handler = create_event_handler(task, user_id)

@@ -310,7 +310,11 @@ async def chat_completions(request: Request):
         body = await request.json()
         messages = body.get("messages", [])
         stream = body.get("stream", False)
-        user_id = body.get("user", "dashboard")
+        # Collapse all known aliases (eleazar/default/dashboard/device-UUID)
+        # to ONE canonical user_id so SQLite/Postgres stop sharding the
+        # same human's conversations across multiple keyspaces.
+        from nova.user_resolver import canonical_user_id
+        user_id = canonical_user_id(body.get("user", "dashboard"))
         
         if not messages:
             raise HTTPException(status_code=400, detail="messages required")
@@ -402,6 +406,8 @@ async def simple_chat(req: ChatRequest):
     Simpler interface than OpenAI format - just message + user_id.
     """
     try:
+        from nova.user_resolver import canonical_user_id
+        req.user_id = canonical_user_id(req.user_id)
         # Get or create conversation session
         conversation_id = req.conversation_id or f"text_{uuid.uuid4().hex[:12]}"
         session = await get_or_create_session(req.user_id, conversation_id)

@@ -160,6 +160,8 @@ async def get_or_create_session(
     path: str = DB_PATH,
 ) -> Session:
     """Get existing session for this conversation or create one."""
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id)
     session_id = f"{user_id}:{conversation_id}"
     now = time.time()
     async with aiosqlite.connect(path) as db:
@@ -249,6 +251,8 @@ async def get_user_sessions(
     path: str = DB_PATH,
 ) -> list[Session]:
     """Get recent sessions for a user."""
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id)
     async with aiosqlite.connect(path) as db:
         db.row_factory = aiosqlite.Row
         rows = await db.execute_fetchall(
@@ -364,7 +368,7 @@ async def _resolve_or_create_conversation(
 
 async def _sync_message_to_backend(
     conversation_id: str,
-    user_id: str,
+    user_id: str,  # canonical_user_id() already applied by caller (sync_turn_to_backend)
     role: str,
     content: str,
     model: str = None,
@@ -461,6 +465,8 @@ async def ensure_backend_conversation(
     Uses external_id to map Nova's string conversation IDs to PostgreSQL UUIDs.
     No Dashboard dependency.
     """
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id)
     if not _HAS_ASYNCPG:
         return False
     
@@ -512,6 +518,8 @@ async def search_past_conversations(
       days_back=7          → last 7 days from now
       from_days=90, to_days=7  → between 3 months ago and 1 week ago
     """
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id)
     # 1. PostgreSQL vector search first (semantic — understands meaning, not just keywords)
     results = await _search_postgres_direct(user_id, query, days_back, limit,
                                              from_days=from_days, to_days=to_days)
@@ -780,12 +788,15 @@ async def get_backend_conversations(
     limit: int = 20,
 ) -> list[dict]:
     """Get user's conversations from PostgreSQL directly via asyncpg."""
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id)
     if not _HAS_ASYNCPG:
         return []
     try:
         pool = await _get_pg_pool()
-        # Include 'default' user for historical data
-        user_filter = "user_id = $1" if user_id == "default" else "user_id IN ($1, 'default')"
+        # All historical aliases now collapse to canonical_user_id at the
+        # entry boundary, so a single equality check is sufficient.
+        user_filter = "user_id = $1"
         rows = await pool.fetch(
             f"""SELECT id, title, user_id, source, importance_score, summary,
                        retention_tier, message_count, total_tokens,
@@ -805,9 +816,9 @@ async def get_backend_conversations(
                 "source": r["source"],
                 "importance_score": r["importance_score"],
                 "message_count": r["message_count"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-                "last_message_at": r["last_message_at"].isoformat() if r["last_message_at"] else None,
+                "created_at": r["created_at"].timestamp() if r["created_at"] else None,
+                "updated_at": r["updated_at"].timestamp() if r["updated_at"] else None,
+                "last_message_at": r["last_message_at"].timestamp() if r["last_message_at"] else None,
             }
             for r in rows
         ]
@@ -821,6 +832,8 @@ async def get_backend_conversation(
     user_id: str,
 ) -> dict | None:
     """Get a single conversation with messages from PostgreSQL directly via asyncpg."""
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id)
     if not _HAS_ASYNCPG:
         return None
     try:
@@ -856,7 +869,9 @@ async def get_backend_conversation(
             "title": conv["title"],
             "user_id": conv["user_id"],
             "message_count": conv["message_count"],
-            "created_at": conv["created_at"].isoformat() if conv["created_at"] else None,
+            "created_at": conv["created_at"].timestamp() if conv["created_at"] else None,
+            "updated_at": conv["updated_at"].timestamp() if conv["updated_at"] else None,
+            "last_message_at": conv["last_message_at"].timestamp() if conv["last_message_at"] else None,
             "messages": [
                 {
                     "id": str(m["id"]),
@@ -864,7 +879,7 @@ async def get_backend_conversation(
                     "content": m["content"],
                     "model": m["model"],
                     "tokens_used": m["tokens_used"],
-                    "created_at": m["created_at"].isoformat() if m["created_at"] else None,
+                    "created_at": m["created_at"].timestamp() if m["created_at"] else None,
                     "importance_score": m["importance_score"],
                 }
                 for m in msgs
