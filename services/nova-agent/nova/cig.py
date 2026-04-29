@@ -10,6 +10,7 @@ Data flow:
   Direct Nova queries → handle_cig_query() → this client
 """
 
+import asyncio
 import os
 import aiohttp
 import json
@@ -19,7 +20,14 @@ from loguru import logger
 CIG_URL = os.environ.get("CIG_URL", "http://localhost:8780")
 CIG_API_KEY = os.environ.get("CIG_API_KEY", "nova-agent-key-2024")
 
+# Fast read endpoints (cached Neo4j queries). 12s is plenty.
 _TIMEOUT = aiohttp.ClientTimeout(total=12)
+# Semantic search hits the AI Gateway to embed the query and then
+# Chroma for the ANN lookup; cold-path can spike past 12s, and the
+# aiohttp TimeoutError stringifies to an empty message which made
+# previous failures look silently like "no results". 30s is well
+# inside Nova's tool-call budget.
+_SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 _HEADERS = {
     "X-API-Key": CIG_API_KEY,
@@ -132,7 +140,7 @@ async def search_cig_kg(
                 f"{CIG_URL}/v1/search/emails",
                 headers=_HEADERS,
                 json={"query": query, "limit": limit},
-                timeout=_TIMEOUT,
+                timeout=_SEARCH_TIMEOUT,
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -144,9 +152,15 @@ async def search_cig_kg(
                     text = await resp.text()
                     logger.warning(f"CIG search failed: {resp.status} {text[:100]}")
                     return {"error": f"CIG returned {resp.status}", "results": []}
+    except asyncio.TimeoutError:
+        # asyncio.TimeoutError stringifies to '' which previously
+        # masked real timeouts as "empty response". Report it.
+        logger.warning("CIG search timed out (>30s)")
+        return {"error": "search timed out (CIG/AI-Gateway slow path)",
+                "results": []}
     except Exception as e:
-        logger.warning(f"CIG search error: {e}")
-        return {"error": str(e), "results": []}
+        logger.warning(f"CIG search error: {type(e).__name__}: {e}")
+        return {"error": f"{type(e).__name__}: {e}", "results": []}
 
 
 async def get_latest_briefing(briefing_type: Optional[str] = None) -> dict[str, Any]:
@@ -201,6 +215,35 @@ async def get_nova_context() -> dict[str, Any]:
         return {}
 
 
+def _format_email_line(e: dict[str, Any]) -> str:
+    """Render one email row as a single human-readable line.
+
+    Robust to all the shapes CIG /v1/emails/recent and
+    /v1/search/emails return: sender may be a {email,name} dict,
+    or split across from_email/from_name, or a plain string. Date
+    falls back through several keys."""
+    subject = (e.get("subject") or e.get("snippet") or "(no subject)")[:120]
+
+    # Sender resolution — prefer name+email, fall back to whichever exists.
+    name = e.get("from_name") or e.get("sender_name")
+    addr = e.get("from_email") or e.get("sender_email")
+    if not (name or addr):
+        s = e.get("sender") or e.get("from")
+        if isinstance(s, dict):
+            name = name or s.get("name")
+            addr = addr or s.get("email")
+        elif isinstance(s, str):
+            addr = addr or s
+    if name and addr:
+        sender = f"{name} <{addr}>"
+    else:
+        sender = name or addr or "Unknown"
+
+    date = (e.get("date") or e.get("sent_date") or e.get("received_at")
+            or e.get("timestamp") or "")
+    return f"{subject} — from {sender} ({date})"
+
+
 async def query_cig(
     user_id: str,
     domain: str = "email",
@@ -215,18 +258,32 @@ async def query_cig(
     domain = domain.lower().strip()
 
     if domain in ("email", "inbox", "emails"):
+        # If the caller provided a search query, route to the
+        # semantic email search endpoint rather than dumping the
+        # 10 most-recent inbox items (which would ignore the query
+        # and confuse the LLM into thinking nothing matched).
+        q = (query or "").strip()
+        if q:
+            data = await search_cig_kg(user_id, q, limit=kwargs.get("limit", 10))
+            if "error" in data:
+                return f"Email search unavailable: {data['error']}"
+            emails = data.get("results") or data.get("emails") or []
+            if not emails:
+                return f"No emails found matching '{q}'."
+            lines = [f"Email search results for '{q}':"]
+            for e in emails[:10]:
+                lines.append("  - " + _format_email_line(e))
+            return "\n".join(lines)
+
         data = await query_email_analytics(user_id, **kwargs)
         if "error" in data:
             return f"Email analytics unavailable: {data['error']}"
-        emails = data.get("emails", [])
+        emails = data.get("emails") or data.get("recent_emails") or []
         if not emails:
             return "No recent emails found."
         lines = ["Recent emails:"]
         for e in emails[:10]:
-            subject = e.get("subject", e.get("snippet", "No subject")[:60])
-            sender = e.get("from", e.get("sender", "Unknown"))
-            date = e.get("date", e.get("received_at", ""))
-            lines.append(f"  - {subject} — from {sender} ({date})")
+            lines.append("  - " + _format_email_line(e))
         return "\n".join(lines)
 
     elif domain in ("calendar", "schedule", "meetings"):
