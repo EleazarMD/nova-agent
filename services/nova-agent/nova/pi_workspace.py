@@ -18,20 +18,30 @@ from typing import Any, Optional
 from loguru import logger
 
 PI_WORKSPACE_URL = os.environ.get("PI_WORKSPACE_URL", "http://localhost:8762")
+PI_WORKSPACE_API_KEY = os.environ.get("PI_WORKSPACE_API_KEY", "")
 _timeout = aiohttp.ClientTimeout(total=15)
+
+
+def _headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if PI_WORKSPACE_API_KEY:
+        headers["X-API-Key"] = PI_WORKSPACE_API_KEY
+    return headers
 
 
 async def _ws_get(path: str, params: dict | None = None) -> dict | list | None:
     async with aiohttp.ClientSession(timeout=_timeout) as s:
-        async with s.get(f"{PI_WORKSPACE_URL}{path}", params=params) as r:
+        async with s.get(f"{PI_WORKSPACE_URL}{path}", params=params, headers=_headers()) as r:
             if r.status == 200:
                 return await r.json()
+            text = await r.text()
+            logger.warning(f"Workspace GET {path} failed: {r.status} {text[:200]}")
             return None
 
 
 async def _ws_post(path: str, body: dict) -> dict | None:
     async with aiohttp.ClientSession(timeout=_timeout) as s:
-        async with s.post(f"{PI_WORKSPACE_URL}{path}", json=body) as r:
+        async with s.post(f"{PI_WORKSPACE_URL}{path}", json=body, headers=_headers()) as r:
             if r.status in (200, 201):
                 return await r.json()
             text = await r.text()
@@ -41,15 +51,17 @@ async def _ws_post(path: str, body: dict) -> dict | None:
 
 async def _ws_put(path: str, body: dict) -> dict | None:
     async with aiohttp.ClientSession(timeout=_timeout) as s:
-        async with s.put(f"{PI_WORKSPACE_URL}{path}", json=body) as r:
+        async with s.put(f"{PI_WORKSPACE_URL}{path}", json=body, headers=_headers()) as r:
             if r.status == 200:
                 return await r.json()
+            text = await r.text()
+            logger.warning(f"Workspace PUT {path} failed: {r.status} {text[:200]}")
             return None
 
 
 async def _ws_delete(path: str) -> bool:
     async with aiohttp.ClientSession(timeout=_timeout) as s:
-        async with s.delete(f"{PI_WORKSPACE_URL}{path}") as r:
+        async with s.delete(f"{PI_WORKSPACE_URL}{path}", headers=_headers()) as r:
             return r.status == 200
 
 
