@@ -1,16 +1,15 @@
 """
 Homelab infrastructure mutating operations for Nova.
 
-All mutating operations (restart, start, stop) are gated by the homelab
-approval engine (ecosystem-dashboard PostgreSQL). Nova is a CONSUMER of
-the approval system, never an authority.
+All mutating operations (restart, start, stop) are gated by the standalone
+approval-service. Nova is a CONSUMER of the approval system, never an authority.
 
 Approval flow:
-  POST /api/security/approvals/request  → create approval (push + audit)
-  GET  /api/security/approvals/{id}/status → poll for decision
+  POST /api/approvals      → create approval (push + audit)
+  GET  /api/approvals/{id} → poll for decision
 
-The Dashboard (web) and iOS app are the ONLY surfaces where a human
-can approve or deny.
+Hyperspace iOS is the primary human approval surface.
+The Homelab Dashboard is not the approval authority.
 """
 
 import asyncio
@@ -40,7 +39,6 @@ from nova.operational_mode import (
 # Configuration — homelab approval engine
 # ---------------------------------------------------------------------------
 
-DASHBOARD_URL = os.environ.get("ECOSYSTEM_URL", "http://localhost:8404")
 # Standalone approval-service microservice (JIT Zero-Tolerance Infrastructure Approvals)
 APPROVAL_SERVICE_URL = os.environ.get("APPROVAL_SERVICE_URL", "http://127.0.0.1:8407")
 APPROVAL_SERVICE_API_KEY = os.environ.get("APPROVAL_SERVICE_API_KEY", "ai-gateway-api-key-2024")
@@ -58,7 +56,7 @@ _APPROVAL_EXPIRY_HOURS: dict[str, float] = {
     "service_restart": 1 / 60,   # 1 minute
     "service_start":   1 / 60,   # 1 minute
     "service_stop":    5 / 60,   # 5 minutes
-    "file_delete":     5 / 60,   # 5 minutes
+    "workspace_page_delete": 5 / 60,  # 5 minutes
 }
 
 
@@ -72,11 +70,7 @@ async def _request_approval(
     risk_level: str,
     context: str,
 ) -> dict:
-    """Submit an approval request to the dashboard approval API (port 8404).
-    
-    Uses the unified dashboard endpoint which stores approvals in PostgreSQL
-    and delivers push notifications via APNs to iOS.
-    """
+    """Submit an approval request to the standalone approval-service."""
     url = f"{APPROVAL_SERVICE_URL}/api/approvals"
     expiry_hours = _APPROVAL_EXPIRY_HOURS.get(tool_name, 1 / 60)  # default: 1 minute
     payload = {
@@ -121,7 +115,7 @@ async def _request_approval(
 
 
 async def _poll_approval_status(approval_id: str) -> dict:
-    """Poll the dashboard approval API until a decision is made or timeout."""
+    """Poll the standalone approval-service until a decision is made or timeout."""
     url = f"{APPROVAL_SERVICE_URL}/api/approvals/{approval_id}"
     elapsed = 0
 
