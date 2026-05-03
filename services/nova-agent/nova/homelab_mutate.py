@@ -56,7 +56,7 @@ _APPROVAL_EXPIRY_HOURS: dict[str, float] = {
     "service_restart": 1 / 60,   # 1 minute
     "service_start":   1 / 60,   # 1 minute
     "service_stop":    5 / 60,   # 5 minutes
-    "workspacePageDelete": 5 / 60,  # 5 minutes
+    "workspace_page_delete": 5 / 60,  # 5 minutes
 }
 
 
