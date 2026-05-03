@@ -137,6 +137,15 @@ class TurnMetrics:
 _METRICS = TurnMetrics()
 
 
+def _best_effort_task(coro) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        return
+    loop.create_task(coro)
+
+
 async def _persist_policy_observation(observation) -> None:
     try:
         from nova.store import append_turn_policy_observation
@@ -187,7 +196,7 @@ def _record_policy_outcome(
     result: "TurnExecutionResult",
     latency_ms: int = 0,
 ) -> None:
-    asyncio.create_task(_label_previous_policy_observation(text))
+    _best_effort_task(_label_previous_policy_observation(text))
     features = extract_turn_features(text, state)
     shadow_candidate = shadow_policy_predict(features)
     outcome = "handled" if result.handled else "pass_through"
@@ -211,7 +220,7 @@ def _record_policy_outcome(
         stop_reason=result.stop_reason,
         latency_ms=latency_ms,
     )
-    asyncio.create_task(_persist_policy_observation(observation))
+    _best_effort_task(_persist_policy_observation(observation))
 
 
 @dataclass
@@ -467,7 +476,7 @@ def decide_turn(text: str, state: TurnState) -> TurnPlan:
     lower = user_text.lower()
     features = extract_turn_features(text, state)
     shadow_candidate = shadow_policy_predict(features)
-    asyncio.create_task(_log_plan_cache_candidate(features))
+    _best_effort_task(_log_plan_cache_candidate(features))
 
     wants_workspace = _contains_any(lower, ("workspace", "page", "pages", "document", "documents", "advisory", "advisories", "report", "brief"))
     wants_lookup = _contains_any(lower, ("find", "lookup", "search", "email", "thread", "message"))
