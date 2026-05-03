@@ -3548,6 +3548,33 @@ async def handle_manage_workspace(
         _plain_title,
     )
 
+    def _full_id_line(label: str, value: str) -> str:
+        return f"{label}: {value}"
+
+    async def _resolve_page_id(page_ref: str) -> tuple[str, str]:
+        ref = (page_ref or "").strip()
+        if not ref:
+            return "", ""
+        pages = await list_pages()
+        exact = [p for p in pages if p.get("id") == ref]
+        if exact:
+            return ref, ""
+        prefix = ref.removesuffix("...").strip()
+        if len(prefix) >= 4:
+            matches = [p for p in pages if str(p.get("id", "")).startswith(prefix)]
+            if len(matches) == 1:
+                return matches[0]["id"], f"Resolved page_id prefix '{ref}' to full page_id {matches[0]['id']}."
+            if len(matches) > 1:
+                choices = ", ".join(f"{_plain_title(p.get('title', 'Untitled'))} ({p.get('id')})" for p in matches[:5])
+                return "", f"Page ID prefix '{ref}' is ambiguous. Matching pages: {choices}"
+        title_matches = [p for p in pages if ref.lower() in _plain_title(p.get("title", "")).lower()]
+        if len(title_matches) == 1:
+            return title_matches[0]["id"], f"Resolved page title '{ref}' to page_id {title_matches[0]['id']}."
+        if len(title_matches) > 1:
+            choices = ", ".join(f"{_plain_title(p.get('title', 'Untitled'))} ({p.get('id')})" for p in title_matches[:5])
+            return "", f"Page reference '{ref}' matched multiple pages. Use one full page_id: {choices}"
+        return ref, ""
+
     try:
         # ── Pages ──
         if action == "list_pages":
@@ -3558,7 +3585,7 @@ async def handle_manage_workspace(
             for p in pages[:15]:
                 t = _plain_title(p.get("title", "Untitled"))
                 emoji = p.get("icon", {}).get("emoji", "")
-                lines.append(f"  {emoji} {t} (id: {p['id'][:8]}...)")
+                lines.append(f"  {emoji} {t} ({_full_id_line('page_id', p['id'])})")
             return "\n".join(lines)
 
         elif action == "create_page":
@@ -3572,7 +3599,7 @@ async def handle_manage_workspace(
                 await create_block(page["id"], "paragraph",
                                    {"richText": [{"type": "text", "text": {"content": content}, "plainText": content}]},
                                    parent_id=page.get("rootBlockId", ""))
-            return f"\u2705 Page created: \"{title}\" (id: {page['id'][:8]}...)"
+            return f"\u2705 Page created: \"{title}\" ({_full_id_line('page_id', page['id'])})"
 
         elif action == "create_page_with_blocks":
             if not title:
@@ -3586,18 +3613,23 @@ async def handle_manage_workspace(
             if not page:
                 return "Failed to create page with blocks."
             bc = page.get("block_count", 0)
-            return f"\u2705 Page created: \"{title}\" with {bc} blocks (id: {page['id'][:8]}...)"
+            return f"\u2705 Page created: \"{title}\" with {bc} blocks ({_full_id_line('page_id', page['id'])})"
 
         elif action == "get_page":
             if not page_id:
                 return "page_id is required for get_page."
-            page = await get_page(page_id)
+            resolved_page_id, resolution_message = await _resolve_page_id(page_id)
+            if not resolved_page_id:
+                return resolution_message or f"Page {page_id} not found."
+            page = await get_page(resolved_page_id)
             if not page:
                 return f"Page {page_id} not found."
             t = _plain_title(page.get("title", "Untitled"))
-            lines = [f"📄 {t}"]
+            lines = [f"📄 {t}", _full_id_line("page_id", resolved_page_id)]
+            if resolution_message:
+                lines.append(resolution_message)
             # Get blocks
-            blocks = await get_page_blocks(page_id)
+            blocks = await get_page_blocks(resolved_page_id)
             for b in (blocks or [])[:20]:
                 bt = b.get("type", "")
                 props = b.get("properties", {})
@@ -3625,15 +3657,19 @@ async def handle_manage_workspace(
         elif action == "add_block":
             if not page_id or not block_type:
                 return "page_id and block_type are required for add_block."
+            resolved_page_id, resolution_message = await _resolve_page_id(page_id)
+            if not resolved_page_id:
+                return resolution_message or f"Page {page_id} not found."
             block_props: dict = {}
             if content:
                 block_props["richText"] = [{"type": "text", "text": {"content": content}, "plainText": content}]
             if properties:
                 block_props.update(properties)
-            block = await create_block(page_id, block_type, block_props, parent_id=parent_id)
+            block = await create_block(resolved_page_id, block_type, block_props, parent_id=parent_id)
             if not block:
                 return "Failed to add block."
-            return f"✅ Added {block_type} block to page {page_id[:8]}..."
+            suffix = f" {resolution_message}" if resolution_message else ""
+            return f"✅ Added {block_type} block to page_id {resolved_page_id}.{suffix}"
 
         # ── Search ──
         elif action == "search":
@@ -3646,7 +3682,7 @@ async def handle_manage_workspace(
             lines = [f"🔍 Found {len(items)} results for '{content}':"]
             for r in items[:8]:
                 emoji = {"page": "📄", "block": "📝", "database": "📊", "email": "📧"}.get(r.get("type", ""), "📎")
-                lines.append(f"  {emoji} {r.get('title', 'Untitled')} (score: {r.get('score', 0):.2f}) id: {r.get('id', '')[:8]}...")
+                lines.append(f"  {emoji} {r.get('title', 'Untitled')} (score: {r.get('score', 0):.2f}) id: {r.get('id', '')}")
             return "\n".join(lines)
 
         # ── Databases ──

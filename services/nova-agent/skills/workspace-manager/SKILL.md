@@ -41,7 +41,7 @@ parameters:
       description: "Title for pages, databases, tasks, events, forms"
     page_id:
       type: string
-      description: "Page ID"
+      description: "Full page UUID from list_pages/search/create_page. Do not shorten or summarize UUIDs."
     database_id:
       type: string
       description: "Database ID"
@@ -152,6 +152,8 @@ Never go silent while a tool is running. The user should always hear what's happ
 - `create_page` — Create new note (title + optional content + icon)
 - `get_page` — Read page with all its blocks
 - `add_block` — Add content block (paragraph, heading, to-do, etc.)
+
+Use the complete `page_id` value returned by `list_pages`, `search`, or page creation. Never pass a shortened display form like `6c8a188e...` when a full UUID is available.
 
 ### Search
 - `search` — Hybrid FTS + vector search across all content
