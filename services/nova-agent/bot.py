@@ -17,9 +17,11 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
+    InputTransportMessageFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    TranscriptionFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -51,9 +53,10 @@ from nova.events import event_bus
 from nova.notify import create_event_handler
 from nova.prompt import build_system_prompt
 from nova.push import mark_user_active, mark_user_inactive, register_push_fallback
-from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn
+from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn, get_session_metadata, update_session_metadata_key
 from nova.pcg import build_context, record_observation, create_preference
 from nova.tools import TOOL_DEFINITIONS, dispatch_tool, set_progress_context
+from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan, turn_state_from_metadata, turn_state_to_metadata_value
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -237,14 +240,14 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations", "analyze_spreadsheet"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
     # Tool iteration tracking — runaway loop guard only (not a quality throttle)
     _tool_calls_this_turn: list[int] = [0]
-    _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 5
-    _MAX_TOOL_CALLS_HARD_LIMIT = 25  # Pure infinite-loop guard
+    _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 4
+    _MAX_TOOL_CALLS_HARD_LIMIT = 10  # Pure infinite-loop guard
     # Per-tool-per-turn rate limits — differentiated by provider cost/risk
     # Cloud APIs (paid, rate-limited externally): tight limits
     # Local/homelab APIs (free, internal): generous limits
@@ -252,16 +255,16 @@ async def run_bot(
         # ── Cloud / paid APIs ──────────────────────────────────────────────
         "web_search": 3,            # Perplexity Sonar — paid per call; allow 1 natural LLM retry
         "get_weather": 2,           # OpenWeatherMap — paid API
-        "query_cig": 2,             # CIG analytics — AI gateway internally
-        "hub_delegate": 2,          # Hub RPC — approval-gated, expensive
+        "hub_delegate": 2,          # Hub RPC — approval-gated
         # ── Local / homelab ───────────────────────────────────────────────
-        "check_studio": 4,          # Local CIG/Hermes
-        "query_frameworks": 3,      # Local LIAM/PCG
-        "recall_memory": 4,         # Local PCG
-        "search_past_conversations": 2,  # Local DB but guards loop
-        "tesla_control": 4,         # Local relay → Tesla cloud (relay handles its own limits)
+        "query_cig": 3,             # CIG analytics
+        "check_studio": 2,          # Local CIG/Hermes
+        "query_frameworks": 5,      # Local LIAM/PCG
+        "recall_memory": 5,         # Local PCG
+        "search_past_conversations": 2,  # Local DB
+        "tesla_control": 4,         # Local relay → Tesla cloud
         "service_status": 6,        # Local Docker API
-        "homelab_diagnostics": 3,   # Local Docker API — heavy
+        "homelab_diagnostics": 4,   # Local Docker API
         "homelab_operations": 4,    # Local Docker API
     }
     _per_tool_call_counts: dict[str, int] = {}
@@ -271,6 +274,14 @@ async def run_bot(
     # and state differ between calls.
     _DEDUP_EXCLUDED_TOOLS = {"hub_delegate", "tesla_wake"}
     _last_tool_call: dict = {"name": None, "args": None, "result": None}
+    _structured_final_response_this_turn: list[bool] = [False]
+    _search_tools_exhausted: list[bool] = [False]
+    _turn_state = TurnState()
+    try:
+        _turn_metadata = await get_session_metadata(session.session_id)
+        _turn_state = turn_state_from_metadata(_turn_metadata)
+    except Exception as e:
+        logger.warning(f"TurnOrchestrator state restore failed: {e}")
     # Traffic telemetry — emitted to logger for monitoring/grepping
     # Format: NOVA_TRAFFIC | tool=<name> | provider=<class> | latency=<ms> | bytes_out=<n> | status=<ok|error|rate_limited|timeout>
     _PROVIDER_CLASS: dict[str, str] = {
@@ -357,8 +368,30 @@ async def run_bot(
             "manage_workspace": f"📝 Workspace: {args.get('action', 'processing')}...",
             "staar_tutor": f"📚 STAAR: {args.get('action', 'generating')} problems...",
             "compact_conversations": "🧠 Compacting conversations & extracting facts...",
+            "analyze_spreadsheet": "📊 Fetching attachment and sending to Atlas for analysis...",
         }
         return desc_map.get(tool_name, f"Executing {tool_name}...")
+
+    def _is_search_tool(tool_name: str) -> bool:
+        return tool_name in {"query_cig", "search_past_conversations", "check_studio"}
+
+    def _stop_searching_message(tool_name: str) -> str:
+        if tool_name == "query_cig":
+            return (
+                "SYSTEM: You have already searched CIG enough for this turn. "
+                "Do not call query_cig, check_studio, or search_past_conversations again. "
+                "Use the email/context results you already have. If the user asked to create workspace pages or documents, delegate to Scribe now with hub_delegate."
+            )
+        if tool_name == "search_past_conversations":
+            return (
+                "SYSTEM: You have already searched conversation history enough for this turn. "
+                "Do not search again. Summarize what you found and continue the user's task. "
+                "If document construction is requested, delegate to Scribe now."
+            )
+        return (
+            "SYSTEM: You have already checked the local context enough for this turn. "
+            "Do not call more search/read tools. Answer, ask one focused clarification, or delegate to the right agent now."
+        )
 
     def make_tool_handler(tool_name: str):
         async def handler(params: FunctionCallParams):
@@ -372,9 +405,17 @@ async def run_bot(
                 _last_tool_call["name"] == tool_name and 
                 _last_tool_call["args"] == args_str and
                 _last_tool_call["result"] is not None):
-                logger.warning(f"🔥 Duplicate tool call detected: {tool_name}, returning cached result")
-                await params.result_callback(_last_tool_call["result"])
+                logger.warning(f"🔥 Duplicate tool call detected: {tool_name}, forcing response")
+                await params.result_callback(
+                    f"SYSTEM: Duplicate {tool_name} call blocked. Do not call this tool again with the same arguments. "
+                    "Use the prior result already in context and respond to the user now."
+                )
                 logger.info(f"🔥 Duplicate callback completed for {tool_name}")
+                return
+
+            if _search_tools_exhausted[0] and _is_search_tool(tool_name):
+                logger.warning(f"NOVA_TRAFFIC | tool={tool_name} | provider=local:search | status=search_budget_exhausted")
+                await params.result_callback(_stop_searching_message(tool_name))
                 return
             
             _tool_calls_this_turn[0] += 1
@@ -397,10 +438,14 @@ async def run_bot(
             tool_limit = _PER_TOOL_LIMITS.get(tool_name, 99)  # no limit for unlisted tools
             if tool_count > tool_limit:
                 logger.warning(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | status=rate_limited | call={tool_count}/{tool_limit}")
-                await params.result_callback(
-                    f"[{tool_name} rate-limited: already called {tool_count - 1}x this turn, limit={tool_limit}] "
-                    "Use the data you already have to answer the user."
-                )
+                if _is_search_tool(tool_name):
+                    _search_tools_exhausted[0] = True
+                    await params.result_callback(_stop_searching_message(tool_name))
+                else:
+                    await params.result_callback(
+                        f"SYSTEM: {tool_name} has already been called {tool_count - 1} times this turn. "
+                        "Use the data you already have to answer the user. Do not call more tools unless required to complete a user-requested action."
+                    )
                 return
 
             # ── Auto-heartbeat after sustained tool chains ──
@@ -425,9 +470,34 @@ async def run_bot(
                     "type": "thinking",
                     "text": thinking_text,
                 })
+                
+            # Emit granular validationStep for UI
+            await _send_server_msg({
+                "type": "validationStep",
+                "tool": tool_name,
+                "status": "running",
+            })
+            
+            from nova.hypothesis import get_hypothesis_validator
+            validator = get_hypothesis_validator()
+            if validator and validator.active:
+                # We skip sending the message again since we just sent it, 
+                # but we need to record it in the session
+                validator.current_session.start_tool(tool_name)
 
             # ── Background path: tool executes ──
             _t_start = time.monotonic()
+            
+            async def _heartbeat_loop():
+                try:
+                    while True:
+                        await asyncio.sleep(15)
+                        await _send_server_msg({"type": "heartbeat", "text": "Still working on it..."})
+                except asyncio.CancelledError:
+                    pass
+
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
+            
             try:
                 # Add timeout to prevent tools from hanging indefinitely
                 # Slow delegation tools need much longer timeouts
@@ -437,6 +507,7 @@ async def run_bot(
                     "tesla_wake": 60,           # 60s — wake + poll for vehicle online
                     "service_status": 30,       # 30s — Docker API
                     "homelab_diagnostics": 60,  # 60s — Full diagnostics
+                    "manage_workspace": 300,    # 5 min — API latency + potential approval flow
                 }
                 tool_timeout = _SLOW_TOOL_TIMEOUTS.get(tool_name, 30.0)
                 result = await asyncio.wait_for(dispatch_tool(tool_name, args), timeout=tool_timeout)
@@ -445,21 +516,81 @@ async def run_bot(
                 _bytes_out = len(result_str.encode())
                 logger.info(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out={_bytes_out} | status=ok")
                 logger.info(f"Tool {tool_name} returned type={type(result).__name__}, len={len(result_str)}, content={result_str[:200]}")
+                lower_result = result_str.lower()
+                if _is_search_tool(tool_name) and (
+                    "no cig knowledge graph results" in lower_result
+                    or "no emails found" in lower_result
+                    or "thread lookup failed" in lower_result
+                    or "thread not found" in lower_result
+                    or "you've already searched" in lower_result
+                    or "no past conversations found" in lower_result
+                ):
+                    _search_tools_exhausted[0] = True
             except asyncio.TimeoutError:
                 _latency_ms = int((time.monotonic() - _t_start) * 1000)
                 logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=timeout")
                 result = f"Tool {tool_name} timed out after {tool_timeout:.0f}s. The operation took too long to complete."
+                await _send_server_msg({
+                    "type": "validationStep",
+                    "tool": tool_name,
+                    "status": "failed",
+                    "result": "Timed out",
+                })
+                if validator and validator.active:
+                    validator.current_session.fail_tool(tool_name, "Timed out")
             except Exception as e:
                 _latency_ms = int((time.monotonic() - _t_start) * 1000)
                 logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=error | err={e}")
                 result = f"Tool execution error: {str(e)}"
+                await _send_server_msg({
+                    "type": "validationStep",
+                    "tool": tool_name,
+                    "status": "failed",
+                    "result": "Error occurred",
+                })
+                if validator and validator.active:
+                    validator.current_session.fail_tool(tool_name, str(e))
+            finally:
+                heartbeat_task.cancel()
             
             # Structured-card support: tools may return a dict of the shape
             #   {"speakable": "<text for LLM/TTS>", "card": {"kind": "...", ...}}
             # in which case we forward the card to iOS as a server message and
             # only feed the speakable text back to the LLM. Falls through to
             # normal string handling for every other tool.
-            if isinstance(result, dict) and "card" in result and "speakable" in result:
+            if isinstance(result, dict) and result.get("display") and result.get("speech"):
+                display_text = str(result.get("display") or "")
+                speech_text = str(result.get("speech") or result.get("speakable") or display_text)
+                card_payload = result.get("card") or {}
+                if card_payload:
+                    try:
+                        await _send_server_msg({
+                            "type": "card",
+                            "kind": card_payload.get("kind", "generic"),
+                            "tool": tool_name,
+                            "data": card_payload,
+                        })
+                        logger.info(f"Emitted card ({card_payload.get('kind')}) for tool {tool_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to emit card for {tool_name}: {e}")
+                from nova.text_utils import strip_markdown_for_speech
+                speech_text = strip_markdown_for_speech(speech_text)
+                await _send_server_msg({
+                    "type": "validated",
+                    "text": display_text,
+                    "speechText": speech_text,
+                    "result": tool_name,
+                    "suppressSpeech": False,
+                })
+                if display_text.strip():
+                    await append_turn(session.session_id, "assistant", display_text)
+                    asyncio.create_task(_sync_message_to_backend(
+                        conversation_id, user_id, "assistant", display_text,
+                        model=LLM_MODEL,
+                    ))
+                _structured_final_response_this_turn[0] = True
+                result = f"{tool_name} completed. A structured visual response and separate speech summary have already been sent to the user. Do not add another answer."
+            elif isinstance(result, dict) and "card" in result and "speakable" in result:
                 card_payload = result.get("card") or {}
                 try:
                     await _send_server_msg({
@@ -478,8 +609,31 @@ async def run_bot(
             if not result_str or not result_str.strip():
                 logger.error(f"Tool {tool_name} returned empty result (type={type(result).__name__}), injecting error message")
                 result = f"Tool {tool_name} executed but returned no data. Please try again or use a different approach."
+                await _send_server_msg({
+                    "type": "validationStep",
+                    "tool": tool_name,
+                    "status": "failed",
+                    "result": "No data returned",
+                })
+                if validator and validator.active:
+                    validator.current_session.fail_tool(tool_name, "No data returned")
             else:
                 result = result_str
+                # Only emit completed if it wasn't already emitted as failed in the except blocks
+                # We can check if it's an error string, but simply emitting completed here is fine for successful paths.
+                # Actually, wait, the exception blocks set result to a string and continue, so they fall through here!
+                # We should conditionally emit "completed" only if not an error.
+                if not result_str.startswith("Tool execution error:") and not result_str.startswith(f"Tool {tool_name} timed out"):
+                    # Extract a snippet for the UI
+                    snippet = result_str[:100]
+                    await _send_server_msg({
+                        "type": "validationStep",
+                        "tool": tool_name,
+                        "status": "completed",
+                        "result": snippet,
+                    })
+                    if validator and validator.active:
+                        validator.current_session.complete_tool(tool_name, snippet)
 
             # Clear ThinkingCard phase so the LLM's next response is spoken, not swallowed
             if tool_name in _SLOW_TOOLS:
@@ -561,6 +715,20 @@ async def run_bot(
     # ── Conversation Compaction (negative exponential decay + PCG facts) ──
     llm.register_function("compact_conversations", make_tool_handler("compact_conversations"))
 
+    # ── Analyze Spreadsheet (email attachment → Atlas data analysis) ──
+    llm.register_function("analyze_spreadsheet", make_tool_handler("analyze_spreadsheet"))
+
+    # ── Missing tool registrations ──────────────────────────────────────
+    llm.register_function("manage_ticket", make_tool_handler("manage_ticket"))
+    llm.register_function("query_workspace", make_tool_handler("query_workspace"))
+    llm.register_function("manage_workspace", make_tool_handler("manage_workspace"))
+    llm.register_function("manage_notes", make_tool_handler("manage_notes"))
+    llm.register_function("exomind", make_tool_handler("exomind"))
+    llm.register_function("ev_route_planner", make_tool_handler("ev_route_planner"))
+    llm.register_function("youtube", make_tool_handler("youtube"))
+    llm.register_function("homelab_operations", make_tool_handler("homelab_operations"))
+    llm.register_function("homelab_diagnostics", make_tool_handler("homelab_diagnostics"))
+
     # ── Context with history restoration ─────────────────────────────────
     messages = [{"role": "system", "content": system_prompt}]
 
@@ -603,19 +771,25 @@ async def run_bot(
             await super().process_frame(frame, direction)
 
             if isinstance(frame, LLMFullResponseStartFrame):
-                _pi_thinking_sent[0] = True
                 _pi_first_text[0] = False
-                await _send_server_msg({"phase": "thinking"})
-                await ctx_watcher.check_and_persist()
+                if not _structured_final_response_this_turn[0]:
+                    _pi_thinking_sent[0] = True
+                    await _send_server_msg({"phase": "thinking"})
+                    await ctx_watcher.check_and_persist()
 
             elif isinstance(frame, LLMTextFrame):
+                if _structured_final_response_this_turn[0]:
+                    return
                 _pi_buffer.append(frame.text)
                 if not _pi_first_text[0]:
                     _pi_first_text[0] = True
                     await _send_server_msg({"phase": "responding"})
 
             elif isinstance(frame, LLMFullResponseEndFrame):
-                if _pi_buffer:
+                if _structured_final_response_this_turn[0]:
+                    _pi_buffer.clear()
+                    _structured_final_response_this_turn[0] = False
+                elif _pi_buffer:
                     full_text = "".join(_pi_buffer)
                     _pi_buffer.clear()
                     if full_text.strip():
@@ -644,6 +818,52 @@ async def run_bot(
 
             await self.push_frame(frame, direction)
 
+    class TurnOrchestratorFrameProcessor(FrameProcessor):
+        async def process_frame(self, frame, direction):
+            await super().process_frame(frame, direction)
+
+            text = ""
+            if isinstance(frame, InputTransportMessageFrame):
+                msg = frame.message
+                if isinstance(msg, dict) and msg.get("type") == "send-text":
+                    data = msg.get("data", {})
+                    text = data.get("content", "") if isinstance(data, dict) else ""
+            elif isinstance(frame, TranscriptionFrame):
+                if getattr(frame, "user_id", "") != "system":
+                    text = getattr(frame, "text", "") or ""
+
+            if text:
+                plan = decide_turn(text, _turn_state)
+
+                async def _persist(role: str, content: str):
+                    await append_turn(session.session_id, role, content)
+                    asyncio.create_task(_sync_message_to_backend(
+                        conversation_id, user_id, role, content,
+                        model=LLM_MODEL if role == "assistant" else None,
+                    ))
+
+                handled = await execute_turn_plan(
+                    plan,
+                    _turn_state,
+                    dispatch_tool,
+                    _send_server_msg,
+                    _persist,
+                )
+                if handled:
+                    try:
+                        await update_session_metadata_key(
+                            session.session_id,
+                            STATE_METADATA_KEY,
+                            turn_state_to_metadata_value(_turn_state),
+                        )
+                    except Exception as e:
+                        logger.warning(f"TurnOrchestrator state persist failed: {e}")
+                    return
+
+            await self.push_frame(frame, direction)
+
+    turn_orchestrator = TurnOrchestratorFrameProcessor()
+
     # Build pipeline based on audio mode
     if use_server_audio:
         # Server-side STT/TTS mode using local Whisper + Qwen TTS
@@ -664,6 +884,7 @@ async def run_bot(
         pipeline = Pipeline([
             transport.input(),
             stt,
+            turn_orchestrator,
             user_aggregator,
             llm,
             PersistenceInterceptor(),
@@ -674,9 +895,7 @@ async def run_bot(
     else:
         # iOS native STT/TTS mode - text via data channel, no VAD needed
         from pipecat.frames.frames import (
-            InputTransportMessageFrame,
             OutputTransportMessageFrame,
-            TranscriptionFrame,
             TextFrame,
         )
         import re as _re
@@ -695,6 +914,36 @@ async def run_bot(
             r'|query_frameworks)\b[^\]]*\]',
             _re.IGNORECASE,
         )
+        _native_tts_in_table: list[bool] = [False]
+
+        def _suppress_markdown_table_chunks(text: str) -> str:
+            parts = _re.split("(\n)", text)
+            kept: list[str] = []
+            current = ""
+            for part in parts:
+                if part == "\n":
+                    stripped = current.strip()
+                    if stripped.startswith("|") or _native_tts_in_table[0]:
+                        _native_tts_in_table[0] = False
+                    else:
+                        kept.append(current)
+                        kept.append(part)
+                    current = ""
+                    continue
+                current += part
+            if current:
+                stripped = current.strip()
+                if stripped.startswith("|"):
+                    _native_tts_in_table[0] = True
+                elif _native_tts_in_table[0]:
+                    if "|" in current:
+                        _native_tts_in_table[0] = True
+                    else:
+                        _native_tts_in_table[0] = False
+                        kept.append(current)
+                else:
+                    kept.append(current)
+            return "".join(kept)
 
         class NativeTextBridge(FrameProcessor):
             """Bridge for native STT/TTS mode with tool-syntax filtering.
@@ -743,6 +992,9 @@ async def run_bot(
                         if not cleaned.strip():
                             # Entire frame was tool syntax — drop it
                             return
+                    cleaned = _suppress_markdown_table_chunks(cleaned)
+                    if not cleaned.strip():
+                        return
                     # Step 2: Strip markdown for TTS (bold, headers, pipes, emojis)
                     # iOS TTS reads raw markdown verbatim — pipes become "pipe", dashes become "minus"
                     from nova.text_utils import strip_markdown_for_speech
@@ -750,12 +1002,15 @@ async def run_bot(
                     cleaned = strip_markdown_for_speech(cleaned)
                     if cleaned != pre_strip:
                         logger.debug(f"🧼 Stripped markdown from LLM text: '{pre_strip[:80]}' → '{cleaned[:80]}'")
+                    if cleaned != original:
                         frame.text = cleaned
 
                 # Log LLMFullResponseStartFrame/EndFrame
                 if isinstance(frame, LLMFullResponseStartFrame):
+                    _native_tts_in_table[0] = False
                     logger.info(f"✅ LLMFullResponseStartFrame → triggers bot-llm-started")
                 if isinstance(frame, LLMFullResponseEndFrame):
+                    _native_tts_in_table[0] = False
                     logger.info(f"✅ LLMFullResponseEndFrame → triggers bot-llm-stopped")
 
                 await self.push_frame(frame, direction)
@@ -766,6 +1021,7 @@ async def run_bot(
 
         pipeline = Pipeline([
             transport.input(),
+            turn_orchestrator,
             user_aggregator,
             llm,
             PersistenceInterceptor(),
@@ -821,6 +1077,8 @@ async def run_bot(
                         _tool_calls_this_turn[0] = 0
                         _per_tool_call_counts.clear()
                         _last_tool_call.update({"name": None, "args": None, "result": None})
+                        _structured_final_response_this_turn[0] = False
+                        _search_tools_exhausted[0] = False
                         await append_turn(session.session_id, "user", content)
                         await _sync_message_to_backend(
                             conversation_id, user_id, "user", content

@@ -159,6 +159,11 @@ async def get_page_blocks(page_id: str) -> list:
     return result if isinstance(result, list) else []
 
 
+async def delete_page(page_id: str) -> bool:
+    """Delete a page in Pi Workspace."""
+    return await _ws_delete(f"/api/pages/{page_id}")
+
+
 async def create_block(page_id: str, block_type: str, properties: dict, parent_id: str = "") -> dict:
     body = {"type": block_type, "properties": properties}
     if parent_id:

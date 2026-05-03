@@ -851,6 +851,7 @@ TOOL_DEFINITIONS = [
                 "create_page (new note or document), "
                 "create_page_with_blocks (new page with multiple content blocks in one call — ideal for worksheets, quizzes, structured docs), "
                 "get_page (read page content and blocks), "
+                "delete_page (delete a page, requires intent for approval), "
                 "add_block (add content block to a page), "
                 "search (hybrid FTS + vector search across all content), "
                 "list_databases (browse databases), "
@@ -1000,6 +1001,10 @@ TOOL_DEFINITIONS = [
                     "message": {
                         "type": "string",
                         "description": "Message for AI chat",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Explanation of intent for approval-gated actions like delete_page",
                     },
                 },
                 "required": ["action"],
@@ -3534,11 +3539,12 @@ async def handle_manage_workspace(
     assignee: str = "",
     fields: list | None = None,
     message: str = "",
+    intent: str = "",
     **kwargs,
 ) -> str:
     """Handle Pi Workspace operations via the Workspace API (port 8762)."""
     from nova.pi_workspace import (
-        create_page, create_page_with_blocks, list_pages, get_page, get_page_blocks, create_block,
+        create_page, create_page_with_blocks, list_pages, get_page, get_page_blocks, create_block, delete_page,
         create_database, list_databases, list_database_rows, create_database_row,
         update_database_row, create_form, submit_form,
         get_planner_day, create_task, update_task, delete_task,
@@ -3653,6 +3659,43 @@ async def handle_manage_workspace(
                     text = props.get("richText", [{}])[0].get("plainText", "") if props.get("richText") else title
                     lines.append(f"  📋 {text} [{props.get('status', '?')}] P{props.get('priority', '?')}")
             return "\n".join(lines)
+
+        elif action == "delete_page":
+            if not page_id:
+                return "page_id is required for delete_page."
+            full_id, msg = await _resolve_page_id(page_id)
+            if not full_id:
+                return msg or f"Page {page_id} not found."
+                
+            if not intent:
+                return "DENIED: You must provide an 'intent' explaining why this page needs to be deleted."
+                
+            from nova.homelab_mutate import _request_approval, _poll_approval_status
+            
+            page_data = await get_page(full_id)
+            page_title = _plain_title(page_data.get("title", "Untitled")) if page_data else full_id
+            
+            context = f"{intent} | Page: {page_title} ({full_id})"
+            
+            try:
+                approval = await _request_approval(
+                    tool_name="workspace_page_delete",
+                    arguments={"page_id": full_id, "title": page_title, "intent": intent},
+                    risk_level="medium",
+                    context=context,
+                )
+            except Exception as e:
+                return f"DENIED: Could not reach approval engine: {e}"
+                
+            result = await _poll_approval_status(approval["id"])
+            status = result.get("status", "error")
+            
+            if status != "approved":
+                reason = result.get("decisionReason") or result.get("reason") or status
+                return f"Deletion of page '{page_title}' was {status}. {reason}"
+                
+            success = await delete_page(full_id)
+            return f"Deleted page '{page_title}' ({full_id}) successfully." if success else f"Failed to delete page '{page_title}'."
 
         elif action == "add_block":
             if not page_id or not block_type:
