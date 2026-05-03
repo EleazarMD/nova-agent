@@ -30,9 +30,9 @@ except ImportError:
 DB_PATH = os.environ.get("SQLITE_PATH", "./data/nova.db")
 PG_DSN = os.environ.get("DATABASE_URL", "postgresql://eleazar@localhost/ecosystem_unified")
 
-# NVIDIA NIM Embeddings (nv-embedqa-e5-v5, 1024-dim, TensorRT on RTX GPU)
+# NVIDIA NIM Embeddings (llama-3.2-nv-embedqa-1b-v2, 2048-dim, TensorRT on RTX GPU)
 _NIM_EMBED_URL = os.environ.get("NIM_EMBED_URL", "http://localhost:8006/v1/embeddings")
-_NIM_EMBED_MODEL = os.environ.get("NIM_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+_NIM_EMBED_MODEL = os.environ.get("NIM_EMBED_MODEL", "nvidia/llama-3.2-nv-embedqa-1b-v2")
 _nim_available: Optional[bool] = None
 
 # Reusable asyncpg pool (lazy-initialized)
@@ -69,14 +69,14 @@ async def _check_nim_available() -> bool:
             except Exception:
                 _nim_available = False
         if _nim_available:
-            logger.info("NVIDIA NIM embeddings available (nv-embedqa-e5-v5, 1024-dim)")
+            logger.info("NVIDIA NIM embeddings available (llama-3.2-nv-embedqa-1b-v2, 2048-dim)")
         else:
             logger.warning("NVIDIA NIM embeddings not reachable")
     return _nim_available
 
 
 async def generate_embedding(text: str, input_type: str = "passage") -> list[float] | None:
-    """Generate embedding via NVIDIA NIM (nv-embedqa-e5-v5, 1024-dim, TensorRT on RTX GPU).
+    """Generate embedding via NVIDIA NIM (llama-3.2-nv-embedqa-1b-v2, 2048-dim, TensorRT on RTX GPU).
     
     Truncates to 500 chars to stay under NIM's 512-token limit.
     """

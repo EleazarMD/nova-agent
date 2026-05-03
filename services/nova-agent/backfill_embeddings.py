@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Backfill embeddings for existing ai_messages using NVIDIA NIM (nv-embedqa-e5-v5).
+"""Backfill embeddings for existing ai_messages using NVIDIA NIM (llama-3.2-nv-embedqa-1b-v2).
 
-Processes messages in batches, generates 1024-dim embeddings via NIM,
+Processes messages in batches, generates 2048-dim embeddings via NIM,
 and updates the embedding column in PostgreSQL.
 
 Usage:
@@ -25,7 +25,7 @@ logger.remove()
 logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
 
 NIM_EMBED_URL = os.environ.get("NIM_EMBED_URL", "http://localhost:8006/v1/embeddings")
-NIM_EMBED_MODEL = os.environ.get("NIM_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+NIM_EMBED_MODEL = os.environ.get("NIM_EMBED_MODEL", "nvidia/llama-3.2-nv-embedqa-1b-v2")
 PG_DSN = os.environ.get("DATABASE_URL", "postgresql://eleazar@localhost/ecosystem_unified")
 
 

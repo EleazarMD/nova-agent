@@ -43,7 +43,7 @@ Search through Nova's conversation history using semantic vector search with dat
 
 ## Search Strategy
 
-1. **Primary**: NVIDIA NIM semantic vector search (nv-embedqa-e5-v5, 1024-dim) via pgvector cosine similarity
+1. **Primary**: NVIDIA NIM semantic vector search (llama-3.2-nv-embedqa-1b-v2, 2048-dim) via pgvector cosine similarity
 2. **Fallback**: ILIKE keyword search if embeddings unavailable
 3. **Local fallback**: SQLite keyword search
 
@@ -63,10 +63,10 @@ Assistant: Invoking @conversation-search with query="Tesla integration", days_ba
 - Primary: NVIDIA NIM (port 8006) embeddings + pgvector cosine similarity on PostgreSQL
 - Fallback: ILIKE keyword search on PostgreSQL
 - Local fallback: SQLite keyword search
-- All 3023+ messages embedded with 1024-dim vectors
+- All 3023+ messages embedded with 2048-dim vectors
 - Results include conversation snippets with relevance scores
 
 ## References
 
 - Script: `nova/store.py` → `search_past_conversations`
-- PostgreSQL: `workspace.ai_messages.embedding` (vector(1024))
+- PostgreSQL: `workspace.ai_messages.embedding` (vector(2048))
