@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import time
 import json
+import asyncio
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from nova.turn_policy import extract_location_prefix, extract_turn_features, log_policy_observation, shadow_policy_predict
+from nova.turn_policy import build_policy_observation, extract_location_prefix, extract_turn_features, log_policy_observation, shadow_policy_predict
 
 
 DispatchTool = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -134,6 +135,46 @@ class TurnMetrics:
 
 
 _METRICS = TurnMetrics()
+
+
+async def _persist_policy_observation(observation) -> None:
+    try:
+        from nova.store import append_turn_policy_observation
+        await append_turn_policy_observation(observation)
+    except Exception as e:
+        logger.warning(f"Failed to persist turn policy observation: {e}")
+
+
+def _record_policy_outcome(
+    text: str,
+    state: "TurnState",
+    result: "TurnExecutionResult",
+    latency_ms: int = 0,
+) -> None:
+    features = extract_turn_features(text, state)
+    shadow_candidate = shadow_policy_predict(features)
+    outcome = "handled" if result.handled else "pass_through"
+    observation = build_policy_observation(
+        features=features,
+        deterministic_intent=result.intent or TurnIntent.PASS_THROUGH.value,
+        shadow_candidate=shadow_candidate,
+        handled=result.handled,
+        outcome=outcome,
+        tools_used=result.tools_used,
+        stop_reason=result.stop_reason,
+        latency_ms=latency_ms,
+    )
+    log_policy_observation(
+        features=features,
+        deterministic_intent=observation.deterministic_intent,
+        shadow_candidate=shadow_candidate,
+        handled=result.handled,
+        outcome=outcome,
+        tools_used=result.tools_used,
+        stop_reason=result.stop_reason,
+        latency_ms=latency_ms,
+    )
+    asyncio.create_task(_persist_policy_observation(observation))
 
 
 @dataclass
@@ -750,6 +791,7 @@ async def execute_turn_plan_result(
     if plan.intent == TurnIntent.PASS_THROUGH:
         result = TurnExecutionResult(handled=False, intent=plan.intent.value)
         _METRICS.record(result)
+        _record_policy_outcome(plan.user_text, state, result)
         return result
 
     started = time.monotonic()
@@ -760,6 +802,7 @@ async def execute_turn_plan_result(
     if handler is None:
         result = TurnExecutionResult(handled=False, intent=plan.intent.value)
         _METRICS.record(result)
+        _record_policy_outcome(plan.user_text, state, result)
         return result
     runtime = TurnRuntime(
         plan=plan,
@@ -772,6 +815,7 @@ async def execute_turn_plan_result(
     )
     result = await handler(runtime)
     _METRICS.record(result, telemetry.latency_ms)
+    _record_policy_outcome(plan.user_text, state, result, telemetry.latency_ms)
     return result
 
 

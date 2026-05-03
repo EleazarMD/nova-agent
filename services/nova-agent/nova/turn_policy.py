@@ -56,6 +56,32 @@ class PolicyCandidate:
         return asdict(self)
 
 
+@dataclass
+class TurnPolicyObservation:
+    ts: int
+    features: TurnFeatures
+    deterministic_intent: str
+    shadow_candidate: PolicyCandidate | None
+    handled: bool | None = None
+    outcome: str = "observed"
+    tools_used: list[str] = field(default_factory=list)
+    stop_reason: str = ""
+    latency_ms: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ts": self.ts,
+            "features": self.features.to_dict(),
+            "deterministic_intent": self.deterministic_intent,
+            "shadow_candidate": self.shadow_candidate.to_dict() if self.shadow_candidate else None,
+            "handled": self.handled,
+            "outcome": self.outcome,
+            "tools_used": self.tools_used,
+            "stop_reason": self.stop_reason,
+            "latency_ms": self.latency_ms,
+        }
+
+
 _CURRENT_TERMS = (
     "current",
     "right now",
@@ -153,13 +179,43 @@ def log_policy_observation(
     shadow_candidate: PolicyCandidate | None,
     handled: bool | None = None,
     outcome: str = "observed",
+    tools_used: list[str] | None = None,
+    stop_reason: str = "",
+    latency_ms: int = 0,
 ) -> None:
-    payload = {
-        "ts": int(time.time()),
-        "features": features.to_dict(),
-        "deterministic_intent": deterministic_intent,
-        "shadow_candidate": shadow_candidate.to_dict() if shadow_candidate else None,
-        "handled": handled,
-        "outcome": outcome,
-    }
-    logger.info(f"NOVA_TURN_POLICY | {json.dumps(payload, sort_keys=True)}")
+    observation = TurnPolicyObservation(
+        ts=int(time.time()),
+        features=features,
+        deterministic_intent=deterministic_intent,
+        shadow_candidate=shadow_candidate,
+        handled=handled,
+        outcome=outcome,
+        tools_used=tools_used or [],
+        stop_reason=stop_reason,
+        latency_ms=latency_ms,
+    )
+    logger.info(f"NOVA_TURN_POLICY | {json.dumps(observation.to_dict(), sort_keys=True)}")
+
+
+def build_policy_observation(
+    *,
+    features: TurnFeatures,
+    deterministic_intent: str,
+    shadow_candidate: PolicyCandidate | None,
+    handled: bool | None = None,
+    outcome: str = "observed",
+    tools_used: list[str] | None = None,
+    stop_reason: str = "",
+    latency_ms: int = 0,
+) -> TurnPolicyObservation:
+    return TurnPolicyObservation(
+        ts=int(time.time()),
+        features=features,
+        deterministic_intent=deterministic_intent,
+        shadow_candidate=shadow_candidate,
+        handled=handled,
+        outcome=outcome,
+        tools_used=tools_used or [],
+        stop_reason=stop_reason,
+        latency_ms=latency_ms,
+    )

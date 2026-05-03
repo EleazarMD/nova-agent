@@ -151,6 +151,33 @@ async def init_db(path: str = DB_PATH):
             CREATE INDEX IF NOT EXISTS idx_turns_session
             ON turns(session_id, timestamp ASC)
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS turn_policy_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                utterance_hash TEXT NOT NULL,
+                normalized_text TEXT NOT NULL,
+                deterministic_intent TEXT NOT NULL,
+                shadow_intent TEXT,
+                shadow_confidence REAL,
+                handled INTEGER,
+                outcome TEXT NOT NULL,
+                tools_used TEXT,
+                stop_reason TEXT,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                features_json TEXT NOT NULL,
+                shadow_candidate_json TEXT,
+                observation_json TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_policy_observations_hash
+            ON turn_policy_observations(utterance_hash, timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_policy_observations_intent
+            ON turn_policy_observations(deterministic_intent, timestamp DESC)
+        """)
         await db.commit()
 
 
@@ -199,6 +226,39 @@ async def get_or_create_session(
             )
 
 
+async def get_session_metadata(session_id: str, path: str = DB_PATH) -> dict:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT metadata FROM sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        if not rows or not rows[0]["metadata"]:
+            return {}
+        try:
+            data = json.loads(rows[0]["metadata"])
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            logger.warning(f"Invalid session metadata JSON for {session_id}")
+            return {}
+
+
+async def update_session_metadata(session_id: str, metadata: dict, path: str = DB_PATH):
+    now = time.time()
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            "UPDATE sessions SET metadata = ?, last_active = ? WHERE session_id = ?",
+            (json.dumps(metadata), now, session_id),
+        )
+        await db.commit()
+
+
+async def update_session_metadata_key(session_id: str, key: str, value, path: str = DB_PATH):
+    metadata = await get_session_metadata(session_id, path=path)
+    metadata[key] = value
+    await update_session_metadata(session_id, metadata, path=path)
+
+
 async def append_turn(
     session_id: str,
     role: str,
@@ -219,6 +279,87 @@ async def append_turn(
             (now, session_id),
         )
         await db.commit()
+
+
+async def append_turn_policy_observation(observation, path: str = DB_PATH):
+    features = observation.features.to_dict()
+    shadow = observation.shadow_candidate.to_dict() if observation.shadow_candidate else None
+    payload = observation.to_dict()
+    async with aiosqlite.connect(path) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS turn_policy_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                utterance_hash TEXT NOT NULL,
+                normalized_text TEXT NOT NULL,
+                deterministic_intent TEXT NOT NULL,
+                shadow_intent TEXT,
+                shadow_confidence REAL,
+                handled INTEGER,
+                outcome TEXT NOT NULL,
+                tools_used TEXT,
+                stop_reason TEXT,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                features_json TEXT NOT NULL,
+                shadow_candidate_json TEXT,
+                observation_json TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_policy_observations_hash
+            ON turn_policy_observations(utterance_hash, timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_policy_observations_intent
+            ON turn_policy_observations(deterministic_intent, timestamp DESC)
+        """)
+        await db.execute(
+            """
+            INSERT INTO turn_policy_observations (
+                timestamp,
+                utterance_hash,
+                normalized_text,
+                deterministic_intent,
+                shadow_intent,
+                shadow_confidence,
+                handled,
+                outcome,
+                tools_used,
+                stop_reason,
+                latency_ms,
+                features_json,
+                shadow_candidate_json,
+                observation_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                float(observation.ts),
+                str(features.get("utterance_hash") or ""),
+                str(features.get("normalized_text") or ""),
+                observation.deterministic_intent,
+                shadow.get("intent") if shadow else None,
+                float(shadow.get("confidence")) if shadow and shadow.get("confidence") is not None else None,
+                None if observation.handled is None else int(bool(observation.handled)),
+                observation.outcome,
+                json.dumps(observation.tools_used),
+                observation.stop_reason,
+                int(observation.latency_ms or 0),
+                json.dumps(features),
+                json.dumps(shadow) if shadow else None,
+                json.dumps(payload),
+            ),
+        )
+        await db.commit()
+
+
+async def get_recent_turn_policy_observations(limit: int = 100, path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM turn_policy_observations ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
 
 
 async def get_history(
