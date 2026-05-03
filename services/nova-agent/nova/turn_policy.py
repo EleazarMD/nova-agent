@@ -109,6 +109,33 @@ _SIDE_EFFECT_TERMS = (
     "set ",
     "change",
 )
+_CORRECTION_TERMS = (
+    "no ",
+    "no,",
+    "wrong",
+    "not what i asked",
+    "that's not what i asked",
+    "that is not what i asked",
+    "try again",
+    "you missed",
+    "where is",
+    "where's",
+    "i asked for",
+    "i wanted",
+    "you didn't",
+    "you did not",
+)
+
+
+@dataclass
+class OutcomeLabel:
+    outcome: str
+    confidence: float
+    reason: str
+    target_observation_id: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def normalize_turn_text(text: str) -> str:
@@ -169,6 +196,51 @@ def shadow_policy_predict(features: TurnFeatures) -> PolicyCandidate | None:
             evidence_budget={"get_weather": 1},
             presentation="weather_card_table_plus_clean_speech",
         )
+    return None
+
+
+def label_previous_turn_outcome(current_text: str, previous_observation: dict[str, Any] | None) -> OutcomeLabel | None:
+    if not previous_observation:
+        return None
+    normalized = normalize_turn_text(current_text)
+    if not normalized:
+        return None
+    previous_text = str(previous_observation.get("normalized_text") or "")
+    previous_intent = str(previous_observation.get("deterministic_intent") or "")
+    previous_shadow_intent = str(previous_observation.get("shadow_intent") or "")
+    previous_handled = previous_observation.get("handled")
+    target_id = previous_observation.get("id")
+    correction_hit = any(term in normalized for term in _CORRECTION_TERMS)
+    if correction_hit:
+        return OutcomeLabel(
+            outcome="user_correction",
+            confidence=0.86,
+            reason="Next user turn contains correction language.",
+            target_observation_id=int(target_id) if target_id is not None else None,
+        )
+    if previous_text and normalized == previous_text:
+        return OutcomeLabel(
+            outcome="repeat_request",
+            confidence=0.9,
+            reason="Next user turn exactly repeated the previous normalized request.",
+            target_observation_id=int(target_id) if target_id is not None else None,
+        )
+    if previous_text and (previous_text in normalized or normalized in previous_text) and min(len(previous_text), len(normalized)) >= 12:
+        return OutcomeLabel(
+            outcome="near_repeat_request",
+            confidence=0.72,
+            reason="Next user turn substantially overlaps the previous request.",
+            target_observation_id=int(target_id) if target_id is not None else None,
+        )
+    if previous_handled == 0 and previous_shadow_intent and previous_shadow_intent != previous_intent:
+        current_features = extract_turn_features(current_text, None)
+        if previous_shadow_intent == "weather_lookup" and current_features.asks_weather:
+            return OutcomeLabel(
+                outcome="shadow_policy_likely_better",
+                confidence=0.78,
+                reason="Previous turn passed through while shadow policy predicted weather and user continued weather request.",
+                target_observation_id=int(target_id) if target_id is not None else None,
+            )
     return None
 
 

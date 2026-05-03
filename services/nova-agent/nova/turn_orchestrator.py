@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from nova.turn_policy import build_policy_observation, extract_location_prefix, extract_turn_features, log_policy_observation, shadow_policy_predict
+from nova.turn_policy import build_policy_observation, extract_location_prefix, extract_turn_features, label_previous_turn_outcome, log_policy_observation, shadow_policy_predict
 
 
 DispatchTool = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -145,12 +145,32 @@ async def _persist_policy_observation(observation) -> None:
         logger.warning(f"Failed to persist turn policy observation: {e}")
 
 
+async def _label_previous_policy_observation(text: str) -> None:
+    try:
+        from nova.store import get_recent_turn_policy_observations, label_turn_policy_observation
+        rows = await get_recent_turn_policy_observations(1)
+        previous = rows[0] if rows else None
+        label = label_previous_turn_outcome(text, previous)
+        if not label or label.target_observation_id is None:
+            return
+        updated = await label_turn_policy_observation(
+            label.target_observation_id,
+            label.outcome,
+            label.to_dict(),
+        )
+        if updated:
+            logger.info(f"NOVA_TURN_POLICY_LABEL | {json.dumps(label.to_dict(), sort_keys=True)}")
+    except Exception as e:
+        logger.warning(f"Failed to label previous turn policy observation: {e}")
+
+
 def _record_policy_outcome(
     text: str,
     state: "TurnState",
     result: "TurnExecutionResult",
     latency_ms: int = 0,
 ) -> None:
+    asyncio.create_task(_label_previous_policy_observation(text))
     features = extract_turn_features(text, state)
     shadow_candidate = shadow_policy_predict(features)
     outcome = "handled" if result.handled else "pass_through"

@@ -362,6 +362,38 @@ async def get_recent_turn_policy_observations(limit: int = 100, path: str = DB_P
         return [dict(row) for row in rows]
 
 
+async def label_turn_policy_observation(
+    observation_id: int,
+    outcome: str,
+    label: dict,
+    path: str = DB_PATH,
+) -> bool:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT observation_json FROM turn_policy_observations WHERE id = ?",
+            (observation_id,),
+        )
+        if not rows:
+            return False
+        try:
+            payload = json.loads(rows[0]["observation_json"] or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        payload["outcome"] = outcome
+        payload["outcome_label"] = label
+        await db.execute(
+            """
+            UPDATE turn_policy_observations
+            SET outcome = ?, observation_json = ?
+            WHERE id = ?
+            """,
+            (outcome, json.dumps(payload), observation_id),
+        )
+        await db.commit()
+        return True
+
+
 async def get_history(
     session_id: str,
     limit: int = 40,
