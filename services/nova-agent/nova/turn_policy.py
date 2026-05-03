@@ -138,6 +138,20 @@ class OutcomeLabel:
         return asdict(self)
 
 
+@dataclass
+class PlanCacheCandidate:
+    intent: str
+    confidence: float
+    reason: str
+    observation_id: int
+    tools_used: list[str] = field(default_factory=list)
+    stop_reason: str = ""
+    source: str = "semantic_plan_cache"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def normalize_turn_text(text: str) -> str:
     cleaned = re.sub(r"^\[User location:[^\]]+\]\s*", "", text.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r"\n?🧭 MODE POLICY:.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
@@ -242,6 +256,64 @@ def label_previous_turn_outcome(current_text: str, previous_observation: dict[st
                 target_observation_id=int(target_id) if target_id is not None else None,
             )
     return None
+
+
+def _token_set(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) > 2}
+
+
+def _jaccard_similarity(left: str, right: str) -> float:
+    left_tokens = _token_set(left)
+    right_tokens = _token_set(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def plan_cache_candidate_from_observation(
+    features: TurnFeatures,
+    observation: dict[str, Any],
+) -> PlanCacheCandidate | None:
+    try:
+        handled = int(observation.get("handled") or 0) == 1
+    except (TypeError, ValueError):
+        handled = False
+    outcome = str(observation.get("outcome") or "")
+    intent = str(observation.get("deterministic_intent") or "")
+    if not handled or outcome in {"user_correction", "repeat_request", "near_repeat_request"}:
+        return None
+    if not intent or intent == "pass_through":
+        return None
+    cached_text = str(observation.get("normalized_text") or "")
+    similarity = _jaccard_similarity(features.normalized_text, cached_text)
+    same_weather_shape = features.asks_weather and intent == "weather_lookup" and "weather" in cached_text
+    if same_weather_shape:
+        similarity = max(similarity, 0.72)
+    if similarity < 0.45:
+        return None
+    try:
+        tools_used = json.loads(observation.get("tools_used") or "[]")
+    except json.JSONDecodeError:
+        tools_used = []
+    confidence = min(0.95, 0.45 + similarity * 0.5)
+    return PlanCacheCandidate(
+        intent=intent,
+        confidence=round(confidence, 3),
+        reason=f"Similar successful handled observation; token_jaccard={similarity:.3f}",
+        observation_id=int(observation.get("id") or 0),
+        tools_used=tools_used if isinstance(tools_used, list) else [],
+        stop_reason=str(observation.get("stop_reason") or ""),
+    )
+
+
+def log_plan_cache_candidate(features: TurnFeatures, candidate: PlanCacheCandidate | None) -> None:
+    if not candidate:
+        return
+    payload = {
+        "features": features.to_dict(),
+        "candidate": candidate.to_dict(),
+    }
+    logger.info(f"NOVA_TURN_PLAN_CACHE | {json.dumps(payload, sort_keys=True)}")
 
 
 def log_policy_observation(

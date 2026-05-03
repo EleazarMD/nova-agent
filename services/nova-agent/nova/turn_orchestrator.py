@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from nova.turn_policy import build_policy_observation, extract_location_prefix, extract_turn_features, label_previous_turn_outcome, log_policy_observation, shadow_policy_predict
+from nova.turn_policy import build_policy_observation, extract_location_prefix, extract_turn_features, label_previous_turn_outcome, log_plan_cache_candidate, log_policy_observation, plan_cache_candidate_from_observation, shadow_policy_predict
 
 
 DispatchTool = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -162,6 +162,23 @@ async def _label_previous_policy_observation(text: str) -> None:
             logger.info(f"NOVA_TURN_POLICY_LABEL | {json.dumps(label.to_dict(), sort_keys=True)}")
     except Exception as e:
         logger.warning(f"Failed to label previous turn policy observation: {e}")
+
+
+async def _log_plan_cache_candidate(features) -> None:
+    try:
+        from nova.store import get_successful_turn_policy_observations
+        rows = await get_successful_turn_policy_observations(200)
+        candidates = [
+            candidate
+            for candidate in (plan_cache_candidate_from_observation(features, row) for row in rows)
+            if candidate is not None
+        ]
+        if not candidates:
+            return
+        best = max(candidates, key=lambda candidate: candidate.confidence)
+        log_plan_cache_candidate(features, best)
+    except Exception as e:
+        logger.warning(f"Failed to evaluate turn plan cache candidate: {e}")
 
 
 def _record_policy_outcome(
@@ -450,6 +467,7 @@ def decide_turn(text: str, state: TurnState) -> TurnPlan:
     lower = user_text.lower()
     features = extract_turn_features(text, state)
     shadow_candidate = shadow_policy_predict(features)
+    asyncio.create_task(_log_plan_cache_candidate(features))
 
     wants_workspace = _contains_any(lower, ("workspace", "page", "pages", "document", "documents", "advisory", "advisories", "report", "brief"))
     wants_lookup = _contains_any(lower, ("find", "lookup", "search", "email", "thread", "message"))

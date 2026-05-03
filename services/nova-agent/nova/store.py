@@ -362,6 +362,24 @@ async def get_recent_turn_policy_observations(limit: int = 100, path: str = DB_P
         return [dict(row) for row in rows]
 
 
+async def get_successful_turn_policy_observations(limit: int = 200, path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT *
+            FROM turn_policy_observations
+            WHERE handled = 1
+              AND deterministic_intent != 'pass_through'
+              AND outcome NOT IN ('user_correction', 'repeat_request', 'near_repeat_request')
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+
 async def label_turn_policy_observation(
     observation_id: int,
     outcome: str,
