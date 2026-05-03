@@ -178,6 +178,37 @@ async def init_db(path: str = DB_PATH):
             CREATE INDEX IF NOT EXISTS idx_turn_policy_observations_intent
             ON turn_policy_observations(deterministic_intent, timestamp DESC)
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS turn_policy_embeddings (
+                observation_id INTEGER PRIMARY KEY,
+                model TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (observation_id) REFERENCES turn_policy_observations(id)
+            )
+        """)
+        await db.execute("""
+            CREATE VIEW IF NOT EXISTS policy_intent_frequency AS
+            SELECT deterministic_intent, COUNT(*) as count, SUM(handled) as handled_count
+            FROM turn_policy_observations
+            GROUP BY deterministic_intent
+            ORDER BY count DESC
+        """)
+        await db.execute("""
+            CREATE VIEW IF NOT EXISTS policy_outcome_frequency AS
+            SELECT outcome, COUNT(*) as count
+            FROM turn_policy_observations
+            GROUP BY outcome
+            ORDER BY count DESC
+        """)
+        await db.execute("""
+            CREATE VIEW IF NOT EXISTS policy_shadow_disagreements AS
+            SELECT deterministic_intent, shadow_intent, COUNT(*) as count
+            FROM turn_policy_observations
+            WHERE deterministic_intent != coalesce(shadow_intent, '')
+            GROUP BY deterministic_intent, shadow_intent
+            ORDER BY count DESC
+        """)
         await db.commit()
 
 
@@ -313,7 +344,7 @@ async def append_turn_policy_observation(observation, path: str = DB_PATH):
             CREATE INDEX IF NOT EXISTS idx_turn_policy_observations_intent
             ON turn_policy_observations(deterministic_intent, timestamp DESC)
         """)
-        await db.execute(
+        cursor = await db.execute(
             """
             INSERT INTO turn_policy_observations (
                 timestamp,
@@ -349,7 +380,22 @@ async def append_turn_policy_observation(observation, path: str = DB_PATH):
                 json.dumps(payload),
             ),
         )
+        obs_id = cursor.lastrowid
         await db.commit()
+
+    # Async generate and store embedding without blocking
+    if features.get("normalized_text"):
+        asyncio.create_task(_store_observation_embedding(obs_id, features["normalized_text"], path))
+
+async def _store_observation_embedding(obs_id: int, text: str, path: str):
+    emb = await generate_embedding(text)
+    if emb:
+        async with aiosqlite.connect(path) as db:
+            await db.execute(
+                "INSERT INTO turn_policy_embeddings (observation_id, model, embedding_json, created_at) VALUES (?, ?, ?, ?)",
+                (obs_id, _NIM_EMBED_MODEL, json.dumps(emb), time.time())
+            )
+            await db.commit()
 
 
 async def get_recent_turn_policy_observations(limit: int = 100, path: str = DB_PATH) -> list[dict]:
