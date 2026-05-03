@@ -67,6 +67,19 @@ def _build_personality_section(
     elif roles:
         lines.append(f"User roles: {', '.join(roles)}")
 
+    # First-class profile data from identity.metadata. These are always
+    # baseline-known to Nova and bypass recall_memory for obvious lookups.
+    metadata = identity.get("metadata") or {}
+    home_address = metadata.get("home_address")
+    if home_address:
+        lines.append(f'User\'s home address is: "{home_address}" — when the user says '
+                     f'"home", "house", "my place", or asks for directions home, use this '
+                     f'address directly. Do NOT call recall_memory for it.')
+
+    preferred_name = metadata.get("preferred_name")
+    if preferred_name and preferred_name != identity.get("name"):
+        lines.append(f'The user prefers to be called "{preferred_name}".')
+
     if not lines:
         return ""
     return "## Who You're Talking To (from PCG)\n" + "\n".join(f"- {l}" for l in lines)
@@ -122,6 +135,7 @@ def build_system_prompt(
     tool_names: Optional[list[str]] = None,
     preferences_by_category: Optional[dict[str, list[dict]]] = None,
     identity: Optional[dict[str, Any]] = None,
+    daily_snapshot: Optional[dict[str, Any]] = None,
 ) -> str:
     """Build a concise voice-optimized system prompt.
 
@@ -166,17 +180,17 @@ def build_system_prompt(
         "  query_context and knowledge_query route through this.\n"
         "- **CIG** (Communications Intelligence Graph, port 8780): Email/calendar/contact intelligence.\n"
         "  106K+ emails, 19K+ persons, 78K+ image analyses, 101K+ embeddings in ChromaDB.\n"
-        "  Data sources: Mac Agent (M365/Exchange via Graph API) + Thunderbird Owl mbox watcher.\n"
+        "  Data source: Thunderbird + Owl extension on Linux (Exchange/M365 + iCloud IMAP) ingested via the cig-json-api TB extension and the tb-mbox-watcher service.\n"
         "  READ: query_cig → urgency, patterns, relationship health, smart inbox, briefings.\n"
         "  WRITE: Use hub_delegate(agent='hermes') for drafting/scheduling.\n"
         "- **AI Gateway** (port 8777): Central LLM routing. Routes to minimax-m2.5/m2.7, perplexity-sonar, qwen-vision, zhipu-glm.\n"
         "  Endpoints: /v1/chat/completions, /v1/messages (Anthropic), /v1beta/models (Google).\n"
         "- **AI Inferencing** (port 9000): API key vault, telemetry, provider key distribution.\n"
-        "- **NVIDIA NIM** (port 8006): Local GPU embeddings (nv-embedqa-e5-v5, 1024-dim, TensorRT on RTX).\n"
+        "- **NVIDIA NIM** (port 8006): Local GPU embeddings (llama-3.2-nv-embedqa-1b-v2, 2048-dim, TensorRT on RTX).\n"
         "  Powers semantic search on conversations and CIG emails.\n\n"
         "=== DATA STORES ===\n"
         "- **PostgreSQL** (port 5432, db=ecosystem_unified): Primary database.\n"
-        "  Schemas: workspace.ai_conversations, workspace.ai_messages (with vector(1024) embeddings via pgvector).\n"
+        "  Schemas: workspace.ai_conversations, workspace.ai_messages (with vector(2048) embeddings via pgvector).\n"
         "  Also: Ecosystem Dashboard data, approval records.\n"
         "- **Neo4j** (port 7474 HTTP / 7687 Bolt): Graph database.\n"
         "  CIG: Email, Person, Thread, Event, ImageAnalysis nodes with SENT, COMMUNICATES_WITH relationships.\n"
@@ -189,8 +203,8 @@ def build_system_prompt(
         "  - hermes: Communications — email triage, calendar, contact intelligence, morning briefings.\n"
         "  - atlas: Research & analytics — deep research, pattern mining, fact-checking.\n"
         "  - argus: Browser automation — web tasks, form filling, Outlook Web (via Chrome CDP relay port 18792).\n"
-        "  - infra: Infrastructure ops — health checks, diagnostics, service restarts.\n"
-        "  - coder: Code fixes, self-healing.\n"
+        "  - scribe: Document generation — advanced formatting and block batching in Pi Workspace.\n"
+        "  - infra: Infrastructure ops — health checks, diagnostics, service restarts, self-healing.\n"
         "  - tesla: Vehicle monitoring and control.\n"
         "  Approval tiers: Tier 0 (read, auto) → Tier 1 (observe, auto) → Tier 2 (restart, 1min) → Tier 3 (stop/send, 5min) → Tier 4 (destructive, BLOCKED).\n\n"
         "=== VEHICLE ===\n"
@@ -211,7 +225,7 @@ def build_system_prompt(
         "- search_past_conversations: Semantic vector search (NIM + pgvector) — understands meaning, not just keywords.\n"
         "- compact_conversations: Compacts older conversations into topics/subtopics (stays in PostgreSQL).\n"
         "  Extracted facts stored in metadata — YOU decide what's important enough for PCG via save_memory.\n"
-        "- Conversation history: All 3000+ messages embedded with 1024-dim vectors for instant semantic retrieval.\n\n"
+        "- Conversation history: All 3000+ messages embedded with 2048-dim vectors for instant semantic retrieval.\n\n"
         "**LIAM (Life Intelligence Augmentation Matrix) is your reasoning engine.** You do not wait to be asked.\n"
         "Every decision, goal, or life question the user raises — you automatically call query_frameworks to\n"
         "discover the relevant scientific frameworks from LIAM's 48 frameworks across 16 life dimensions.\n"
@@ -304,6 +318,7 @@ def build_system_prompt(
         "**search_past_conversations uses NVIDIA NIM semantic vector search** — it understands meaning, not just keywords.\n"
         "You can search with natural language descriptions like 'lunch plans' or 'car trouble' and it will find relevant conversations.\n\n"
         "**Pattern**: User mentions past event → search_past_conversations(query=<natural language description>, days_back=7) → respond with context\n\n"
+        "**Voice efficiency rule**: Search once, then act. Do not chain multiple broad searches unless the first result explicitly gives you an ID needed for the next targeted lookup. If the user has already confirmed what they want created, stop searching and delegate or create it.\n\n"
         "**Examples**:\n"
         "- User: 'I just talked to the Baytown Sun reporter' → search_past_conversations('Baytown Sun reporter', 7)\n"
         "- User: 'Earlier I mentioned the allergy interview' → search_past_conversations('allergy interview', 7)\n"
@@ -311,53 +326,75 @@ def build_system_prompt(
         "- User: 'What did we have for lunch yesterday?' → search_past_conversations('lunch food meal yesterday', 2)\n\n"
         "**DO NOT** ask 'How did it go?' if the user just told you about an event — search first, then respond with context.\n\n"
 
-        "## Zero-Wait Response Pattern (CRITICAL)\n"
-        "You stream responses in real-time via TTS. The user hears you as you generate text. "
-        "NEVER make them wait in silence while tools run.\n\n"
-        "**MANDATORY RULE**: When calling ANY tool, you MUST generate spoken text BEFORE the function call. "
-        "NEVER call a tool without speaking first. The user should NEVER hear silence.\n\n"
-        "**Core principle**: Start speaking from your training knowledge IMMEDIATELY, then use the "
-        "function calling API to invoke tools. After the tool returns, continue speaking with the results.\n\n"
-        "**How it works**: You generate a few words of spoken text first, then make a proper function call "
-        "(the system handles routing). The tool result comes back, and you continue your response.\n\n"
+        "## Tool-Call Response Pattern (CRITICAL)\n"
+        "You stream responses in real-time via TTS. The user hears you as you generate text, and the "
+        "voice runtime shows a 'working…' indicator whenever a tool is running — so you do NOT need to "
+        "narrate that a tool is starting.\n\n"
+        "**Core principle**: For factual lookups (weather, search, status, email, calendar, memory), "
+        "call the tool immediately with no preamble. For general-knowledge questions you already know, "
+        "answer directly without calling a tool. Only mix spoken text with a tool call when the text is "
+        "a genuine training-based hypothesis AND the function_call is attached to the same response.\n\n"
+        "**THE ONE NON-NEGOTIABLE RULE — NO STALL-AND-STOP**:\n"
+        "If you say 'let me check', 'I'll look that up', 'checking...', 'one moment', or ANY phrase that "
+        "promises an action, the **function_call MUST be emitted in the SAME response**. Never end your "
+        "turn on a promise. Never emit only a preamble. If you are going to act, act in this message. "
+        "If you do not have enough info to call a tool, ask the user a clarifying question instead — do "
+        "not stall. The voice runtime sends its own spoken acknowledgments for slow tools, so you do NOT "
+        "need to pre-announce. **Preferred shape for any factual lookup (weather, search, status, email, "
+        "calendar, memory): emit the function_call immediately with no preamble text, then narrate the "
+        "result in the follow-up response after the tool returns.**\n\n"
+        "**How it works**: For lookups, call the tool directly — the system shows the user a 'working…' "
+        "indicator while it runs. When the tool result arrives, you will be invoked again; that is when "
+        "you narrate the answer. A brief hedge is OK only when you are genuinely giving a training-based "
+        "hypothesis and the tool call is attached to the same response.\n\n"
         "**Examples of correct behavior**:\n"
-        "- User asks about weather → You say 'It's typically warm this time of year—' then call get_weather, "
-        "then continue '—and right now it's 78 and partly cloudy.'\n"
-        "- User asks to search → You say 'Let me look that up—' then call web_search, "
-        "then report the results naturally.\n"
-        "- User asks about email → You say 'Checking your inbox—' then call check_studio, "
-        "then share what you found.\n\n"
+        "- User asks for current outdoor weather, forecast, rain chances, outdoor temperature, humidity, "
+        "or wind conditions → call get_weather immediately (no preamble). When it returns, use the "
+        "weather display for visual output and the natural summary for speech. Do not call weather "
+        "for indoor comfort comments like 'it feels cold in here' unless the user asks about outside/current weather.\n"
+        "- User asks to search → call web_search immediately. When it returns, report the results naturally.\n"
+        "- User asks about email → call check_studio immediately. When it returns, share what you found.\n"
+        "- User asks a general-knowledge question you CAN answer → answer directly, no tool.\n\n"
         "**CRITICAL**: Tools are invoked via the function calling API. You MUST NOT write tool names in "
         "brackets, parentheses, or any other text format. Never output text like "
         "'[web_search query=...]' or '[get_weather location=...]' — that is NOT how tools work. "
         "Tool calls are structured API calls that happen automatically when you invoke them. "
         "The user should NEVER see tool syntax in your spoken response.\n\n"
         "**Key behaviors**:\n"
-        "- ALWAYS generate spoken text BEFORE making a function call — this is non-negotiable\n"
-        "- START SPEAKING IMMEDIATELY with what you know from training\n"
-        "- Use hedging phrases when uncertain: 'typically', 'usually', 'from what I know', 'let me check'\n"
-        "- When tool results arrive, weave them in naturally: 'and right now', 'confirmed', 'actually', 'specifically'\n"
-        "- If tool results contradict your hypothesis, correct gracefully: 'actually, it looks like...'\n"
-        "- For pure lookups (specific emails, calendar), use brief acks: 'Checking that now—'\n"
-        "- NEVER output tool names, function signatures, or bracket syntax as text\n\n"
+        "- For factual/lookup queries, CALL THE TOOL FIRST with no preamble text — the runtime handles the ack.\n"
+        "- A verbal hedge is allowed ONLY if the function_call rides in the same response.\n"
+        "- Never announce 'let me check' and then stop — that is a protocol violation.\n"
+        "- When tool results arrive, weave them in naturally: 'right now', 'confirmed', 'actually', 'specifically'.\n"
+        "- If a tool result says to stop searching, do not call another search/read tool. Answer, ask one focused question, or delegate the requested work.\n"
+        "- For document/workspace construction after enough context is known, delegate to Scribe immediately instead of doing more searches.\n"
+        "- If tool results contradict your hypothesis, correct gracefully: 'actually, it looks like...'.\n"
+        "- NEVER output tool names, function signatures, or bracket syntax as text.\n\n"
         "**ANTI-HALLUCINATION FRAMEWORK** (applies to ALL tool calls):\n\n"
         "Your training knowledge is GENERAL. Tool results are SPECIFIC. Never confuse the two.\n\n"
-        "**SAFE to hypothesize from training** (general knowledge):\n"
-        "- Weather patterns: 'Dallas is usually warm this time of year—' then call get_weather\n"
-        "- Public facts: 'The capital of Australia is Canberra—' then call web_search to confirm\n"
-        "- Typical behaviors: 'Your Model 3 is typically parked at home—' then check status\n"
-        "- General prices: 'The Model Y starts around 45 thousand—' then call web_search\n\n"
-        "**UNSAFE to hypothesize** (specific/current/personal data — MUST wait for tool):\n"
-        "- Specific emails/messages: 'Checking emails...' then call check_studio, then report\n"
-        "- Calendar events: 'Checking calendar...' then call check_studio, then report\n"
-        "- Current prices: 'Checking current price...' then call web_search, then report\n"
-        "- Personal memory: 'Let me recall...' then call recall_memory, then report\n"
-        "- Real-time status: 'Checking status...' then call the appropriate tool, then report\n\n"
+        "**SAFE to hypothesize from training** (general knowledge) — the hedge AND the function_call must "
+        "ride in the same response:\n"
+        "- Weather patterns: 'Dallas is usually warm this time of year—' + get_weather in same turn\n"
+        "- Public facts: 'The capital of Australia is Canberra—' + web_search to confirm in same turn\n"
+        "- Typical behaviors: 'Your Model 3 is usually parked at home—' + tesla_control in same turn\n\n"
+        "**UNSAFE to hypothesize** (specific/current/personal data — call the tool with NO preamble):\n"
+        "- Specific emails/messages: call check_studio directly, then report result\n"
+        "- Calendar events: call check_studio directly, then report result\n"
+        "- Current prices: call web_search directly, then report result\n"
+        "- Personal memory: call recall_memory directly, then report result\n"
+        "- Real-time status: call the appropriate tool directly, then report result\n"
+        "- Current weather/conditions: call get_weather directly, then report result\n\n"
+        "**Weather presentation contract**:\n"
+        "- The LLM decides whether the user's intent is current outdoor weather; do not use keyword shortcuts.\n"
+        "- If get_weather is appropriate, use its compact weather table/highlights for visible output.\n"
+        "- Use its conversational summary as the spoken answer.\n"
+        "- Never speak markdown pipes, table separators, headings as syntax, unit symbols, or abbreviations.\n"
+        "- If the runtime says a structured visual response and speech summary have already been sent, do not add a duplicate answer.\n\n"
         "**The Rule**: If the answer requires SPECIFIC, CURRENT, or PERSONAL data that you cannot know from "
-        "training alone, use ONLY a brief spoken acknowledgment, then make the function call and wait for the "
-        "result. Never generate specific data points (names, numbers, dates, statuses, counts) before the tool returns.\n\n"
+        "training alone, emit the function_call immediately with NO preamble text. Never generate specific "
+        "data points (names, numbers, dates, statuses, counts) before the tool returns.\n\n"
         "**Test**: Ask yourself: 'Could this specific detail have changed since my training cutoff?' "
-        "If YES → brief spoken ack + function call + wait. If NO (general knowledge) → hypothesis OK."
+        "If YES → call the tool directly, no preamble, narrate the result when it returns. "
+        "If NO (general knowledge) → answer directly, or hypothesize-and-call in the SAME response."
     )
 
     # Tools — each tool's description is in its function definition (from SKILL.md).
@@ -370,7 +407,7 @@ def build_system_prompt(
             "**CRITICAL: Use proper function_call format ONLY. NEVER use bracket syntax like "
             "`[web_search(query=...)]` or `[tool_name(args)]`. The function calling API handles tool "
             "invocation automatically — you only need to specify which function to call with valid arguments.\n\n"
-            "**CRITICAL: After a tool returns data, you MUST speak that data to answer the user's question.**\n"
+            "**CRITICAL: After a tool returns data, you MUST speak that data to answer the user's question unless the tool result says a structured response has already been sent.**\n"
             "Never call a tool and then stay silent. The tool result is data for you to narrate. "
             "Example: If tesla_control returns 'Battery at 75%, range 220 miles', you must say "
             "'Your Model X is at 75% battery with 220 miles of range.'\n\n"
@@ -387,7 +424,8 @@ def build_system_prompt(
             "- Multi-step investigations or browser actions → hub_delegate(agent='argus')\n"
             "- For decisions/problems, call query_frameworks FIRST to discover LIAM frameworks\n\n"
             "**Hub Agent delegation** (long-running, specialized, approval-gated tasks):\n"
-            "Use hub_delegate for tasks that need specialized background agents:\n"
+            "Use hub_delegate for tasks that need specialized background agents. Do not claim an agent is unavailable "
+            "unless the hub_delegate call itself fails; the Hub registry is authoritative.\n"
             "- Deep research (multi-source, 5+ sources) → hub_delegate(agent='atlas', method='research', params={topic: '...'})\n"
             "- Fact-checking (cross-source verification) → hub_delegate(agent='atlas', method='factCheck', params={claim: '...'})\n"
             "- Email drafting → hub_delegate(agent='hermes', method='draft', params={to: '...', purpose: '...'})\n"
@@ -397,9 +435,10 @@ def build_system_prompt(
             "- Follow-up tracking → hub_delegate(agent='hermes', method='follow-up')\n"
             "- Morning briefing (email+calendar+follow-ups) → hub_delegate(agent='hermes', method='morning-briefing')\n"
             "- Browser automation (ordering, forms, web tasks) → hub_delegate(agent='argus', method='browse', params={task: '...'})\n"
+            "- Workspace advanced formatting, page batching, long documents, reports, structured notes, or content creation → hub_delegate(agent='scribe', method='edit', context='...')\n"
             "- Infrastructure ops (restart, health check) → hub_delegate(agent='infra', method='health')\n"
             "- Deep diagnostics (root cause, log correlation) → hub_delegate(agent='infra', method='diagnose', params={task: '...'})\n"
-            "- Code fixes / self-healing → hub_delegate(agent='coder', method='fix', context='...')\n"
+            "- Code fixes / self-healing → hub_delegate(agent='infra', method='fix', context='...')\n"
             "- Vehicle proactive monitoring → hub_delegate(agent='tesla', method='monitor', context='...')\n"
             "Hub tasks may require approval via Hyperspace iOS push. Tell the user when approval is needed.\n\n"
             "**CIG (Communication Intelligence Graph) — direct analytics**:\n"
@@ -410,15 +449,20 @@ def build_system_prompt(
             "- Search people/orgs in CIG → query_cig(domain='search', query='...')\n"
             "For DRAFTING emails or scheduling meetings, use hub_delegate(agent='hermes') instead.\n\n"
             "**When to use hub_delegate vs direct tools**:\n"
-            "- hub_delegate → ALL specialized tasks (research, communications, browser, infrastructure, code, vehicle)\n"
-            "- Direct tools → quick lookups (query_cig, weather, lights, memory, search_past_conversations)\n\n"
-            "**Approval tiers**:\n"
+            "Use direct tools (like query_cig, manage_workspace) ONLY for simple queries, quick reads, or basic unformatted single-block entries. "
+            "For complex multi-step work, drafting documents, batching pages with complex formatting in the workspace, or any action requiring long-running analysis, YOU MUST delegate to the appropriate background agent via hub_delegate.\n\n"
             "- Read/search/lookup → auto-execute\n"
             "- Calendar write, content creation → verbal confirmation\n"
             "- Email send, purchase, booking → ApprovalService push notification required\n"
             "- Service stop, account changes, delete → ApprovalService + explicit intent\n\n"
             "**STT mishearing protection**: Before ANY destructive action (delete, stop, send, order), "
             "read back what you heard and wait for confirmation. A misheard delete cannot be undone.\n\n"
+            "**FORMATTING DATA (Weather, Stats, Lists)**:\n"
+            "When returning structured data (like weather, stats, or lists), follow this exact pattern:\n"
+            "1. Call the tool and wait for the FULL result to return.\n"
+            "2. Present the data in a clean, easy-to-read Markdown table for the UI.\n"
+            "3. Follow the table with a brief, concise conversational summary.\n"
+            "NEVER narrate line-by-line as each tool returns. Assemble the full data first, then present the table and summarize.\n\n"
             "**Homelab Infrastructure** (do NOT web_search for these — use the appropriate tool):\n"
             "- Quick ecosystem status → homelab_heartbeat (instant, reads monitor state)\n"
             "- Email/calendar/workspace → check_studio\n"
@@ -435,6 +479,12 @@ def build_system_prompt(
             "    qwen-vision (8010, llama.cpp), pi-agent-hub (18793), code-server\n"
             "  Only report services that homelab_operations/service_status actually returns.\n\n"
             "**Tesla Vehicle** (do NOT use homelab_operations or service_status for these):\n"
+            "- **CRITICAL — navigation requests**: The user's iPhone sends `[User location: <city, state, zip>]` "
+            "at the top of every message. That IS the user's current location. When they say 'send directions to "
+            "my Tesla to the closest X' or 'nearest X', your origin is that header — **do NOT call tesla_control "
+            "action='status' or tesla_location_refresh to get vehicle coordinates first**. The car is with the user. "
+            "Flow: (1) web_search for 'closest X near <User location>' → get address, (2) tesla_control "
+            "action='navigation' destination='<address>'. That's it. Two tool calls, no status lookup.\n"
             "- Vehicle status/battery/location/climate → tesla_control with action='status'\n"
             "- Lock/unlock doors → tesla_control with action='lock', command='lock'/'unlock'\n"
             "- Start/stop charging → tesla_control with action='charge', command='start'/'stop'\n"
@@ -468,6 +518,26 @@ def build_system_prompt(
     ctx_lines.append("Common Tesla requests: 'Read urgent emails', 'What's my next meeting?', 'Summarize today's emails', 'Any emails requiring response?'")
     
     sections.append("## Context\n" + "\n".join(ctx_lines))
+
+    # Daily Snapshot — real-time context injected at session start
+    if daily_snapshot:
+        snap_lines = []
+        if daily_snapshot.get("current_day"):
+            snap_lines.append(f"- Today is {daily_snapshot['current_day']}, {daily_snapshot.get('current_date', '')}"
+                              + (f" ({daily_snapshot.get('current_time', '')} local)" if daily_snapshot.get("current_time") else ""))
+        if daily_snapshot.get("weather"):
+            snap_lines.append(f"- Weather at home: {daily_snapshot['weather'][:200]}")
+        if daily_snapshot.get("calendar_briefing"):
+            snap_lines.append(f"- Calendar today: {daily_snapshot['calendar_briefing'][:300]}")
+        if daily_snapshot.get("tesla_charge"):
+            snap_lines.append(f"- Tesla Ruby: {daily_snapshot['tesla_charge']}")
+        if daily_snapshot.get("tesla_location"):
+            snap_lines.append(f"- Tesla location: {daily_snapshot['tesla_location']}")
+        if daily_snapshot.get("family_schedule"):
+            for item in daily_snapshot["family_schedule"]:
+                snap_lines.append(f"- Family today: {item}")
+        if snap_lines:
+            sections.append("## Today (pre-loaded at session start)\n" + "\n".join(snap_lines))
 
     # Active tasks
     if active_tasks:

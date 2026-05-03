@@ -78,54 +78,75 @@ async def handle_web_search(query: str, deep_mode: bool = False) -> str:
     }
 
     try:
+        # One internal retry on 429 (Perplexity rate limit) with 2s backoff.
+        # Perplexity Sonar is the only permitted search provider, so we retry
+        # in-place rather than falling back to another engine.
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, headers=headers, json=body,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"Web search HTTP {resp.status}: {text[:200]}")
-                    return f"Search failed (HTTP {resp.status}). The AI Gateway may be experiencing issues. Please try again."
+            data = None
+            for attempt in range(2):
+                async with session.post(
+                    url, headers=headers, json=body,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 429 and attempt == 0:
+                        logger.warning(f"Web search 429 rate limit (model: {model}). Retrying...")
+                        if model == "sonar-pro":
+                            logger.info("Falling back to 'sonar' model to bypass strict rate limits.")
+                            model = "sonar"
+                            body["model"] = "sonar"
+                        await asyncio.sleep(2.0)
+                        continue
+                    if resp.status == 429:
+                        return (
+                            "Perplexity rate-limited this search. Tell the user the search "
+                            "provider is temporarily throttled and to try again in a minute. "
+                            "Do NOT call web_search again this turn."
+                        )
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"Web search HTTP {resp.status}: {text[:200]}")
+                        return f"Search failed (HTTP {resp.status}). The AI Gateway may be experiencing issues. Please try again."
+                    data = await resp.json()
+                    break
+            if data is None:
+                return "Search failed: no response from Perplexity after retry."
 
-                data = await resp.json()
-                
-                # Extract content from Perplexity response
-                content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
-                
-                # Extract citations array from Perplexity response
-                citations = data.get("citations", [])
+        # Extract content from Perplexity response
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
 
-                if not content:
-                    return "Search returned no results."
+        # Extract citations array from Perplexity response
+        citations = data.get("citations", [])
 
-                # Send citations as structured server message for iOS UI
-                if citations and _server_msg_fn:
-                    source_items = [
-                        {"index": i + 1, "url": u}
-                        for i, u in enumerate(citations[:5])  # Limit to 5 for UI
-                    ]
-                    try:
-                        await _server_msg_fn({
-                            "type": "sources",
-                            "query": query,
-                            "citations": source_items,
-                        })
-                    except Exception as e:
-                        logger.warning(f"Could not send sources message: {e}")
+        if not content:
+            return "Search returned no results."
 
-                # Append citation count to LLM response
-                # iOS will display the actual URLs, so we just note they're available
-                if citations:
-                    content += f"\n\n({len(citations)} sources available — the user's device will display them.)"
+        # Send citations as structured server message for iOS UI
+        if citations and _server_msg_fn:
+            source_items = [
+                {"index": i + 1, "url": u}
+                for i, u in enumerate(citations[:5])  # Limit to 5 for UI
+            ]
+            try:
+                await _server_msg_fn({
+                    "type": "sources",
+                    "query": query,
+                    "citations": source_items,
+                })
+            except Exception as e:
+                logger.warning(f"Could not send sources message: {e}")
 
-                logger.info(f"Web search OK ({model}): {len(content)} chars, {len(citations)} citations")
-                return content
-                
+        # Append citation count to LLM response
+        # iOS will display the actual URLs, so we just note they're available
+        if citations:
+            content += f"\n\n({len(citations)} sources available — the user's device will display them.)"
+
+        logger.info(f"Web search OK ({model}): {len(content)} chars, {len(citations)} citations")
+        return content
+
     except asyncio.TimeoutError:
         return "Search timed out after 15 seconds. Please try a simpler or more specific query."
     except Exception as e:

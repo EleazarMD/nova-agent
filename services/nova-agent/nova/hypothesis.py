@@ -343,7 +343,7 @@ class HypothesisValidator:
         # Send comprehensive validated message per Zero-Wait Protocol
         msg: dict[str, Any] = {
             "type": "validated",
-            "result": result.value,
+            "result": result.value if hasattr(result, 'value') else result,
             "suppressSpeech": suppress_speech,
             # Include original hypothesis for transparency
             "hypothesis": session.hypothesis_text,
@@ -368,7 +368,7 @@ class HypothesisValidator:
         await self._send_msg(msg)
         
         logger.info(
-            f"[Hypothesis] Validated: {result.value} "
+            f"[Hypothesis] Validated: {result.value if hasattr(result, 'value') else result} "
             f"({len(session.citations)} citations, {len(validation_steps)} steps, suppress_speech={suppress_speech})"
         )
         

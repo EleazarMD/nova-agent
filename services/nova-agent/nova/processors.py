@@ -145,7 +145,11 @@ class ConversationPersistence(FrameProcessor):
                     
                     # Simple heuristic: if response is significantly different, it's corrected
                     # If it adds detail, it's enriched. Otherwise, confirmed.
-                    if len(response_text) > len(hypothesis_text) * 1.5:
+                    if not session.steps:
+                        # If no tools were actually executed, this is a direct conversational response
+                        # even if hypothesis mode was initially triggered.
+                        result = "direct"
+                    elif len(response_text) > len(hypothesis_text) * 1.5:
                         result = ValidationResult.ENRICHED
                     elif hypothesis_text not in response_text and response_text not in hypothesis_text:
                         result = ValidationResult.CORRECTED
@@ -156,12 +160,18 @@ class ConversationPersistence(FrameProcessor):
                     # Determine if iOS should speak based on validation result
                     # - confirmed/enriched: suppress (hypothesis was already spoken)
                     # - corrected: speak (hypothesis was wrong, need to correct)
+                    # - direct: suppress (hypothesis was spoken and no tools used)
                     # - BUT only suppress if hypothesis actually had text and was spoken!
                     hypothesis_was_spoken = session.hypothesis_text.strip() and session.confidence > 0
                     should_suppress = (
-                        result in (ValidationResult.CONFIRMED, ValidationResult.ENRICHED) 
+                        (result == "direct" or result in (ValidationResult.CONFIRMED, ValidationResult.ENRICHED)) 
                         and hypothesis_was_spoken
                     )
+                    
+                    # Hack: HypothesisValidator expects ValidationResult enum, but we'll pass the string directly
+                    # wait, HypothesisValidator.validate takes a ValidationResult! I need to check its implementation
+                    # Or I can just pass ValidationResult.CONFIRMED to validate() but override it?
+                    # Let's look at HypothesisValidator.validate()
                     
                     await self._hypothesis_validator.validate(
                         validated_text=full_text,  # Full response for iOS response card

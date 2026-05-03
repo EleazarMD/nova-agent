@@ -28,9 +28,10 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
-from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation
+from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation, get_session_metadata, update_session_metadata_key
 from nova.prompt import build_system_prompt
 from nova.tools import TOOL_DEFINITIONS, dispatch_tool, reset_conversation_search_count, set_progress_context
+from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan_result, get_orchestrator_metrics, turn_state_from_metadata, turn_state_to_metadata_value
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -46,6 +47,7 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS if "function" in t
 
 # Max conversation turns to restore from DB
 MAX_HISTORY_TURNS = 40
+_turn_states: dict[str, TurnState] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +197,20 @@ async def orchestrator_status():
     """Get cache orchestrator status."""
     from nova.cache_orchestrator import get_orchestrator_status
     return get_orchestrator_status()
+
+
+@app.get("/turn-orchestrator/status")
+async def turn_orchestrator_status():
+    return {
+        "status": "ok",
+        "state_cache_entries": len(_turn_states),
+        "metrics": get_orchestrator_metrics(),
+    }
+
+
+@app.get("/turn-orchestrator/metrics")
+async def turn_orchestrator_metrics():
+    return get_orchestrator_metrics()
 
 
 @app.get("/orchestrator/recommendations")
@@ -441,6 +457,45 @@ async def simple_chat(req: ChatRequest):
         
         # Reset per-turn search counter
         reset_conversation_search_count(req.user_id)
+
+        if conversation_id not in _turn_states:
+            metadata = await get_session_metadata(session.session_id)
+            _turn_states[conversation_id] = turn_state_from_metadata(metadata)
+        turn_state = _turn_states[conversation_id]
+        plan = decide_turn(req.message, turn_state)
+        orchestrated_response: list[str] = []
+
+        async def _send_server_msg(msg: dict):
+            if msg.get("type") == "validated":
+                orchestrated_response.append(str(msg.get("text") or msg.get("speechText") or ""))
+
+        async def _persist(role: str, content: str):
+            await append_turn(session.session_id, role, content)
+            await _sync_message_to_backend(conversation_id, req.user_id, role, content)
+
+        orchestration_result = await execute_turn_plan_result(
+            plan,
+            turn_state,
+            dispatch_tool,
+            _send_server_msg,
+            _persist,
+        )
+        if orchestration_result.handled:
+            await update_session_metadata_key(
+                session.session_id,
+                STATE_METADATA_KEY,
+                turn_state_to_metadata_value(turn_state),
+            )
+            response_text = orchestration_result.response or (
+                orchestrated_response[-1] if orchestrated_response else "Handled by Nova Turn Orchestrator."
+            )
+            return ChatResponse(
+                response=response_text,
+                conversation_id=conversation_id,
+                model=LLM_MODEL,
+                usage=None,
+                tool_calls=orchestration_result.tools_used or None,
+            )
         
         # Save user turn (SQLite + PostgreSQL)
         await append_turn(session.session_id, "user", req.message)

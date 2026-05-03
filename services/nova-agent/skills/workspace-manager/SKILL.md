@@ -17,20 +17,22 @@ parameters:
         - create_page
         - create_page_with_blocks
         - get_page
+        - delete_page
         - add_block
         - search
         - list_databases
         - create_database
+        - list_rows
         - add_row
         - update_row
-        - list_rows
         - create_form
         - submit_form
-        - planner
+        - get_planner_day
         - create_task
         - update_task
         - delete_task
         - create_event
+        - update_planner_notes
         - list_templates
         - create_from_template
         - ai_chat
@@ -39,6 +41,9 @@ parameters:
     title:
       type: string
       description: "Title for pages, databases, tasks, events, forms"
+    intent:
+      type: string
+      description: "Explanation of intent for approval-gated actions like delete_page"
     page_id:
       type: string
       description: "Full page UUID from list_pages/search/create_page. Do not shorten or summarize UUIDs."
@@ -151,6 +156,7 @@ Never go silent while a tool is running. The user should always hear what's happ
 - `list_pages` — Browse all pages/notes
 - `create_page` — Create new note (title + optional content + icon)
 - `get_page` — Read page with all its blocks
+- `delete_page` — Delete a page. **Requires providing an `intent` parameter** explaining why the page is being deleted for JIT approval.
 - `add_block` — Add content block (paragraph, heading, to-do, etc.)
 
 Use the complete `page_id` value returned by `list_pages`, `search`, or page creation. Never pass a shortened display form like `6c8a188e...` when a full UUID is available.

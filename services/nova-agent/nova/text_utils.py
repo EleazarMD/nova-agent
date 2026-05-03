@@ -153,39 +153,10 @@ def _table_rows_to_speech(rows: list[list[str]]) -> str:
     if not rows:
         return ""
 
-    # Generic header labels that don't add meaning when spoken
-    _GENERIC_HEADERS = {"stat", "value", "key", "item", "name", "label", "property", "field", "#"}
-
-    if len(rows) >= 2:
-        headers = [h.strip().lower() for h in rows[0]]
-        # For 2-column tables with generic headers like Stat/Value,
-        # just speak as "Label: Value" using column 0 as label
-        if (len(headers) == 2 and
-            headers[0] in _GENERIC_HEADERS and
-            headers[1] in _GENERIC_HEADERS):
-            speech_parts = []
-            for row in rows[1:]:
-                cells = [c.strip() for c in row]
-                if len(cells) >= 2 and cells[0]:
-                    speech_parts.append(f"{cells[0]}: {cells[1]}")
-                elif cells[0]:
-                    speech_parts.append(cells[0])
-            return '. '.join(speech_parts) + '.' if speech_parts else ''
-        # General case: use headers as labels
-        speech_parts = []
-        for row in rows[1:]:
-            for i, cell in enumerate(row):
-                if i < len(headers) and cell.strip():
-                    label = rows[0][i].strip()
-                    if not re.match(r'^\d+$', label):
-                        speech_parts.append(f"{label}: {cell.strip()}")
-                    else:
-                        speech_parts.append(cell.strip())
-        return '. '.join(speech_parts) + '.' if speech_parts else ''
-    else:
-        # Single row — just speak values
-        cells = [c.strip() for c in rows[0] if c.strip()]
-        return '. '.join(cells) + '.' if cells else ''
+    # Since Nova has been instructed to always provide a conversational summary
+    # immediately following any Markdown table, reading the table aloud letter-by-letter
+    # is redundant and robotic. We simply suppress the entire table from the TTS output.
+    return ""
 
 
 def strip_markdown_for_speech(text: str) -> str:
