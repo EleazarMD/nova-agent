@@ -1012,6 +1012,34 @@ TOOL_DEFINITIONS = [
         },
     },
     # -------------------------------------------------------------------------
+    # Image Analysis (Qwen Vision)
+    # -------------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_image",
+            "description": (
+                "Use the local Qwen Vision model (qwen-vision) on the RTX workstation "
+                "to interpret and describe an image given its URL. Always use this "
+                "when the user attaches an image or provides an image URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_url": {
+                        "type": "string",
+                        "description": "URL of the image to analyze",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Specific question or instruction for the vision model (default: 'Describe this image in detail.')",
+                    },
+                },
+                "required": ["image_url"],
+            },
+        },
+    },
+    # -------------------------------------------------------------------------
     # EV Charging & Route Planning (NREL AFDC API)
     # -------------------------------------------------------------------------
     {
@@ -3507,6 +3535,74 @@ async def handle_manage_ticket(
 
 
 # ---------------------------------------------------------------------------
+# Image Analysis (Qwen Vision)
+# ---------------------------------------------------------------------------
+
+async def handle_analyze_image(
+    image_url: str,
+    prompt: str = "Describe this image in detail.",
+    **kwargs
+) -> str:
+    """Download an image and send it to the local Qwen Vision model via AI Gateway or llama.cpp."""
+    import aiohttp
+    import base64
+    import os
+    
+    # Optional: download image first and encode as base64
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    return f"Failed to download image from {image_url}. Status: {resp.status}"
+                image_bytes = await resp.read()
+                mime_type = resp.headers.get('Content-Type', 'image/jpeg')
+    except Exception as e:
+        return f"Error downloading image: {str(e)}"
+        
+    b64_image = base64.b64encode(image_bytes).decode('utf-8')
+    data_url = f"data:{mime_type};base64,{b64_image}"
+    
+    payload = {
+        "model": "qwen-vision",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]
+            }
+        ],
+        "max_tokens": 1000
+    }
+    
+    # Try AI Gateway first, fallback to direct llama.cpp if needed
+    vision_url = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1").replace("/api/v1", "/v1/chat/completions")
+    if "api/v1" not in os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1") and "v1" not in vision_url:
+        vision_url = "http://127.0.0.1:8777/v1/chat/completions"
+        
+    try:
+        async with aiohttp.ClientSession() as session:
+            # We use a 90 second timeout as vision models can be slow
+            async with session.post(vision_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"]
+                elif resp.status == 404:
+                    # Fallback to direct llama.cpp port if AI Gateway doesn't route it
+                    direct_url = "http://127.0.0.1:8010/v1/chat/completions"
+                    async with session.post(direct_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as direct_resp:
+                        if direct_resp.status == 200:
+                            data = await direct_resp.json()
+                            return data["choices"][0]["message"]["content"]
+                        else:
+                            return f"Vision model returned status {direct_resp.status}: {await direct_resp.text()}"
+                else:
+                    return f"AI Gateway returned status {resp.status}: {await resp.text()}"
+    except Exception as e:
+        return f"Error calling vision model: {str(e)}"
+
+# ---------------------------------------------------------------------------
 # Workspace management (fast direct API calls)
 # ---------------------------------------------------------------------------
 
@@ -4134,6 +4230,8 @@ TOOL_HANDLERS = {
     "manage_timer": handle_manage_timer,
     # Ticket tracker
     "manage_ticket": handle_manage_ticket,
+    # Image analysis
+    "analyze_image": handle_analyze_image,
     # Workspace management (fast direct API)
     "manage_workspace": handle_manage_workspace,
     # Notes & Productivity

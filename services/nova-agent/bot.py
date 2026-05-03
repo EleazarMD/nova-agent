@@ -240,7 +240,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations", "analyze_spreadsheet"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations", "analyze_spreadsheet", "analyze_image"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -369,6 +369,7 @@ async def run_bot(
             "staar_tutor": f"📚 STAAR: {args.get('action', 'generating')} problems...",
             "compact_conversations": "🧠 Compacting conversations & extracting facts...",
             "analyze_spreadsheet": "📊 Fetching attachment and sending to Atlas for analysis...",
+            "analyze_image": "👁️ Sending image to Qwen Vision model...",
         }
         return desc_map.get(tool_name, f"Executing {tool_name}...")
 
@@ -717,6 +718,7 @@ async def run_bot(
 
     # ── Analyze Spreadsheet (email attachment → Atlas data analysis) ──
     llm.register_function("analyze_spreadsheet", make_tool_handler("analyze_spreadsheet"))
+    llm.register_function("analyze_image", make_tool_handler("analyze_image"))
 
     # ── Missing tool registrations ──────────────────────────────────────
     llm.register_function("manage_ticket", make_tool_handler("manage_ticket"))
@@ -911,7 +913,7 @@ async def run_bot(
             r'|service_health_check|homelab_operations|homelab_diagnostics'
             r'|ev_route_planner|tesla_location_refresh|tesla_control|youtube'
             r'|knowledge_query|get_enriched_context|link_goal_to_knowledge'
-            r'|query_frameworks)\b[^\]]*\]',
+            r'|query_frameworks|analyze_image|analyze_spreadsheet)\b[^\]]*\]',
             _re.IGNORECASE,
         )
         _native_tts_in_table: list[bool] = [False]
