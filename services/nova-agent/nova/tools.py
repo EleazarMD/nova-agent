@@ -3775,7 +3775,7 @@ async def handle_manage_workspace(
             
             try:
                 approval = await _request_approval(
-                    tool_name="workspace_page_delete",
+                    tool_name="workspacePageDelete",
                     arguments={"page_id": full_id, "title": page_title, "intent": intent},
                     risk_level="medium",
                     context=context,
