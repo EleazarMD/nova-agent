@@ -58,6 +58,7 @@ _APPROVAL_EXPIRY_HOURS: dict[str, float] = {
     "service_restart": 1 / 60,   # 1 minute
     "service_start":   1 / 60,   # 1 minute
     "service_stop":    5 / 60,   # 5 minutes
+    "file_delete":     5 / 60,   # 5 minutes
 }
 
 
