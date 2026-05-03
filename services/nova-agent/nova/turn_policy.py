@@ -18,6 +18,17 @@ from loguru import logger
 
 
 @dataclass
+class CanonicalTurnText:
+    raw_text: str
+    canonical_text: str
+    location: str
+    mode_policy: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class TurnFeatures:
     utterance_hash: str
     normalized_text: str
@@ -127,6 +138,35 @@ _CORRECTION_TERMS = (
 )
 
 
+def canonicalize_turn_text(text: str) -> CanonicalTurnText:
+    raw = text or ""
+    working = raw.strip()
+    location = extract_location_prefix(working)
+    working = re.sub(r"^\[User location:[^\]]+\]\s*", "", working, flags=re.IGNORECASE)
+    mode_policy = ""
+    lines = working.splitlines()
+    kept: list[str] = []
+    skipping_policy = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("🧭 MODE POLICY:"):
+            mode_policy = stripped
+            skipping_policy = True
+            continue
+        if skipping_policy:
+            if not stripped:
+                skipping_policy = False
+            continue
+        kept.append(line)
+    canonical = "\n".join(kept).strip()
+    return CanonicalTurnText(
+        raw_text=raw,
+        canonical_text=canonical,
+        location=location,
+        mode_policy=mode_policy,
+    )
+
+
 @dataclass
 class OutcomeLabel:
     outcome: str
@@ -153,8 +193,7 @@ class PlanCacheCandidate:
 
 
 def normalize_turn_text(text: str) -> str:
-    cleaned = re.sub(r"^\[User location:[^\]]+\]\s*", "", text.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\n?🧭 MODE POLICY:.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = canonicalize_turn_text(text).canonical_text
     cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
     return cleaned
 

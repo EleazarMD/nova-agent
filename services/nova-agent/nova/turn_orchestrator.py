@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from nova.turn_policy import build_policy_observation, extract_location_prefix, extract_turn_features, label_previous_turn_outcome, log_plan_cache_candidate, log_policy_observation, plan_cache_candidate_from_observation, shadow_policy_predict
+from nova.turn_policy import build_policy_observation, canonicalize_turn_text, extract_location_prefix, extract_turn_features, label_previous_turn_outcome, log_plan_cache_candidate, log_policy_observation, plan_cache_candidate_from_observation, shadow_policy_predict
 
 
 DispatchTool = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -382,9 +382,7 @@ TOPIC_KEYWORDS = [
 
 
 def clean_user_text(text: str) -> str:
-    cleaned = re.sub(r"^\[User location:[^\]]+\]\s*", "", text.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\n?🧭 MODE POLICY:.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    return cleaned.strip()
+    return canonicalize_turn_text(text).canonical_text
 
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:

@@ -53,10 +53,11 @@ from nova.events import event_bus
 from nova.notify import create_event_handler
 from nova.prompt import build_system_prompt
 from nova.push import mark_user_active, mark_user_inactive, register_push_fallback
-from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn, get_session_metadata, update_session_metadata_key
+from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn, get_session_metadata, update_session_metadata_key, append_learning_event
 from nova.pcg import build_context, record_observation, create_preference
 from nova.tools import TOOL_DEFINITIONS, dispatch_tool, set_progress_context
 from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan, turn_state_from_metadata, turn_state_to_metadata_value
+from nova.turn_policy import canonicalize_turn_text
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -273,17 +274,10 @@ async def run_bot(
     # is a unique long-running task — even if args look similar, the context
     # and state differ between calls.
     _DEDUP_EXCLUDED_TOOLS = {"hub_delegate", "tesla_wake"}
-    _last_tool_call: dict = {"name": None, "args": None, "result": None}
-    _structured_final_response_this_turn: list[bool] = [False]
+    _latest_user_event: dict[str, str] = {}
+    _tool_call_count_this_turn: list[int] = [0]
     _search_tools_exhausted: list[bool] = [False]
-    _turn_state = TurnState()
-    try:
-        _turn_metadata = await get_session_metadata(session.session_id)
-        _turn_state = turn_state_from_metadata(_turn_metadata)
-    except Exception as e:
-        logger.warning(f"TurnOrchestrator state restore failed: {e}")
-    # Traffic telemetry — emitted to logger for monitoring/grepping
-    # Format: NOVA_TRAFFIC | tool=<name> | provider=<class> | latency=<ms> | bytes_out=<n> | status=<ok|error|rate_limited|timeout>
+    _structured_final_response_this_turn: list[bool] = [False]
     _PROVIDER_CLASS: dict[str, str] = {
         "web_search": "cloud:perplexity",
         "get_weather": "cloud:openweathermap",
@@ -309,6 +303,17 @@ async def run_bot(
         "manage_timer": "local:nova",
         "set_reminder": "local:nova",
     }
+
+    async def _record_learning_event(**kwargs):
+        try:
+            await append_learning_event(
+                session_id=session.session_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                **kwargs,
+            )
+        except Exception as e:
+            logger.warning(f"Learning event append failed: {e}")
 
     def _build_spoken_ack(tool_name: str, args: dict) -> str | None:
         """Generate a contextual spoken acknowledgment from tool name + args.
@@ -486,6 +491,21 @@ async def run_bot(
                 # but we need to record it in the session
                 validator.current_session.start_tool(tool_name)
 
+            await _record_learning_event(
+                event_type="tool_call_started",
+                source_layer="llm_tool_loop",
+                raw_text=_latest_user_event.get("raw_text", ""),
+                canonical_text=_latest_user_event.get("canonical_text", ""),
+                location=_latest_user_event.get("location", ""),
+                mode_policy=_latest_user_event.get("mode_policy", ""),
+                tool_name=tool_name,
+                tool_args=args,
+                payload={
+                    "provider_class": provider_class,
+                    "tool_call_index": call_num,
+                },
+            )
+
             # ── Background path: tool executes ──
             _t_start = time.monotonic()
             
@@ -639,6 +659,28 @@ async def run_bot(
             # Clear ThinkingCard phase so the LLM's next response is spoken, not swallowed
             if tool_name in _SLOW_TOOLS:
                 await _send_server_msg({"phase": "done"})
+
+            final_result_str = str(result) if result is not None else ""
+            tool_success = bool(final_result_str.strip()) and not final_result_str.startswith("Tool execution error:") and not final_result_str.startswith(f"Tool {tool_name} timed out")
+            await _record_learning_event(
+                event_type="tool_call_completed",
+                source_layer="llm_tool_loop",
+                raw_text=_latest_user_event.get("raw_text", ""),
+                canonical_text=_latest_user_event.get("canonical_text", ""),
+                location=_latest_user_event.get("location", ""),
+                mode_policy=_latest_user_event.get("mode_policy", ""),
+                tool_name=tool_name,
+                tool_args=args,
+                success=tool_success,
+                latency_ms=locals().get("_latency_ms", 0),
+                outcome="success" if tool_success else "failed",
+                payload={
+                    "provider_class": provider_class,
+                    "result_preview": final_result_str[:500],
+                    "result_chars": len(final_result_str),
+                    "promotion_candidate": tool_success and tool_name in {"save_memory", "recall_memory", "query_cig", "hub_delegate", "tesla_control", "get_weather"},
+                },
+            )
 
             # ── Result path: feed back to LLM for comprehensive spoken response ──
             logger.info(f"🔥 Calling result_callback for {tool_name} with {len(str(result))} chars: {str(result)[:150]}")
@@ -835,7 +877,39 @@ async def run_bot(
                     text = getattr(frame, "text", "") or ""
 
             if text:
+                canonical = canonicalize_turn_text(text)
+                _latest_user_event.clear()
+                _latest_user_event.update(canonical.to_dict())
                 plan = decide_turn(text, _turn_state)
+                await _record_learning_event(
+                    event_type="user_turn_received",
+                    source_layer="transport",
+                    raw_text=canonical.raw_text,
+                    canonical_text=canonical.canonical_text,
+                    location=canonical.location,
+                    mode_policy=canonical.mode_policy,
+                    outcome="received" if canonical.canonical_text else "blank_after_canonicalization",
+                    payload={
+                        "audio_mode": audio_mode,
+                        "frame_type": type(frame).__name__,
+                    },
+                )
+                await _record_learning_event(
+                    event_type="orchestrator_decision",
+                    source_layer="native_turn_orchestrator",
+                    raw_text=canonical.raw_text,
+                    canonical_text=canonical.canonical_text,
+                    location=canonical.location,
+                    mode_policy=canonical.mode_policy,
+                    outcome=plan.intent.value,
+                    payload={
+                        "intent": plan.intent.value,
+                        "goal": plan.goal,
+                        "allowed_tools": plan.allowed_tools,
+                        "evidence_budget": plan.evidence_budget,
+                        "stop_conditions": plan.stop_conditions,
+                    },
+                )
 
                 async def _persist(role: str, content: str):
                     await append_turn(session.session_id, role, content)

@@ -209,6 +209,39 @@ async def init_db(path: str = DB_PATH):
             GROUP BY deterministic_intent, shadow_intent
             ORDER BY count DESC
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                session_id TEXT,
+                conversation_id TEXT,
+                user_id TEXT,
+                event_type TEXT NOT NULL,
+                source_layer TEXT NOT NULL,
+                raw_text TEXT,
+                canonical_text TEXT,
+                location TEXT,
+                mode_policy TEXT,
+                tool_name TEXT,
+                tool_args_json TEXT,
+                success INTEGER,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                outcome TEXT,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_events_time
+            ON learning_events(timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_events_type
+            ON learning_events(event_type, timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_events_session
+            ON learning_events(session_id, timestamp DESC)
+        """)
         await db.commit()
 
 
@@ -314,6 +347,9 @@ async def append_turn(
 
 async def append_turn_policy_observation(observation, path: str = DB_PATH):
     features = observation.features.to_dict()
+    if not str(features.get("normalized_text") or "").strip():
+        logger.warning("Skipping blank turn policy observation")
+        return
     shadow = observation.shadow_candidate.to_dict() if observation.shadow_candidate else None
     payload = observation.to_dict()
     async with aiosqlite.connect(path) as db:
@@ -386,6 +422,116 @@ async def append_turn_policy_observation(observation, path: str = DB_PATH):
     # Async generate and store embedding without blocking
     if features.get("normalized_text"):
         asyncio.create_task(_store_observation_embedding(obs_id, features["normalized_text"], path))
+
+
+async def append_learning_event(
+    *,
+    event_type: str,
+    source_layer: str,
+    session_id: str = "",
+    conversation_id: str = "",
+    user_id: str = "",
+    raw_text: str = "",
+    canonical_text: str = "",
+    location: str = "",
+    mode_policy: str = "",
+    tool_name: str = "",
+    tool_args: Optional[dict] = None,
+    success: Optional[bool] = None,
+    latency_ms: int = 0,
+    outcome: str = "",
+    payload: Optional[dict] = None,
+    path: str = DB_PATH,
+) -> int:
+    now = time.time()
+    payload = payload or {}
+    async with aiosqlite.connect(path) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS learning_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                session_id TEXT,
+                conversation_id TEXT,
+                user_id TEXT,
+                event_type TEXT NOT NULL,
+                source_layer TEXT NOT NULL,
+                raw_text TEXT,
+                canonical_text TEXT,
+                location TEXT,
+                mode_policy TEXT,
+                tool_name TEXT,
+                tool_args_json TEXT,
+                success INTEGER,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                outcome TEXT,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_events_time
+            ON learning_events(timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_events_type
+            ON learning_events(event_type, timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_learning_events_session
+            ON learning_events(session_id, timestamp DESC)
+        """)
+        cursor = await db.execute(
+            """
+            INSERT INTO learning_events (
+                timestamp,
+                session_id,
+                conversation_id,
+                user_id,
+                event_type,
+                source_layer,
+                raw_text,
+                canonical_text,
+                location,
+                mode_policy,
+                tool_name,
+                tool_args_json,
+                success,
+                latency_ms,
+                outcome,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                session_id or None,
+                conversation_id or None,
+                user_id or None,
+                event_type,
+                source_layer,
+                raw_text or None,
+                canonical_text or None,
+                location or None,
+                mode_policy or None,
+                tool_name or None,
+                json.dumps(tool_args or {}) if tool_args is not None else None,
+                None if success is None else int(bool(success)),
+                int(latency_ms or 0),
+                outcome or None,
+                json.dumps(payload),
+            ),
+        )
+        event_id = int(cursor.lastrowid or 0)
+        await db.commit()
+        return event_id
+
+
+async def get_recent_learning_events(limit: int = 100, path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM learning_events ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
 
 async def _store_observation_embedding(obs_id: int, text: str, path: str):
     emb = await generate_embedding(text)
