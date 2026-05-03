@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from nova.turn_policy import build_policy_observation, canonicalize_turn_text, extract_location_prefix, extract_turn_features, label_previous_turn_outcome, log_plan_cache_candidate, log_policy_observation, plan_cache_candidate_from_observation, shadow_policy_predict
+from nova.learning import get_shadow_plan_candidates
 
 
 DispatchTool = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -475,6 +476,16 @@ def decide_turn(text: str, state: TurnState) -> TurnPlan:
     features = extract_turn_features(text, state)
     shadow_candidate = shadow_policy_predict(features)
     _best_effort_task(_log_plan_cache_candidate(features))
+    
+    async def _log_shadow_plan_candidates():
+        try:
+            candidates = await get_shadow_plan_candidates(user_text)
+            if candidates:
+                logger.info(f"NOVA_LEARNING_SHADOW | {json.dumps({'text': user_text, 'candidates': candidates}, sort_keys=True)}")
+        except Exception as e:
+            logger.warning(f"Failed to log shadow candidates: {e}")
+            
+    _best_effort_task(_log_shadow_plan_candidates())
 
     wants_workspace = _contains_any(lower, ("workspace", "page", "pages", "document", "documents", "advisory", "advisories", "report", "brief"))
     wants_lookup = _contains_any(lower, ("find", "lookup", "search", "email", "thread", "message"))

@@ -58,6 +58,7 @@ from nova.pcg import build_context, record_observation, create_preference
 from nova.tools import TOOL_DEFINITIONS, dispatch_tool, set_progress_context
 from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan, turn_state_from_metadata, turn_state_to_metadata_value
 from nova.turn_policy import canonicalize_turn_text
+from nova.learning import consolidate_session_learning
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -859,6 +860,9 @@ async def run_bot(
                 if _pi_thinking_sent[0]:
                     await _send_server_msg({"phase": "done"})
                     _pi_thinking_sent[0] = False
+                
+                # Async background learning consolidation
+                asyncio.create_task(consolidate_session_learning(session.session_id))
 
             await self.push_frame(frame, direction)
 
