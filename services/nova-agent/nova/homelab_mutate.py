@@ -104,7 +104,7 @@ async def _request_approval(
             },
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
-            if resp.status == 201:
+            if resp.status in (200, 201, 202):
                 data = await resp.json()
                 approval_id = data.get("approval_id") or data.get("approval", {}).get("id")
                 logger.info(
@@ -128,6 +128,7 @@ async def _poll_approval_status(approval_id: str) -> dict:
         while elapsed < APPROVAL_TIMEOUT:
             async with session.get(
                 url,
+                headers={"X-API-Key": APPROVAL_SERVICE_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
