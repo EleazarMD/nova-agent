@@ -1822,7 +1822,8 @@ async def handle_hub_delegate(
         },
         "orchestrator": {
             "run": "agents.run",
-            "delegate": "agents.run",
+            "dispatch": "orchestrator.dispatch",
+            "delegate": "orchestrator.dispatch",
         },
     }
     
@@ -3543,64 +3544,88 @@ async def handle_analyze_image(
     prompt: str = "Describe this image in detail.",
     **kwargs
 ) -> str:
-    """Download an image and send it to the local Qwen Vision model via AI Gateway or llama.cpp."""
+    """Download an image and send it to the local Qwen Vision model via AI Gateway or llama.cpp asynchronously."""
     import aiohttp
     import base64
     import os
+    import asyncio
+    from nova.events import event_bus, Event
     
-    # Optional: download image first and encode as base64
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
-                if resp.status != 200:
-                    return f"Failed to download image from {image_url}. Status: {resp.status}"
-                image_bytes = await resp.read()
-                mime_type = resp.headers.get('Content-Type', 'image/jpeg')
-    except Exception as e:
-        return f"Error downloading image: {str(e)}"
-        
-    b64_image = base64.b64encode(image_bytes).decode('utf-8')
-    data_url = f"data:{mime_type};base64,{b64_image}"
+    user_id = kwargs.get("_internal_user_id", "default")
     
-    payload = {
-        "model": "qwen-vision",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}}
-                ]
+    async def _background_analyze():
+        try:
+            # Download image first and encode as base64
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as resp:
+                    if resp.status != 200:
+                        await event_bus.emit(Event(
+                            type="job.failed",
+                            user_id=user_id,
+                            data={"summary": f"Failed to download image from {image_url}. Status: {resp.status}"}
+                        ))
+                        return
+                    image_bytes = await resp.read()
+                    mime_type = resp.headers.get('Content-Type', 'image/jpeg')
+            
+            b64_image = base64.b64encode(image_bytes).decode('utf-8')
+            data_url = f"data:{mime_type};base64,{b64_image}"
+            
+            payload = {
+                "model": "qwen-vision",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}}
+                        ]
+                    }
+                ],
+                "max_tokens": 1000
             }
-        ],
-        "max_tokens": 1000
-    }
+            
+            # Try AI Gateway first, fallback to direct llama.cpp if needed
+            vision_url = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1").replace("/api/v1", "/v1/chat/completions")
+            if "api/v1" not in os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1") and "v1" not in vision_url:
+                vision_url = "http://127.0.0.1:8777/v1/chat/completions"
+                
+            async with aiohttp.ClientSession() as session:
+                # We use a 90 second timeout as vision models can be slow
+                async with session.post(vision_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        result = data["choices"][0]["message"]["content"]
+                    elif resp.status == 404:
+                        # Fallback to direct llama.cpp port if AI Gateway doesn't route it
+                        direct_url = "http://127.0.0.1:8010/v1/chat/completions"
+                        async with session.post(direct_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as direct_resp:
+                            if direct_resp.status == 200:
+                                data = await direct_resp.json()
+                                result = data["choices"][0]["message"]["content"]
+                            else:
+                                result = f"Vision model returned status {direct_resp.status}: {await direct_resp.text()}"
+                    else:
+                        result = f"AI Gateway returned status {resp.status}: {await resp.text()}"
+                        
+            await event_bus.emit(Event(
+                type="job.completed",
+                user_id=user_id,
+                data={"summary": f"I finished looking at the image you attached. Here is what I found: {result}"}
+            ))
+            
+        except Exception as e:
+            logger.error(f"Background image analysis failed: {e}")
+            await event_bus.emit(Event(
+                type="job.failed",
+                user_id=user_id,
+                data={"summary": f"My background image analysis failed: {str(e)}"}
+            ))
+
+    # Fire and forget
+    asyncio.create_task(_background_analyze())
     
-    # Try AI Gateway first, fallback to direct llama.cpp if needed
-    vision_url = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1").replace("/api/v1", "/v1/chat/completions")
-    if "api/v1" not in os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1") and "v1" not in vision_url:
-        vision_url = "http://127.0.0.1:8777/v1/chat/completions"
-        
-    try:
-        async with aiohttp.ClientSession() as session:
-            # We use a 90 second timeout as vision models can be slow
-            async with session.post(vision_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["choices"][0]["message"]["content"]
-                elif resp.status == 404:
-                    # Fallback to direct llama.cpp port if AI Gateway doesn't route it
-                    direct_url = "http://127.0.0.1:8010/v1/chat/completions"
-                    async with session.post(direct_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as direct_resp:
-                        if direct_resp.status == 200:
-                            data = await direct_resp.json()
-                            return data["choices"][0]["message"]["content"]
-                        else:
-                            return f"Vision model returned status {direct_resp.status}: {await direct_resp.text()}"
-                else:
-                    return f"AI Gateway returned status {resp.status}: {await resp.text()}"
-    except Exception as e:
-        return f"Error calling vision model: {str(e)}"
+    return "SYSTEM: Image analysis has started in the background. Tell the user you are looking at it and will let them know when it's ready. Do NOT wait for the result."
 
 # ---------------------------------------------------------------------------
 # Workspace management (fast direct API calls)

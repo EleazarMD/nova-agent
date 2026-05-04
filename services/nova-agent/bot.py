@@ -242,7 +242,7 @@ async def run_bot(
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations", "analyze_spreadsheet", "analyze_image"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations", "analyze_spreadsheet"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -509,6 +509,9 @@ async def run_bot(
 
             # ── Background path: tool executes ──
             _t_start = time.monotonic()
+            
+            # Inject internal user id for tools that need to spawn background tasks
+            args["_internal_user_id"] = user_id
             
             async def _heartbeat_loop():
                 try:
@@ -1178,6 +1181,7 @@ async def run_bot(
                         _ack_sent_this_turn[0] = False
                         _tool_calls_this_turn[0] = 0
                         _per_tool_call_counts.clear()
+                        _last_tool_call.clear()
                         _last_tool_call.update({"name": None, "args": None, "result": None})
                         _structured_final_response_this_turn[0] = False
                         _search_tools_exhausted[0] = False
@@ -1259,8 +1263,9 @@ async def run_bot(
 
 if __name__ == "__main__":
     import json
-    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.staticfiles import StaticFiles
     from pipecat.transports.smallwebrtc.request_handler import (
         SmallWebRTCRequestHandler,
         SmallWebRTCRequest,
@@ -1281,6 +1286,50 @@ if __name__ == "__main__":
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    import os
+    import shutil
+    import uuid
+
+    # Set up local image storage for vision
+    IMAGE_STORE = os.path.join(os.path.dirname(__file__), "data", "images")
+    os.makedirs(IMAGE_STORE, exist_ok=True)
+    webrtc_app.mount("/api/vision/images", StaticFiles(directory=IMAGE_STORE), name="images")
+
+    @webrtc_app.post("/api/vision/upload")
+    async def upload_vision_image(file: UploadFile = File(...)):
+        """Handle image uploads from iOS client for Qwen Vision analysis."""
+        try:
+            # Generate unique filename with original extension
+            ext = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
+            file_id = str(uuid.uuid4())
+            filename = f"{file_id}{ext}"
+            file_path = os.path.join(IMAGE_STORE, filename)
+            
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            
+            logger.info(f"Saved vision image: {filename}")
+            
+            # The URL iOS will send to Nova via hidden system prompt
+            # Must be accessible via the AI gateway/Nova server URL
+            webrtc_port = os.environ.get("NOVA_PORT", "18800")
+            serving_url = f"http://100.108.41.22:{webrtc_port}/api/vision/images/{filename}"
+            
+            return {
+                "success": True,
+                "url": serving_url,
+                "imageUrl": serving_url,
+                "id": file_id,
+                "file": {
+                    "id": file_id,
+                    "url": serving_url,
+                    "fileName": filename,
+                }
+            }
+        except Exception as e:
+            logger.error(f"Failed to upload image: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     # WebRTC request handler
     request_handler = SmallWebRTCRequestHandler()
