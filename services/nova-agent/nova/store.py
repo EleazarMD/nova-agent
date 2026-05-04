@@ -118,6 +118,74 @@ class Session:
     metadata: Optional[str] = None  # JSON blob
 
 
+def _canonical_search_content(content: str) -> str:
+    try:
+        from nova.turn_policy import canonicalize_turn_text
+        canonical = canonicalize_turn_text(content).canonical_text.strip()
+        if canonical:
+            return canonical
+    except Exception:
+        pass
+    return (content or "").strip()
+
+
+def _format_search_content(role: str, content: str, max_chars: int = 150) -> str:
+    cleaned = _canonical_search_content(content)
+    if role == "system" or not cleaned or _is_search_meta_content(cleaned):
+        return ""
+    label = "User" if role == "user" else "Nova"
+    return f"{label}: {cleaned[:max_chars]}"
+
+
+def _is_search_meta_content(content: str) -> bool:
+    cleaned = (content or "").strip().lower()
+    if not cleaned:
+        return True
+    meta_markers = (
+        "system:",
+        "system instruction:",
+        "system assistive routing",
+        "mode policy:",
+        "semantic search infrastructure",
+        "search infrastructure",
+        "corrupted results",
+        "system headers",
+        "the infra agent",
+        "what they should verify:",
+        "what to check:",
+        "result serialization",
+        "query path",
+        "fallback behavior",
+        "content retrieval layer",
+        "vector search fires correctly",
+        "workspace.ai_messages",
+        "/v1/v1/messages",
+    )
+    return any(marker in cleaned for marker in meta_markers)
+
+
+_SEARCH_META_PATTERNS = [
+    "%SYSTEM:%",
+    "%SYSTEM INSTRUCTION:%",
+    "%SYSTEM ASSISTIVE ROUTING%",
+    "%MODE POLICY:%",
+    "%semantic search infrastructure%",
+    "%search infrastructure%",
+    "%corrupted results%",
+    "%system headers%",
+    "%the infra agent%",
+    "%What they should verify:%",
+    "%What to check:%",
+    "%Result serialization%",
+    "%Query path%",
+    "%Fallback behavior%",
+    "%content retrieval layer%",
+    "%vector search fires correctly%",
+    "%workspace.ai_messages%",
+    "%/v1/v1/messages%",
+]
+
+
 async def init_db(path: str = DB_PATH):
     """Create tables if they don't exist."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -778,7 +846,9 @@ async def _sync_message_to_backend(
             return
         
         # Sanitize and score
-        safe_content = _sanitize_content(content)
+        safe_content = _sanitize_content(_canonical_search_content(content))
+        if not safe_content:
+            safe_content = _sanitize_content(content)
         importance = _calculate_importance(safe_content, role, bool(tool_calls))
         is_preserved = importance >= 70
         
@@ -931,6 +1001,15 @@ async def _search_local_conversations(
         terms = [t.lower() for t in query.split() if len(t) >= 2]
         if not terms:
             return []
+        meta_noise = (
+            "semantic search",
+            "search infrastructure",
+            "corrupted results",
+            "system headers",
+            "is broken",
+            "isn't returning",
+            "not returning",
+        )
         
         cutoff = time.time() - (days_back * 86400)
         placeholders = " OR ".join(["LOWER(t.content) LIKE ?" for _ in terms])
@@ -962,11 +1041,22 @@ async def _search_local_conversations(
                 if not match_rows:
                     continue
                 
+                ranked_matches = []
+                for m in match_rows:
+                    cleaned = _canonical_search_content(m["content"]).lower()
+                    lexical_hits = sum(1 for t in terms if t in cleaned)
+                    noise_penalty = 3 if any(term in cleaned for term in meta_noise) else 0
+                    role_bonus = 2 if m["role"] == "user" else 0
+                    ranked_matches.append((lexical_hits + role_bonus - noise_penalty, m))
+                ranked_matches.sort(key=lambda item: (item[0], item[1]["timestamp"] or 0), reverse=True)
+
                 # For each match, get surrounding context (prev + next message)
                 results = []
                 seen_conversations = set()
-                for m in match_rows:
+                for _, m in ranked_matches:
                     conv_id = m["conversation_id"]
+                    if conv_id in seen_conversations:
+                        continue
                     
                     # Get context: 1 message before and 1 after the match
                     context_parts = []
@@ -978,10 +1068,13 @@ async def _search_local_conversations(
                             (m["session_id"], m["rowid"] - 1, m["rowid"] + 1),
                         )
                         for cr in context_rows:
-                            role_label = "User" if cr["role"] == "user" else "Nova"
-                            context_parts.append(f"{role_label}: {cr['content'][:150]}")
+                            formatted = _format_search_content(cr["role"], cr["content"])
+                            if formatted:
+                                context_parts.append(formatted)
                     except Exception:
-                        context_parts.append(f"{'User' if m['role']=='user' else 'Nova'}: {m['content'][:200]}")
+                        formatted = _format_search_content(m["role"], m["content"], 200)
+                        if formatted:
+                            context_parts.append(formatted)
                     
                     # Derive a title from the conversation's first user message
                     title_row = await db.execute_fetchall(
@@ -990,7 +1083,7 @@ async def _search_local_conversations(
                            ORDER BY rowid LIMIT 1""",
                         (m["session_id"],),
                     )
-                    title = title_row[0]["content"][:60] if title_row else f"Conversation {conv_id[:8]}"
+                    title = _canonical_search_content(title_row[0]["content"])[:60] if title_row else f"Conversation {conv_id[:8]}"
                     
                     # Timestamp for display
                     ts = m["timestamp"] or 0
@@ -1057,6 +1150,7 @@ async def _search_postgres_direct(
         query_embedding = await generate_embedding(query, input_type="query")
         if query_embedding:
             embedding_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
+            embedding_dims = len(query_embedding)
             async with pool.acquire() as conn:
                 # Search by cosine similarity on embedded messages, then get context
                 rows = await conn.fetch(
@@ -1064,48 +1158,77 @@ async def _search_postgres_direct(
                            SELECT 
                                c.id as conversation_id,
                                c.title,
+                               m.id as message_id,
+                               m.role,
+                               m.created_at as message_created_at,
                                m.content as snippet,
                                1 - (m.embedding <=> $3::vector) as similarity,
                                c.created_at,
                                c.message_count,
-                               ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY m.embedding <=> $3::vector) as rn
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY c.id
+                                   ORDER BY
+                                       CASE WHEN m.role = 'user' THEN 0 ELSE 1 END,
+                                       m.embedding <=> $3::vector
+                               ) as rn
                            FROM workspace.ai_conversations c
                            JOIN workspace.ai_messages m ON m.conversation_id = c.id
                            WHERE {user_filter}
                              AND c.retention_tier != 'archived'
                              AND {time_filter}
+                             AND m.role IN ('user', 'assistant')
                              AND m.embedding IS NOT NULL
+                             AND vector_dims(m.embedding) = $4
+                             AND NOT (m.content ILIKE ANY($5::text[]))
                        )
                        SELECT * FROM RankedMessages
                        WHERE rn = 1
                        ORDER BY similarity DESC
                        LIMIT $2""",
-                    user_id, limit, embedding_str,
+                    user_id, limit, embedding_str, embedding_dims, _SEARCH_META_PATTERNS,
                 )
 
                 if rows:
                     results = []
                     for r in rows:
                         # Get surrounding context for the best matching message
-                        snippet = (r["snippet"] or "")[:300]
+                        snippet = ""
+                        initial_snippet = _canonical_search_content(r["snippet"] or "")
+                        if not _is_search_meta_content(initial_snippet):
+                            snippet = _format_search_content(r["role"], initial_snippet, 300)
                         # Try to get more context from surrounding messages
                         conv_id = r["conversation_id"]
                         context_rows = await conn.fetch(
-                            """SELECT role, content FROM workspace.ai_messages
-                               WHERE conversation_id = $1::uuid
-                               ORDER BY created_at DESC LIMIT 5""",
-                            conv_id,
+                            """WITH target AS (
+                                   SELECT created_at
+                                   FROM workspace.ai_messages
+                                   WHERE id = $2::uuid
+                               )
+                               SELECT m.role, m.content
+                               FROM workspace.ai_messages m, target
+                               WHERE m.conversation_id = $1::uuid
+                                 AND m.role IN ('user', 'assistant')
+                                 AND m.created_at BETWEEN target.created_at - INTERVAL '10 minutes'
+                                                      AND target.created_at + INTERVAL '10 minutes'
+                                 AND NOT (m.content ILIKE ANY($3::text[]))
+                               ORDER BY m.created_at ASC
+                               LIMIT 7""",
+                            conv_id, r["message_id"], _SEARCH_META_PATTERNS,
                         )
                         if context_rows:
                             parts = []
                             for cr in context_rows:
-                                label = "User" if cr["role"] == "user" else "Nova"
-                                parts.append(f"{label}: {cr['content'][:150]}")
-                            snippet = "\n".join(parts)[:400]
+                                formatted = _format_search_content(cr["role"], cr["content"])
+                                if formatted:
+                                    parts.append(formatted)
+                            if parts:
+                                snippet = "\n".join(parts)[:400]
+                        if not snippet:
+                            snippet = _format_search_content(r["role"], initial_snippet, 300)
 
                         results.append({
                             "conversation_id": str(r["conversation_id"]),
-                            "title": r["title"] or "Untitled",
+                            "title": _canonical_search_content(r["title"] or "")[:80] or "Untitled",
                             "snippet": snippet,
                             "relevance_score": float(r["similarity"]) if r["similarity"] else 0.5,
                             "created_at": r["created_at"].isoformat() if r["created_at"] else "",
@@ -1120,13 +1243,18 @@ async def _search_postgres_direct(
         terms = [t for t in query.split() if len(t) >= 2]
         if not terms:
             return []
+        significant_terms = [
+            t.lower()
+            for t in terms
+            if len(t) >= 4 and t.lower() not in {"this", "that", "with", "from", "about"}
+        ]
 
         param_idx = 3  # $1=user_id, $2=limit
         conditions = []
         params = [user_id, limit]
         for t in terms:
             like_val = f"%{t}%"
-            conditions.append(f"(m.content ILIKE ${param_idx} OR c.title ILIKE ${param_idx})")
+            conditions.append(f"m.content ILIKE ${param_idx}")
             params.append(like_val)
             param_idx += 1
         conditions_sql = " OR ".join(conditions)
@@ -1135,38 +1263,85 @@ async def _search_postgres_direct(
             rows = await conn.fetch(
                 f"""WITH RankedMessages AS (
                        SELECT 
-                           c.id as conversation_id,
-                           c.title,
-                           m.content as snippet,
-                           c.importance_score as relevance_score,
-                           c.created_at,
-                           c.message_count,
-                           ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY c.importance_score DESC, c.last_message_at DESC) as rn
+                               c.id as conversation_id,
+                               c.title,
+                               m.role,
+                               m.content as snippet,
+                               c.importance_score as relevance_score,
+                               c.created_at,
+                               c.message_count,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY c.id
+                                   ORDER BY
+                                       CASE WHEN m.role = 'user' THEN 0 ELSE 1 END,
+                                       c.importance_score DESC,
+                                       c.last_message_at DESC
+                               ) as rn
                        FROM workspace.ai_conversations c
                        JOIN workspace.ai_messages m ON m.conversation_id = c.id
                        WHERE {user_filter}
                          AND c.retention_tier != 'archived'
                          AND {time_filter}
+                         AND m.role IN ('user', 'assistant')
+                         AND NOT (m.content ILIKE ANY(${param_idx}::text[]))
                          AND ({conditions_sql})
                    )
                    SELECT * FROM RankedMessages
                    WHERE rn = 1
                    ORDER BY relevance_score DESC, created_at DESC
-                   LIMIT $2""",
-                *params,
+                   LIMIT $2 * 10""",
+                *params, _SEARCH_META_PATTERNS,
             )
 
             results = []
+            ranked_rows = []
             for r in rows:
+                cleaned = _canonical_search_content(r["snippet"] or "")
+                cleaned_lower = cleaned.lower()
+                lexical_hits = sum(1 for t in terms if t.lower() in cleaned_lower)
+                significant_hits = sum(1 for t in significant_terms if t in cleaned_lower)
+                if len(significant_terms) >= 2 and significant_hits < 2:
+                    continue
+                phrase_bonus = 3 if query.lower() in cleaned_lower else 0
+                role_bonus = 2 if r["role"] == "user" else 0
+                noise_penalty = 4 if any(term in cleaned_lower for term in (
+                    "semantic search",
+                    "search infrastructure",
+                    "corrupted results",
+                    "system headers",
+                    "is broken",
+                    "isn't returning",
+                    "not returning",
+                )) else 0
+                score = lexical_hits + phrase_bonus + role_bonus - noise_penalty
+                if score <= 0:
+                    continue
+                ranked_rows.append((score, r, cleaned))
+
+            ranked_rows.sort(
+                key=lambda item: (item[0], item[1]["relevance_score"] or 0, item[1]["created_at"]),
+                reverse=True,
+            )
+            seen_conversations = set()
+            for score, r, cleaned in ranked_rows:
+                conv_id = str(r["conversation_id"])
+                if conv_id in seen_conversations:
+                    continue
+                snippet = _format_search_content(r["role"], cleaned, 200)
+                if not snippet:
+                    continue
                 results.append({
-                    "conversation_id": str(r["conversation_id"]),
-                    "title": r["title"] or "Untitled",
-                    "snippet": (r["snippet"] or "")[:200],
-                    "relevance_score": (r["relevance_score"] or 50) / 100,
+                    "conversation_id": conv_id,
+                    "title": _canonical_search_content(r["title"] or "")[:80] or "Untitled",
+                    "snippet": snippet,
+                    "relevance_score": min(0.95, max(0.1, score / max(len(terms) + 5, 1))),
                     "created_at": r["created_at"].isoformat() if r["created_at"] else "",
                     "message_count": r["message_count"] or 0,
                     "source": "postgres_keyword",
                 })
+                seen_conversations.add(conv_id)
+                if len(results) >= limit:
+                    break
 
             if results:
                 logger.info(f"Keyword search found {len(results)} conversations for '{query}'")
