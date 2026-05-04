@@ -1060,20 +1060,25 @@ async def _search_postgres_direct(
             async with pool.acquire() as conn:
                 # Search by cosine similarity on embedded messages, then get context
                 rows = await conn.fetch(
-                    f"""SELECT DISTINCT ON (c.id)
-                           c.id as conversation_id,
-                           c.title,
-                           m.content as snippet,
-                           1 - (m.embedding <=> $3::vector) as similarity,
-                           c.created_at,
-                           c.message_count
-                       FROM workspace.ai_conversations c
-                       JOIN workspace.ai_messages m ON m.conversation_id = c.id
-                       WHERE {user_filter}
-                         AND c.retention_tier != 'archived'
-                         AND {time_filter}
-                         AND m.embedding IS NOT NULL
-                       ORDER BY c.id, m.embedding <=> $3::vector
+                    f"""WITH RankedMessages AS (
+                           SELECT 
+                               c.id as conversation_id,
+                               c.title,
+                               m.content as snippet,
+                               1 - (m.embedding <=> $3::vector) as similarity,
+                               c.created_at,
+                               c.message_count,
+                               ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY m.embedding <=> $3::vector) as rn
+                           FROM workspace.ai_conversations c
+                           JOIN workspace.ai_messages m ON m.conversation_id = c.id
+                           WHERE {user_filter}
+                             AND c.retention_tier != 'archived'
+                             AND {time_filter}
+                             AND m.embedding IS NOT NULL
+                       )
+                       SELECT * FROM RankedMessages
+                       WHERE rn = 1
+                       ORDER BY similarity DESC
                        LIMIT $2""",
                     user_id, limit, embedding_str,
                 )
@@ -1128,20 +1133,25 @@ async def _search_postgres_direct(
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                f"""SELECT DISTINCT ON (c.id)
-                       c.id as conversation_id,
-                       c.title,
-                       m.content as snippet,
-                       c.importance_score as relevance_score,
-                       c.created_at,
-                       c.message_count
-                   FROM workspace.ai_conversations c
-                   JOIN workspace.ai_messages m ON m.conversation_id = c.id
-                   WHERE {user_filter}
-                     AND c.retention_tier != 'archived'
-                     AND {time_filter}
-                     AND ({conditions_sql})
-                   ORDER BY c.id, c.importance_score DESC, c.last_message_at DESC
+                f"""WITH RankedMessages AS (
+                       SELECT 
+                           c.id as conversation_id,
+                           c.title,
+                           m.content as snippet,
+                           c.importance_score as relevance_score,
+                           c.created_at,
+                           c.message_count,
+                           ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY c.importance_score DESC, c.last_message_at DESC) as rn
+                       FROM workspace.ai_conversations c
+                       JOIN workspace.ai_messages m ON m.conversation_id = c.id
+                       WHERE {user_filter}
+                         AND c.retention_tier != 'archived'
+                         AND {time_filter}
+                         AND ({conditions_sql})
+                   )
+                   SELECT * FROM RankedMessages
+                   WHERE rn = 1
+                   ORDER BY relevance_score DESC, created_at DESC
                    LIMIT $2""",
                 *params,
             )
