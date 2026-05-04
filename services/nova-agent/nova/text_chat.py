@@ -462,7 +462,7 @@ async def simple_chat(req: ChatRequest):
             metadata = await get_session_metadata(session.session_id)
             _turn_states[conversation_id] = turn_state_from_metadata(metadata)
         turn_state = _turn_states[conversation_id]
-        plan = decide_turn(req.message, turn_state)
+        plan = await decide_turn(req.message, turn_state)
         orchestrated_response: list[str] = []
 
         async def _send_server_msg(msg: dict):
@@ -502,6 +502,19 @@ async def simple_chat(req: ChatRequest):
         await _sync_message_to_backend(
             conversation_id, req.user_id, "user", req.message
         )
+        
+        if plan.learned_candidate:
+            tools = plan.learned_candidate.get("tools_used", [])
+            if tools:
+                tool_name = tools[0]
+                instruction = f"\n\n[SYSTEM ASSISTIVE ROUTING: The user's request matches a learned pattern for the '{tool_name}' tool. Call this tool immediately to assist them.]"
+                messages[-1]["content"] += instruction
+                logger.info(f"NOVA_LEARNING_ROUTING_TEXT | Injected assistive routing for {tool_name}")
+
+        # Start background learning consolidation
+        from nova.learning import consolidate_session_learning
+        import asyncio
+        asyncio.create_task(consolidate_session_learning(session.session_id))
         
         # Call AI Gateway with tools
         response_text, tool_calls, usage = await _call_llm(

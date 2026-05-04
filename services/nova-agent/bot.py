@@ -884,7 +884,7 @@ async def run_bot(
                 canonical = canonicalize_turn_text(text)
                 _latest_user_event.clear()
                 _latest_user_event.update(canonical.to_dict())
-                plan = decide_turn(text, _turn_state)
+                plan = await decide_turn(text, _turn_state)
                 await _record_learning_event(
                     event_type="user_turn_received",
                     source_layer="transport",
@@ -939,6 +939,19 @@ async def run_bot(
                     except Exception as e:
                         logger.warning(f"TurnOrchestrator state persist failed: {e}")
                     return
+
+                if plan.learned_candidate:
+                    tools = plan.learned_candidate.get("tools_used", [])
+                    if tools:
+                        tool_name = tools[0]
+                        instruction = f"\n\n[SYSTEM ASSISTIVE ROUTING: The user's request matches a learned pattern for the '{tool_name}' tool. Call this tool immediately to assist them.]"
+                        if isinstance(frame, InputTransportMessageFrame):
+                            if isinstance(frame.message, dict) and frame.message.get("type") == "send-text":
+                                if isinstance(frame.message.get("data"), dict):
+                                    frame.message["data"]["content"] += instruction
+                        elif isinstance(frame, TranscriptionFrame):
+                            frame.text += instruction
+                        logger.info(f"NOVA_LEARNING_ROUTING | Injected assistive routing for {tool_name}")
 
             await self.push_frame(frame, direction)
 

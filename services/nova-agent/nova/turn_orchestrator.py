@@ -50,6 +50,7 @@ class TurnPlan:
     allowed_tools: list[str] = field(default_factory=list)
     stop_conditions: list[str] = field(default_factory=list)
     context: dict[str, Any] = field(default_factory=dict)
+    learned_candidate: dict[str, Any] | None = None
 
 
 @dataclass
@@ -470,22 +471,23 @@ def _derive_research_topic(user_text: str) -> str:
     return cleaned or user_text
 
 
-def decide_turn(text: str, state: TurnState) -> TurnPlan:
+async def decide_turn(text: str, state: TurnState) -> TurnPlan:
     user_text = clean_user_text(text)
     lower = user_text.lower()
     features = extract_turn_features(text, state)
     shadow_candidate = shadow_policy_predict(features)
     _best_effort_task(_log_plan_cache_candidate(features))
     
-    async def _log_shadow_plan_candidates():
-        try:
-            candidates = await get_shadow_plan_candidates(user_text)
-            if candidates:
-                logger.info(f"NOVA_LEARNING_SHADOW | {json.dumps({'text': user_text, 'candidates': candidates}, sort_keys=True)}")
-        except Exception as e:
-            logger.warning(f"Failed to log shadow candidates: {e}")
-            
-    _best_effort_task(_log_shadow_plan_candidates())
+    learned_candidate = None
+    try:
+        candidates = await get_shadow_plan_candidates(user_text)
+        if candidates:
+            logger.info(f"NOVA_LEARNING_SHADOW | {json.dumps({'text': user_text, 'candidates': candidates}, sort_keys=True)}")
+            best_candidate = candidates[0]
+            if best_candidate["confidence"] >= 0.80:
+                learned_candidate = best_candidate
+    except Exception as e:
+        logger.warning(f"Failed to fetch shadow candidates: {e}")
 
     wants_workspace = _contains_any(lower, ("workspace", "page", "pages", "document", "documents", "advisory", "advisories", "report", "brief"))
     wants_lookup = _contains_any(lower, ("find", "lookup", "search", "email", "thread", "message"))
@@ -617,7 +619,9 @@ def decide_turn(text: str, state: TurnState) -> TurnPlan:
         )
 
     log_policy_observation(features=features, deterministic_intent=TurnIntent.PASS_THROUGH.value, shadow_candidate=shadow_candidate)
-    return TurnPlan(intent=TurnIntent.PASS_THROUGH, goal="", user_text=user_text)
+    plan = TurnPlan(intent=TurnIntent.PASS_THROUGH, goal="", user_text=user_text)
+    plan.learned_candidate = learned_candidate
+    return plan
 
 
 def _build_scribe_context(plan: TurnPlan, state: TurnState, evidence: str = "") -> str:
