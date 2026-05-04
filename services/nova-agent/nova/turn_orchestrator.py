@@ -31,6 +31,7 @@ STATE_METADATA_KEY = "nova_turn_orchestrator"
 
 class TurnIntent(str, Enum):
     PASS_THROUGH = "pass_through"
+    AUTO_ACTION = "auto_action"
     CLARIFICATION = "clarification"
     WEATHER_LOOKUP = "weather_lookup"
     WORKSPACE_CREATION = "workspace_creation"
@@ -486,6 +487,11 @@ async def decide_turn(text: str, state: TurnState) -> TurnPlan:
             best_candidate = candidates[0]
             if best_candidate["confidence"] >= 0.80:
                 learned_candidate = best_candidate
+                if best_candidate["confidence"] >= 0.95:
+                    log_policy_observation(features=features, deterministic_intent=TurnIntent.AUTO_ACTION.value, shadow_candidate=shadow_candidate)
+                    plan = TurnPlan(intent=TurnIntent.AUTO_ACTION, goal="", user_text=user_text)
+                    plan.learned_candidate = learned_candidate
+                    return plan
     except Exception as e:
         logger.warning(f"Failed to fetch shadow candidates: {e}")
 
@@ -829,7 +835,83 @@ async def _run_workflow_status(runtime: TurnRuntime) -> TurnExecutionResult:
     return await runtime.finish(response, "workflow_status_returned")
 
 
+async def _run_auto_action(runtime: TurnRuntime) -> TurnExecutionResult:
+    plan = runtime.plan
+    candidate = plan.learned_candidate or {}
+    tools = candidate.get("tools_used")
+    tool_name = tools[0] if tools else None
+    
+    if not tool_name:
+        return await runtime.finish("I encountered an issue executing this learned action.", "auto_action_failed")
+        
+    await runtime.send_server_msg({"phase": "thinking"})
+    await runtime.send_server_msg({"type": "thinking", "text": f"Auto-executing learned action for {tool_name}..."})
+    
+    # Fast heuristic parameter extraction (Zero-Wait bypasses the LLM)
+    args = {}
+    user_text = plan.user_text
+    lower_text = user_text.lower()
+    if tool_name == "save_memory":
+        content = re.sub(r"^(memorize|save|remember|recall)\s*(this|that)?\s*", "", user_text, flags=re.IGNORECASE).strip()
+        content = re.sub(r"\b(please|thanks|to my memory)\b", "", content, flags=re.IGNORECASE).strip()
+        args = {"content": content}
+    elif tool_name == "get_weather":
+        location = str(plan.context.get("location") or runtime.state.location or "Humble, TX").strip()
+        args = {"location": location}
+    elif tool_name == "control_lights":
+        state_arg = "on" if "on" in lower_text else "off"
+        args = {"state": state_arg}
+    elif tool_name == "query_cig":
+        args = {"domain": "search", "query": user_text}
+    elif tool_name == "tesla_control":
+        action_arg = "wake"
+        command = "wake"
+        if "lock" in lower_text and "unlock" not in lower_text:
+            action_arg = "lock"
+            command = "lock"
+        elif "unlock" in lower_text:
+            action_arg = "lock"
+            command = "unlock"
+        elif "climate" in lower_text or "ac" in lower_text:
+            action_arg = "climate"
+            command = "climate_on"
+        elif "stop" in lower_text or "off" in lower_text:
+            action_arg = "climate"
+            command = "climate_off"
+        args = {"action": action_arg, "command": command}
+    else:
+        args = {"query": user_text, "context": user_text}
+
+    logger.info(f"NOVA_LEARNING_AUTO_ACTION | tool={tool_name} args={args}")
+    
+    result = await runtime.dispatch_tool(tool_name, args)
+    runtime.telemetry.tools_used.append(tool_name)
+    
+    data: Any = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except json.JSONDecodeError:
+            data = result
+            
+    if isinstance(data, dict) and data.get("display") and data.get("speech"):
+        display_text = str(data.get("display") or "")
+        speech_text = str(data.get("speech") or data.get("speakable") or display_text)
+        card = data.get("card") if isinstance(data.get("card"), dict) else None
+        return await runtime.finish_structured(
+            display_text=display_text,
+            speech_text=speech_text,
+            result=tool_name,
+            suppress_speech=False,
+            stop_reason="auto_action_complete"
+        )
+        
+    response = str(result)[:900] if result else f"Action {tool_name} completed."
+    return await runtime.finish(response, "auto_action_complete")
+
+
 STRATEGY_HANDLERS: dict[TurnIntent, StrategyHandler] = {
+    TurnIntent.AUTO_ACTION: _run_auto_action,
     TurnIntent.CLARIFICATION: _run_clarification,
     TurnIntent.WEATHER_LOOKUP: _run_weather_lookup,
     TurnIntent.LOOKUP_THEN_WORKSPACE_CREATION: _run_lookup_then_workspace_creation,
