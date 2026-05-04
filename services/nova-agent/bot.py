@@ -249,7 +249,7 @@ async def run_bot(
     # Tool iteration tracking — runaway loop guard only (not a quality throttle)
     _tool_calls_this_turn: list[int] = [0]
     _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 4
-    _MAX_TOOL_CALLS_HARD_LIMIT = 10  # Pure infinite-loop guard
+    _MAX_TOOL_CALLS_HARD_LIMIT = 20  # Pure infinite-loop guard
     # Per-tool-per-turn rate limits — differentiated by provider cost/risk
     # Cloud APIs (paid, rate-limited externally): tight limits
     # Local/homelab APIs (free, internal): generous limits
@@ -258,13 +258,18 @@ async def run_bot(
         "web_search": 3,            # Perplexity Sonar — paid per call; allow 1 natural LLM retry
         "get_weather": 2,           # OpenWeatherMap — paid API
         "hub_delegate": 2,          # Hub RPC — approval-gated
+        "tesla_control": 3,         # Local relay → Tesla cloud
+        "tesla_wake": 2,            # Local relay → Tesla cloud
+        "tesla_navigation": 2,      # Local relay → Tesla cloud
+        "tesla_stream_monitor": 3,  # Local relay → Tesla cloud
+        "tesla_location_refresh": 3,# Local relay → Tesla cloud
         # ── Local / homelab ───────────────────────────────────────────────
-        "query_cig": 10,            # CIG analytics
-        "check_studio": 5,          # Local CIG/Hermes
-        "query_frameworks": 5,      # Local LIAM/PCG
-        "recall_memory": 5,         # Local PCG
-        "search_past_conversations": 2,  # Local DB
-        "tesla_control": 4,         # Local relay → Tesla cloud
+        "query_cig": 15,            # CIG analytics
+        "check_studio": 10,         # Local CIG/Hermes
+        "query_frameworks": 10,     # Local LIAM/PCG
+        "recall_memory": 10,        # Local PCG
+        "save_memory": 5,           # Local PCG
+        "search_past_conversations": 10,  # Local DB
         "service_status": 6,        # Local Docker API
         "homelab_diagnostics": 4,   # Local Docker API
         "homelab_operations": 4,    # Local Docker API
