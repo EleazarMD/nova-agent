@@ -78,27 +78,20 @@ async def query_frameworks_via_pic(
     category: Optional[str] = None,
     limit: int = 5
 ) -> Dict[str, Any]:
-    """
-    Query frameworks directly from PIC/LIAM using semantic search.
-    Falls back to dimension/category filtering if semantic search unavailable.
-    """
     try:
         async with aiohttp.ClientSession() as session:
-            # Try semantic search endpoint first
-            url = f"{PIC_URL}/api/pic/liam/frameworks/search"
+            url = f"{PIC_URL}/api/liam/query/frameworks"
             body = {
-                "query": problem_description,
+                "problem_description": problem_description,
                 "limit": limit
             }
-            if category:
-                body["category_filter"] = category
             if dimension_id:
-                body["dimension_filter"] = dimension_id
+                body["dimension_filter"] = [dimension_id]
             
             async with session.post(url, json=body, timeout=TIMEOUT) as resp:
                 if resp.status == 200:
-                    # Semantic search succeeded
-                    search_results = await resp.json()
+                    data = await resp.json()
+                    search_results = data.get("frameworks", [])
                     
                     if search_results:
                         frameworks = []
@@ -106,6 +99,9 @@ async def query_frameworks_via_pic(
                         
                         for result in search_results:
                             fw = result.get("framework", {})
+                            if not fw:
+                                continue
+                            
                             frameworks.append({
                                 "id": fw.get("id"),
                                 "name": fw.get("name"),
@@ -115,11 +111,11 @@ async def query_frameworks_via_pic(
                                 "key_concepts": fw.get("key_concepts", []),
                                 "core_thesis": fw.get("core_thesis"),
                                 "limitations": fw.get("limitations", []),
-                                "applicable_dimensions": fw.get("applicable_dimension_ids", []),
+                                "applicable_dimensions": fw.get("applicable_dimensions", []),
                                 "relevance_score": result.get("relevance_score", 0),
-                                "match_reason": result.get("match_reason", "")
+                                "match_reason": result.get("reasoning", "")
                             })
-                            dimensions_detected.update(fw.get("applicable_dimension_ids", []))
+                            dimensions_detected.update(fw.get("applicable_dimensions", []))
                         
                         return {
                             "query": problem_description,
@@ -129,28 +125,21 @@ async def query_frameworks_via_pic(
                             "search_method": "semantic"
                         }
             
-            # Fallback: dimension or category filtering
+            # Fallback for listing
+            url = f"{PIC_URL}/api/liam/frameworks"
+            params = {}
+            if category:
+                params["category"] = category
             if dimension_id:
-                url = f"{PIC_URL}/api/pic/liam/dimensions/{dimension_id}/frameworks"
-                async with session.get(url, timeout=TIMEOUT) as resp:
-                    if resp.status != 200:
-                        return {"error": f"Dimension query failed: HTTP {resp.status}"}
-                    frameworks = await resp.json()
-            else:
-                url = f"{PIC_URL}/api/pic/liam/frameworks"
-                params = {}
-                if category:
-                    params["category"] = category
-                
-                async with session.get(url, params=params, timeout=TIMEOUT) as resp:
-                    if resp.status != 200:
-                        return {"error": f"Framework query failed: HTTP {resp.status}"}
-                    frameworks = await resp.json()
+                params["dimension"] = dimension_id
             
-            # Limit results
+            async with session.get(url, params=params, timeout=TIMEOUT) as resp:
+                if resp.status != 200:
+                    return {"error": f"Framework query failed: HTTP {resp.status}"}
+                frameworks = await resp.json()
+            
             frameworks = frameworks[:limit]
             
-            # Format response
             return {
                 "query": problem_description,
                 "applicable_frameworks": [
@@ -163,7 +152,7 @@ async def query_frameworks_via_pic(
                         "key_concepts": f.get("key_concepts", []),
                         "core_thesis": f.get("core_thesis"),
                         "limitations": f.get("limitations", []),
-                        "applicable_dimensions": f.get("applicable_dimension_ids", [])
+                        "applicable_dimensions": f.get("applicable_dimensions", [])
                     }
                     for f in frameworks
                 ],
