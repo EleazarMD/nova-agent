@@ -5,7 +5,7 @@ from loguru import logger
 import aiosqlite
 from typing import Optional
 
-from nova.store import DB_PATH
+from nova.store import DB_PATH, generate_embedding
 
 async def upsert_learned_plan_candidate(
     trigger_text: str,
@@ -21,12 +21,16 @@ async def upsert_learned_plan_candidate(
     now = time.time()
     tools_json = json.dumps(tools_used)
     
+    embedding = await generate_embedding(trigger_text, input_type="passage")
+    embedding_json = json.dumps(embedding) if embedding else None
+    
     async with aiosqlite.connect(path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS learned_plan_candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trigger_text TEXT NOT NULL,
                 trigger_hash TEXT NOT NULL,
+                trigger_embedding_json TEXT,
                 intent TEXT NOT NULL,
                 tools_used_json TEXT NOT NULL,
                 success_score REAL DEFAULT 1.0,
@@ -55,18 +59,18 @@ async def upsert_learned_plan_candidate(
             new_score = row["success_score"] + 1.0
             new_conf = min(0.95, row["confidence"] + 0.1)
             await db.execute(
-                "UPDATE learned_plan_candidates SET success_score = ?, confidence = ?, updated_at = ? WHERE id = ?",
-                (new_score, new_conf, now, row["id"])
+                "UPDATE learned_plan_candidates SET success_score = ?, confidence = ?, updated_at = ?, trigger_embedding_json = coalesce(trigger_embedding_json, ?) WHERE id = ?",
+                (new_score, new_conf, now, embedding_json, row["id"])
             )
         else:
             await db.execute(
                 """
                 INSERT INTO learned_plan_candidates (
-                    trigger_text, trigger_hash, intent, tools_used_json, 
+                    trigger_text, trigger_hash, trigger_embedding_json, intent, tools_used_json, 
                     success_score, confidence, source_session_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (trigger_text, trigger_hash, intent, tools_json, 1.0, 0.5, source_session_id, now, now)
+                (trigger_text, trigger_hash, embedding_json, intent, tools_json, 1.0, 0.5, source_session_id, now, now)
             )
         await db.commit()
 
@@ -82,6 +86,7 @@ async def consolidate_session_learning(session_id: str, path: str = DB_PATH):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trigger_text TEXT NOT NULL,
                 trigger_hash TEXT NOT NULL,
+                trigger_embedding_json TEXT,
                 intent TEXT NOT NULL,
                 tools_used_json TEXT NOT NULL,
                 success_score REAL DEFAULT 1.0,
@@ -134,12 +139,24 @@ async def consolidate_session_learning(session_id: str, path: str = DB_PATH):
                     )
                     logger.info(f"LEARNING | Extracted episode: '{substantive_text}' -> {intent}")
 
+def _cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    if not vec1 or not vec2 or len(vec1) != len(vec2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm_a = sum(a * a for a in vec1) ** 0.5
+    norm_b = sum(b * b for b in vec2) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
 async def get_shadow_plan_candidates(text: str, path: str = DB_PATH) -> list[dict]:
     if not text or len(text.split()) < 2:
         return []
     
-    import re
+    from nova.store import generate_embedding
     from nova.turn_policy import _jaccard_similarity
+    
+    query_embedding = await generate_embedding(text, input_type="passage")
     
     async with aiosqlite.connect(path) as db:
         # Check if table exists
@@ -148,6 +165,7 @@ async def get_shadow_plan_candidates(text: str, path: str = DB_PATH) -> list[dic
             return []
             
         db.row_factory = aiosqlite.Row
+        # Get highest confidence matches first to minimize processing
         rows = await db.execute_fetchall("SELECT * FROM learned_plan_candidates ORDER BY confidence DESC LIMIT 100")
         candidates = [dict(r) for r in rows]
         
@@ -155,14 +173,27 @@ async def get_shadow_plan_candidates(text: str, path: str = DB_PATH) -> list[dic
     matches = []
     
     for c in candidates:
-        sim = _jaccard_similarity(text_lower, c["trigger_text"].lower())
-        if sim > 0.45:
+        sim = 0.0
+        if query_embedding and c.get("trigger_embedding_json"):
+            try:
+                candidate_embedding = json.loads(c["trigger_embedding_json"])
+                sim = _cosine_similarity(query_embedding, candidate_embedding)
+            except Exception:
+                sim = _jaccard_similarity(text_lower, c["trigger_text"].lower())
+        else:
+            sim = _jaccard_similarity(text_lower, c["trigger_text"].lower())
+            
+        # Semantic thresholds usually range 0.70-0.85 for 'similar' intent
+        if (query_embedding and sim > 0.65) or (not query_embedding and sim > 0.45):
+            # Scale confidence by similarity
+            confidence_multiplier = sim if query_embedding else (sim * 1.5)
             matches.append({
                 "intent": c["intent"],
-                "confidence": round(min(0.95, c["confidence"] * sim * 1.5), 3),
+                "confidence": round(min(0.95, c["confidence"] * confidence_multiplier), 3),
                 "trigger_text": c["trigger_text"],
                 "tools_used": json.loads(c["tools_used_json"]),
-                "similarity": round(sim, 3)
+                "similarity": round(sim, 3),
+                "match_type": "semantic" if query_embedding and c.get("trigger_embedding_json") else "lexical"
             })
             
     return sorted(matches, key=lambda x: x["confidence"], reverse=True)
