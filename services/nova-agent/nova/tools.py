@@ -3597,9 +3597,10 @@ async def handle_analyze_image(
                         data = await resp.json()
                         result = data["choices"][0]["message"]["content"]
                     elif resp.status == 404:
-                        # Fallback to direct llama.cpp port if AI Gateway doesn't route it
-                        direct_url = "http://127.0.0.1:8010/v1/chat/completions"
-                        async with session.post(direct_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as direct_resp:
+                        # Fallback to direct Qwen Vision vLLM port if AI Gateway doesn't route it
+                        direct_url = "http://127.0.0.1:8013/v1/chat/completions"
+                        direct_payload = {**payload, "model": "qwen2.5-vl-7b"}
+                        async with session.post(direct_url, json=direct_payload, timeout=aiohttp.ClientTimeout(total=90)) as direct_resp:
                             if direct_resp.status == 200:
                                 data = await direct_resp.json()
                                 result = data["choices"][0]["message"]["content"]
@@ -4352,6 +4353,11 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         # Inject user_id for conversation search
         if name == "search_past_conversations" or name.startswith("tesla_"):
             args["user_id"] = _current_user_id or "default"
+            
+        # Extract _internal_user_id if present to avoid TypeError for tools without **kwargs
+        internal_user_id = args.pop("_internal_user_id", None)
+        if internal_user_id and name == "analyze_image":
+            args["_internal_user_id"] = internal_user_id
         
         result = await handler(**args)
         
