@@ -259,8 +259,8 @@ async def run_bot(
         "get_weather": 2,           # OpenWeatherMap — paid API
         "hub_delegate": 2,          # Hub RPC — approval-gated
         # ── Local / homelab ───────────────────────────────────────────────
-        "query_cig": 3,             # CIG analytics
-        "check_studio": 2,          # Local CIG/Hermes
+        "query_cig": 10,            # CIG analytics
+        "check_studio": 5,          # Local CIG/Hermes
         "query_frameworks": 5,      # Local LIAM/PCG
         "recall_memory": 5,         # Local PCG
         "search_past_conversations": 2,  # Local DB
@@ -270,12 +270,14 @@ async def run_bot(
         "homelab_operations": 4,    # Local Docker API
     }
     _per_tool_call_counts: dict[str, int] = {}
+    _last_tool_call: dict[str, object] = {"name": None, "args": None, "result": None}
     # Track recent tool calls to detect duplicates
     # Note: hub_delegate is excluded from dedup because each delegation
     # is a unique long-running task — even if args look similar, the context
     # and state differ between calls.
-    _DEDUP_EXCLUDED_TOOLS = {"hub_delegate", "tesla_wake"}
+    _DEDUP_EXCLUDED_TOOLS = {"hub_delegate", "tesla_wake", "analyze_image"}
     _latest_user_event: dict[str, str] = {}
+    _last_recorded_user_turn_key: list[str] = [""]
     _tool_call_count_this_turn: list[int] = [0]
     _search_tools_exhausted: list[bool] = [False]
     _structured_final_response_this_turn: list[bool] = [False]
@@ -315,6 +317,28 @@ async def run_bot(
             )
         except Exception as e:
             logger.warning(f"Learning event append failed: {e}")
+
+    async def _ensure_user_turn_learning_event():
+        canonical_text = (_latest_user_event.get("canonical_text") or "").strip()
+        if not canonical_text:
+            return
+        key = f"{session.session_id}:{canonical_text}"
+        if _last_recorded_user_turn_key[0] == key:
+            return
+        _last_recorded_user_turn_key[0] = key
+        await _record_learning_event(
+            event_type="user_turn_received",
+            source_layer="transport",
+            raw_text=_latest_user_event.get("raw_text", ""),
+            canonical_text=canonical_text,
+            location=_latest_user_event.get("location", ""),
+            mode_policy=_latest_user_event.get("mode_policy", ""),
+            outcome="received",
+            payload={
+                "audio_mode": audio_mode,
+                "capture": "ensure_user_turn_learning_event",
+            },
+        )
 
     def _build_spoken_ack(tool_name: str, args: dict) -> str | None:
         """Generate a contextual spoken acknowledgment from tool name + args.
@@ -492,6 +516,7 @@ async def run_bot(
                 # but we need to record it in the session
                 validator.current_session.start_tool(tool_name)
 
+            await _ensure_user_turn_learning_event()
             await _record_learning_event(
                 event_type="tool_call_started",
                 source_layer="llm_tool_loop",
@@ -665,7 +690,19 @@ async def run_bot(
                 await _send_server_msg({"phase": "done"})
 
             final_result_str = str(result) if result is not None else ""
-            tool_success = bool(final_result_str.strip()) and not final_result_str.startswith("Tool execution error:") and not final_result_str.startswith(f"Tool {tool_name} timed out")
+            failure_markers = (
+                "timed out",
+                "returned http 404",
+                "returned http 500",
+                "tool execution error:",
+                "no past conversations found",
+                "no emails found",
+                "thread lookup failed",
+                "thread not found",
+                "calendar search api returned http 404",
+                "pi agent timed out",
+            )
+            tool_success = bool(final_result_str.strip()) and not any(marker in final_result_str.lower() for marker in failure_markers)
             await _record_learning_event(
                 event_type="tool_call_completed",
                 source_layer="llm_tool_loop",
@@ -682,9 +719,24 @@ async def run_bot(
                     "provider_class": provider_class,
                     "result_preview": final_result_str[:500],
                     "result_chars": len(final_result_str),
-                    "promotion_candidate": tool_success and tool_name in {"save_memory", "recall_memory", "query_cig", "hub_delegate", "tesla_control", "get_weather"},
+                    "promotion_candidate": tool_success and tool_name in {"save_memory", "recall_memory", "search_past_conversations", "query_cig", "web_search", "hub_delegate", "tesla_control", "get_weather"},
                 },
             )
+
+            if tool_name == "analyze_image":
+                ack_text = "Got it — I'm analyzing that image now and will tell you what I find when the vision model finishes."
+                await _send_server_msg({
+                    "type": "validated",
+                    "text": ack_text,
+                    "speechText": ack_text,
+                    "result": "direct",
+                    "suppressSpeech": False,
+                })
+                await _send_server_msg({"phase": "done"})
+                _last_tool_call["name"] = tool_name
+                _last_tool_call["args"] = json.dumps(args, sort_keys=True, default=str)
+                _last_tool_call["result"] = result
+                return
 
             # ── Result path: feed back to LLM for comprehensive spoken response ──
             logger.info(f"🔥 Calling result_callback for {tool_name} with {len(str(result))} chars: {str(result)[:150]}")
@@ -1195,7 +1247,7 @@ async def run_bot(
     ctx_watcher = _ContextWatcher()
 
     # Event bus: proactive notifications while user is connected
-    event_handler = create_event_handler(task, user_id)
+    event_handler = create_event_handler(task, user_id, _send_server_msg)
 
     # Progress callback for Hub delegation streaming updates
     async def on_hub_progress(status_type: str, message: str):
