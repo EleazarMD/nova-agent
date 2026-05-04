@@ -74,6 +74,21 @@ async def upsert_learned_plan_candidate(
             )
         await db.commit()
 
+async def penalize_learned_plan_candidate(candidate_id: int, path: str = DB_PATH):
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM learned_plan_candidates WHERE id = ?", (candidate_id,))
+        row = await cursor.fetchone()
+        if row:
+            new_conf = row["confidence"] * 0.5
+            if new_conf < 0.30:
+                await db.execute("DELETE FROM learned_plan_candidates WHERE id = ?", (candidate_id,))
+                logger.info(f"LEARNING_PENALTY | Purged bad candidate {candidate_id}")
+            else:
+                await db.execute("UPDATE learned_plan_candidates SET confidence = ? WHERE id = ?", (new_conf, candidate_id))
+                logger.info(f"LEARNING_PENALTY | Penalized candidate {candidate_id} -> {new_conf:.2f}")
+        await db.commit()
+
 async def consolidate_session_learning(session_id: str, path: str = DB_PATH):
     """
     Look back at the recent events for a session and extract learned plan candidates.
@@ -105,9 +120,30 @@ async def consolidate_session_learning(session_id: str, path: str = DB_PATH):
         events = [dict(r) for r in rows]
 
     events_so_far = []
+    last_applied_candidate_id = None
     
     for event in events:
         events_so_far.append(event)
+        
+        # Track if we just applied a candidate
+        if event["event_type"] == "candidate_applied":
+            payload = json.loads(event["payload_json"])
+            last_applied_candidate_id = payload.get("candidate_id")
+            continue
+            
+        # Detect corrections immediately following an applied candidate
+        if event["event_type"] == "user_turn_received" and last_applied_candidate_id is not None:
+            raw_text = (event.get("canonical_text") or "").strip().lower()
+            import re
+            text = re.sub(r'[^\w\s]', '', raw_text)  # Strip punctuation for easier matching
+            correction_terms = ("no", "stop", "wrong", "cancel", "undo", "thats not what i meant", "no stop", "wait no", "incorrect", "nevermind")
+            if text in correction_terms or any(text.startswith(t) for t in ("no ", "stop ", "wait ", "wrong ")):
+                logger.info(f"LEARNING_PENALTY | Detected user correction '{raw_text}' for candidate {last_applied_candidate_id}")
+                await penalize_learned_plan_candidate(last_applied_candidate_id, path=path)
+                last_applied_candidate_id = None  # Consume the correction
+            elif text:
+                last_applied_candidate_id = None  # User moved on normally
+        
         if event["event_type"] == "tool_call_completed" and event.get("success"):
             tool_name = event.get("tool_name")
             if tool_name in ("save_memory", "recall_memory", "query_cig", "get_weather", "tesla_control", "hub_delegate"):
@@ -188,6 +224,7 @@ async def get_shadow_plan_candidates(text: str, path: str = DB_PATH) -> list[dic
             # Scale confidence by similarity
             confidence_multiplier = sim if query_embedding else (sim * 1.5)
             matches.append({
+                "id": c["id"],
                 "intent": c["intent"],
                 "confidence": round(min(0.95, c["confidence"] * confidence_multiplier), 3),
                 "trigger_text": c["trigger_text"],

@@ -504,6 +504,19 @@ async def simple_chat(req: ChatRequest):
         )
         
         if plan.learned_candidate:
+            from nova.store import append_learning_event
+            await append_learning_event(
+                event_type="candidate_applied",
+                source_layer="orchestrator",
+                session_id=session.session_id,
+                conversation_id=conversation_id,
+                user_id=req.user_id,
+                canonical_text=req.message,
+                payload={
+                    "candidate_id": plan.learned_candidate.get("id"),
+                    "intent": plan.intent.value
+                }
+            )
             tools = plan.learned_candidate.get("tools_used", [])
             if tools:
                 tool_name = tools[0]

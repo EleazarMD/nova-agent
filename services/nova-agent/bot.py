@@ -941,6 +941,15 @@ async def run_bot(
                     return
 
                 if plan.learned_candidate:
+                    await _record_learning_event(
+                        event_type="candidate_applied",
+                        source_layer="orchestrator",
+                        canonical_text=canonical.canonical_text,
+                        payload={
+                            "candidate_id": plan.learned_candidate.get("id"),
+                            "intent": plan.intent.value
+                        }
+                    )
                     tools = plan.learned_candidate.get("tools_used", [])
                     if tools:
                         tool_name = tools[0]
