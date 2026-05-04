@@ -35,6 +35,7 @@ parameters:
 # Query Frameworks
 
 Query LIAM for scientific frameworks, mental models, and decision-making tools applicable to a problem or question.
+LIAM is its own graph-backed framework layer used by agents for complex reasoning; it is not merely a PCG-owned preference store.
 
 ## When to Invoke
 
@@ -44,6 +45,12 @@ Query LIAM for scientific frameworks, mental models, and decision-making tools a
 - Seeking structured thinking frameworks
 - Applying scientific approaches to life questions
 - Using Model Thinker methodology (multiple frameworks)
+
+## When Not to Use
+
+- Do not use this tool to create, mutate, or bless a new LIAM framework.
+- If the user asks to add, update, enhance, verify, or validate a LIAM framework, delegate to Atlas through Pi Agent Hub using `atlas.liamFramework`.
+- Nova and PiCode may request LIAM changes, but Atlas performs evidence review and returns an approval-ready proposal before any graph mutation.
 
 ## Actions
 
@@ -109,8 +116,8 @@ When multiple frameworks are returned, apply the **Model Thinker** methodology:
 
 ## Technical Details
 
-- Primary: Context Bridge semantic search (http://localhost:8764)
-- Fallback: Direct PIC/LIAM query (http://localhost:8765)
+- Primary: LIAM framework graph query
+- Fallback: legacy PCG/LIAM read endpoint (http://localhost:8765)
 - Timeout: 10 seconds
 - Max results: Configurable (default: 5)
 
@@ -118,5 +125,6 @@ When multiple frameworks are returned, apply the **Model Thinker** methodology:
 
 - Script: `scripts/query_frameworks.py`
 - Context Bridge: http://localhost:8764/v1/query
-- PIC/LIAM: http://localhost:8765/api/pic/liam
+- Legacy PCG/LIAM read endpoint: http://localhost:8765/api/pic/liam
+- Atlas maintenance RPC: `atlas.liamFramework`
 - CLI: Supports standalone execution with `--json` output
