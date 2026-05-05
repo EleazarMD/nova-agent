@@ -5010,3 +5010,76 @@ QUERY_FRAMEWORKS_TOOL = {
 
 TOOL_DEFINITIONS.append(QUERY_FRAMEWORKS_TOOL)
 TOOL_HANDLERS["query_frameworks"] = handle_query_frameworks
+
+
+async def handle_search_framework_catalog(**kwargs) -> dict:
+    """Search LIAM's framework catalog for inventory and author/source questions."""
+    from nova.liam import search_framework_catalog as liam_search_framework_catalog
+
+    try:
+        return await liam_search_framework_catalog(
+            query=kwargs.get("query"),
+            author=kwargs.get("author"),
+            source=kwargs.get("source"),
+            category=kwargs.get("category"),
+            dimension=kwargs.get("dimension"),
+            limit=kwargs.get("limit", 20),
+        )
+    except Exception as e:
+        logger.error(f"Framework catalog search failed: {e}")
+        return {
+            "success": False,
+            "error": f"Framework catalog search error: {str(e)}",
+            "frameworks": [],
+            "total_frameworks": 0,
+        }
+
+
+SEARCH_FRAMEWORK_CATALOG_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_framework_catalog",
+        "description": (
+            "Search or browse the LIAM Framework Database catalog, including both framework "
+            "entries and LIAM dimensions. Use this for inventory, admin, author/source, and "
+            "existence questions such as 'is Nassim Taleb included?', "
+            "'which Daniel Kahneman frameworks do we have?', 'list heuristics', or "
+            "'show frameworks from Thinking, Fast and Slow'. This is NOT the problem-ranking "
+            "tool; use query_frameworks only when selecting frameworks for a decision or problem."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Free-text catalog search across id, name/label, source/scientific basis, description, key concepts, dimensions, and limitations."
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Author/source-name filter, e.g. 'Taleb', 'Kahneman', 'Nassim Nicholas Taleb', or 'Daniel Kahneman'."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Source/work filter, e.g. 'Incerto', 'Thinking, Fast and Slow', 'Model Thinker'."
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Optional framework category filter."
+                },
+                "dimension": {
+                    "type": "string",
+                    "description": "Optional LIAM dimension id filter, e.g. 'metacognition' or 'financial'."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of frameworks to return.",
+                    "default": 20
+                }
+            },
+            "required": []
+        }
+    }
+}
+
+TOOL_DEFINITIONS.append(SEARCH_FRAMEWORK_CATALOG_TOOL)
+TOOL_HANDLERS["search_framework_catalog"] = handle_search_framework_catalog

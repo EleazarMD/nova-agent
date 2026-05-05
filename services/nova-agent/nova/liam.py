@@ -37,6 +37,10 @@ def _admin_headers() -> dict[str, str]:
 async def list_dimensions(
     group: Optional[str] = None,
     status: Optional[str] = None,
+    source: Optional[str] = None,
+    author: Optional[str] = None,
+    query: Optional[str] = None,
+    limit: int = 100,
 ) -> list[dict[str, Any]]:
     """List all LIAM dimensions, optionally filtered by group or status."""
     params = {}
@@ -44,6 +48,13 @@ async def list_dimensions(
         params["group"] = group
     if status:
         params["status"] = status
+    if source:
+        params["source"] = source
+    if author:
+        params["author"] = author
+    if query:
+        params["query"] = query
+    params["limit"] = limit
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -114,13 +125,24 @@ async def query_dimensions(
 async def list_frameworks(
     category: Optional[str] = None,
     dimension: Optional[str] = None,
+    source: Optional[str] = None,
+    author: Optional[str] = None,
+    query: Optional[str] = None,
+    limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """List all LIAM frameworks, optionally filtered by category or dimension."""
+    """List LIAM frameworks, optionally filtered by category, dimension, source/author, or query."""
     params = {}
     if category:
         params["category"] = category
     if dimension:
         params["dimension"] = dimension
+    if source:
+        params["source"] = source
+    if author:
+        params["author"] = author
+    if query:
+        params["query"] = query
+    params["limit"] = limit
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -137,6 +159,49 @@ async def list_frameworks(
     except Exception as e:
         logger.warning(f"LIAM list_frameworks error: {e}")
         return []
+
+
+async def search_framework_catalog(
+    query: Optional[str] = None,
+    author: Optional[str] = None,
+    source: Optional[str] = None,
+    category: Optional[str] = None,
+    dimension: Optional[str] = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """
+    Search the LIAM framework catalog for inventory, author/source, and admin-style questions.
+
+    This is different from query_frameworks(), which ranks frameworks for a problem.
+    Use this when Nova needs to answer whether an author/source/framework exists.
+    """
+    frameworks = await list_frameworks(
+        category=category,
+        dimension=dimension,
+        source=source,
+        author=author,
+        query=query,
+        limit=limit,
+    )
+    dimensions = await list_dimensions(
+        source=source,
+        author=author,
+        query=query,
+        limit=limit,
+    )
+
+    return {
+        "success": True,
+        "query": query,
+        "author": author,
+        "source": source,
+        "category": category,
+        "dimension": dimension,
+        "frameworks": frameworks,
+        "dimensions": dimensions,
+        "total_frameworks": len(frameworks),
+        "total_dimensions": len(dimensions),
+    }
 
 
 async def get_framework(framework_id: str) -> Optional[dict[str, Any]]:
