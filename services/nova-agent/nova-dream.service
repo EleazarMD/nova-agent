@@ -1,0 +1,16 @@
+[Unit]
+Description=Nova Dreaming — idle-time memory consolidation
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=eleazar
+WorkingDirectory=/home/eleazar/Projects/AIHomelab/services/nova-agent/services/nova-agent
+Environment=PATH=/home/eleazar/Projects/AIHomelab/services/nova-agent/services/nova-agent/venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/etc/systemd/system/nova-agent.service.d/environment.conf
+ExecStart=/home/eleazar/Projects/AIHomelab/services/nova-agent/services/nova-agent/venv/bin/python -m nova.dream
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nova-dream
+TimeoutStartSec=300

@@ -11,6 +11,7 @@ Delegated tools: complex tasks via Pi Agent Hub with WebSocket RPC
 import asyncio
 import json
 import os
+import re
 import aiohttp
 import jwt
 
@@ -68,6 +69,9 @@ from nova.homelab_mutate import (
 _ev_routing = _load_skill_module("ev-route-planner", "ev_route_planner")
 handle_ev_route_planner = _ev_routing.handle_ev_route_planner
 
+_get_weather_mod = _load_skill_module("get-weather", "get_weather")
+handle_get_weather = _get_weather_mod.handle_get_weather
+
 _notes = _load_skill_module("notes-manager", "notes_manager")
 handle_manage_notes = _notes.handle_manage_notes
 
@@ -89,43 +93,9 @@ handle_staar_tutor = _staar.handle_staar_tutor
 # Tesla wake (direct import from tesla_tools)
 from nova.tesla_tools import handle_tesla_wake, handle_tesla_navigation
 
-# ---------------------------------------------------------------------------
-# AI Inferencing Service key fetcher (centralized API key vault, port 9000)
-# Constitutional rule: ALL API keys fetched via AI Inferencing, never hardcoded.
-# ---------------------------------------------------------------------------
-
-AI_INFERENCING_URL = os.environ.get("AI_INFERENCING_URL", "http://localhost:9000")
-_key_cache: dict[str, tuple[str, float]] = {}  # provider -> (key, expiry_ts)
-_KEY_CACHE_TTL = 300  # 5 minutes
-
 # Import JWT generator from dedicated auth module
 from nova.hermes_auth import generate_hermes_jwt
 
-
-async def _fetch_provider_key(provider: str) -> str | None:
-    """Fetch an API key from AI Inferencing Service for nova-agent/{provider}.
-    Caches keys in-memory for 5 minutes to avoid per-request HTTP calls."""
-    import time
-    now = time.time()
-    cached = _key_cache.get(provider)
-    if cached and cached[1] > now:
-        return cached[0]
-
-    url = f"{AI_INFERENCING_URL}/api/v1/keys/nova-agent/{provider}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    key = data.get("apiKey")
-                    if key:
-                        _key_cache[provider] = (key, now + _KEY_CACHE_TTL)
-                        logger.debug(f"Fetched {provider} key from AI Inferencing (cached={data.get('cached')})")
-                        return key
-                logger.warning(f"AI Inferencing returned {resp.status} for {provider}")
-    except Exception as e:
-        logger.warning(f"Failed to fetch {provider} key from AI Inferencing: {e}")
-    return None
 
 # Environment configuration
 # OpenClaw removed — all delegation now goes through hub_delegate
@@ -148,6 +118,7 @@ PI_HUB_TOKEN = os.environ.get("PI_HUB_TOKEN", "changeme")
 ProgressCallback = Callable[[str, str], None]
 _current_progress_callback: Optional[ProgressCallback] = None
 _current_user_id: Optional[str] = None
+_current_conversation_id: Optional[str] = None
 _current_user_location: Optional[Any] = None  # Set from location service for timezone
 
 # Server message callback — set by bot.py after RTVI is ready
@@ -166,1294 +137,7 @@ def set_server_msg_fn(fn: Callable):
 # Tool definitions (OpenAI function calling format)
 # ---------------------------------------------------------------------------
 
-TOOL_DEFINITIONS = [
-    # -------------------------------------------------------------------------
-    # Native tools (casual, fast)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather and forecast. Use for weather queries.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "City name or coordinates (e.g. 'Houston', 'Humble TX')",
-                    },
-                },
-                "required": ["location"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "control_lights",
-            "description": "Control Philips Hue lights. Use for 'turn on lights', 'dim bedroom', 'set to blue'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["on", "off", "brightness", "color", "scene", "status"],
-                        "description": "Action to perform",
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Light name, room name, or scene name",
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "Brightness (0-100) or color hex (#FF0000)",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_workstation_status",
-            "description": "Get RTX Workstation status: GPU temps, VRAM, running models.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "detail": {
-                        "type": "string",
-                        "enum": ["summary", "full", "alerts"],
-                        "description": "Level of detail (default summary)",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "set_reminder",
-            "description": "Set a reminder. Will notify via push notification.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The reminder message",
-                    },
-                    "when": {
-                        "type": "string",
-                        "description": "When to remind (e.g. 'in 30 minutes', 'at 3pm')",
-                    },
-                },
-                "required": ["message", "when"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Search tool — definition loaded from skills/web-search/SKILL.md at bottom of file
-    # (see _merge_skill_definitions)
-    # -------------------------------------------------------------------------
-    # -------------------------------------------------------------------------
-    # Hub Agent Delegation (Pi Agent Hub — specialized background agents)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "hub_delegate",
-            "description": (
-                "Delegate specialized tasks to Pi Agent Hub background agents for long-running, "
-                "approval-gated, or deep work. Use for: "
-                "deep research → Atlas (atlas.research), "
-                "CIG analytics → Atlas (atlas.analytics), "
-                "fact-checking → Atlas (atlas.factCheck), "
-                "email drafting/briefing → Hermes (hermes.draft, hermes.inbox-briefing), "
-                "calendar/meeting prep → Hermes (hermes.calendar-briefing, hermes.meeting-prep), "
-                "follow-up tracking → Hermes (hermes.follow-up), "
-                "morning briefing → Hermes (hermes.morning-briefing), "
-                "browser automation → Argus (argus.browse), "
-                "service operations → Infra (health, agents.run), "
-                "code fixes → Coder (agents.run), "
-                "vehicle monitoring → Tesla (tesla.status, tesla.command). "
-                "For QUICK lookups (weather, status, single email read), use direct tools. "
-                "Hub tasks are asynchronous and may require approval via Hyperspace iOS push notification."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "agent": {
-                        "type": "string",
-                        "enum": ["atlas", "infra", "coder", "tesla", "hermes", "argus", "orchestrator"],
-                        "description": "Which Hub agent to delegate to",
-                    },
-                    "method": {
-                        "type": "string",
-                        "description": "RPC method to call (e.g., atlas.research, hermes.draft, hermes.inbox-briefing, hermes.calendar-briefing, hermes.meeting-prep, hermes.follow-up, hermes.morning-briefing, argus.browse, health, tesla.status, tesla.command, agents.run)",
-                    },
-                    "params": {
-                        "type": "object",
-                        "description": "Parameters for the RPC method",
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "Background context from conversation that helps the agent understand the request",
-                    },
-                },
-                "required": ["agent", "method"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # CIG Analytics (Communication Intelligence Graph — email/calendar/contacts)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "query_cig",
-            "description": (
-                "Query the Communication Intelligence Graph (CIG) for email, calendar, and contact analytics. "
-                "Use for: email urgency/prioritization (domain='email'), "
-                "calendar/meeting patterns (domain='calendar'), "
-                "contact relationship health (domain='contacts'), "
-                "knowledge graph search for people/orgs (domain='search'), "
-                "or the latest synthesized briefing from Hermes (domain='briefing'). "
-                "For domain='briefing' the optional `query` param filters by briefing_type "
-                "(morning | evening | heartbeat | meeting-prep | urgency-scan) — leave empty for the "
-                "most recent of any type. Use this when the user asks for their morning briefing, "
-                "EOD summary, meeting prep, or 'what's urgent right now'. "
-                "For DRAFTING emails or scheduling meetings, use hub_delegate(agent='hermes', ...) instead. "
-                "This tool is for READ-ONLY analytics and insights."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "domain": {
-                        "type": "string",
-                        "enum": ["email", "calendar", "contacts", "search", "briefing"],
-                        "description": "Which analytics domain to query",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Search query (required for domain='search'). "
-                            "For domain='briefing' this is an optional briefing_type filter "
-                            "(morning, evening, heartbeat, meeting-prep, urgency-scan). "
-                            "Optional for email/calendar/contacts."
-                        ),
-                    },
-                },
-                "required": ["domain"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Delegated tools (browser, email, calendar, shell — use for actions, not searches)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "search_past_conversations",
-            "description": (
-                "Search past conversations with the user to recall what was discussed previously. "
-                "Use when user asks 'what did we talk about yesterday', 'remember when I mentioned X', "
-                "'what was that thing we discussed last week', or when you need historical context. "
-                "Returns conversation snippets ranked by relevance. "
-                "Use a broad query like 'recent' to browse recent conversations. "
-                "ALWAYS use days_back=90 unless the user specifies a narrower range."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to search for. Use specific terms like 'road trip', 'email sync'. Use 'recent' to browse all recent conversations.",
-                    },
-                    "days_back": {
-                        "type": "integer",
-                        "description": "How many days back from now to search. Default 90.",
-                        "default": 90,
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default: 5)",
-                        "default": 5,
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Studio quick-reads (direct dashboard API)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "check_studio",
-            "description": (
-                "Quickly read status or results from homelab studios. "
-                "Use for fast lookups: 'what's on my calendar', 'check research status', "
-                "'how's the podcast coming', 'any new news stories', 'show recent research', "
-                "'give me my daily briefing', 'any emails need attention'. "
-                "Calendar supports: events (today/tomorrow/this_week), briefing, intelligence. "
-                "Email supports: briefing with action items, contact highlights, metrics, attachment reading. "
-                "For CREATING or GENERATING content, use hub_delegate(agent='hermes') or hub_delegate(agent='argus') instead."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "studio": {
-                        "type": "string",
-                        "enum": ["calendar", "email", "research", "podcast", "news", "image", "workspace"],
-                        "description": "Which studio to query",
-                    },
-                    "action": {
-                        "type": "string",
-                        "enum": ["status", "recent", "list", "detail", "briefing", "today", "tomorrow", "this_week", "attachment"],
-                        "description": "status=overview, recent=latest items, list=all, detail=specific item, briefing=AI summary, today/tomorrow/this_week=calendar date filter, attachment=read email attachment text (requires item_id=email_id)",
-                    },
-                    "item_id": {
-                        "type": "string",
-                        "description": "Specific item ID for detail action",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search/filter query (e.g. keyword for calendar search, topic for research)",
-                    },
-                },
-                "required": ["studio"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Skill Discovery (dynamic skill catalog)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "discover_skills",
-            "description": (
-                "Discover what skills, studios, and capabilities are available in the homelab. "
-                "Call this BEFORE delegating any generative or complex task to learn what's possible "
-                "and what inputs each skill requires. Returns the skill catalog with descriptions, "
-                "required inputs, and trigger patterns. "
-                "Use for: 'what can you do', 'what studios are available', or before creating "
-                "workspace pages, podcasts, research, images, or any content."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "skill_name": {
-                        "type": "string",
-                        "description": "Optional: get details for a specific skill by name (e.g. 'workspace_pages', 'deep_research')",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Network diagnostics (homelab-netdiag API)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "diagnose_network",
-            "description": (
-                "Diagnose homelab network health: gateway, internet, DNS, Tailscale VPN, "
-                "Docker containers, homelab services, and UniFi router. "
-                "Use for: 'is the network working', 'check connectivity', 'why can't I connect', "
-                "'what services are down', 'tailscale status', 'docker status'. "
-                "Can also ping a specific host or check a specific port."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "check": {
-                        "type": "string",
-                        "enum": ["full", "ping", "dns", "port", "tailscale", "docker", "services"],
-                        "description": "Type of check (default 'full' runs everything)",
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Target host/IP for ping, DNS lookup, or port check",
-                    },
-                    "port": {
-                        "type": "integer",
-                        "description": "Port number for port check",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Time (grounded current date/time)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "get_time",
-            "description": (
-                "Get the current date and time in the user's timezone (America/Chicago). "
-                "Use for: 'what time is it', 'what day is it', 'what's the date', "
-                "or when you need to know the current time for scheduling or context."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Timers & alarms (in-memory, survive until Nova restarts)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_timer",
-            "description": (
-                "Set, list, or cancel timers and alarms. Timers fire a push notification when done. "
-                "Use for: 'set a 5 minute timer', 'timer for 30 minutes', 'remind me in 1 hour', "
-                "'cancel my timer', 'what timers are running'. "
-                "For calendar-based reminders at specific times, use hub_delegate(agent='hermes', method='calendar-briefing') instead."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["set", "list", "cancel"],
-                        "description": "Action to perform",
-                    },
-                    "duration_minutes": {
-                        "type": "number",
-                        "description": "Timer duration in minutes (for 'set' action)",
-                    },
-                    "label": {
-                        "type": "string",
-                        "description": "Optional label for the timer (e.g. 'laundry', 'pasta')",
-                    },
-                    "timer_id": {
-                        "type": "string",
-                        "description": "Timer ID to cancel (from 'list' output)",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Homelab infrastructure operations (Docker container management)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "service_status",
-            "description": (
-                "Get status of homelab Docker containers. Use for: "
-                "'is hermes running', 'what containers are up', 'docker status', "
-                "'check if argus is healthy'. Read-only, no approval needed."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "container": {
-                        "type": "string",
-                        "description": "Specific container name (e.g. 'cig', 'argus'). Leave empty for all.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "service_logs",
-            "description": (
-                "Get recent logs from a homelab Docker container. Use for: "
-                "'show hermes logs', 'what errors in argus', 'why did the container crash'. "
-                "Read-only, no approval needed."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "container": {
-                        "type": "string",
-                        "description": "Container name (e.g. 'cig', 'argus')",
-                    },
-                    "lines": {
-                        "type": "integer",
-                        "description": "Number of log lines to show (default 50, max 200)",
-                    },
-                },
-                "required": ["container"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "service_restart",
-            "description": (
-                "Restart a homelab Docker container. Use for: "
-                "'restart hermes', 'cig is unhealthy restart it', 'argus seems stuck'. "
-                "Auto-approved for allowlisted containers. Logged and audited."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "container": {
-                        "type": "string",
-                        "description": "Container name to restart (e.g. 'cig')",
-                    },
-                    "intent": {
-                        "type": "string",
-                        "description": "Brief explanation of why this restart is needed",
-                    },
-                },
-                "required": ["container", "intent"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "service_start",
-            "description": (
-                "Start a stopped homelab Docker container. Use for: "
-                "'start cig', 'bring up argus'. "
-                "Auto-approved for allowlisted containers. Logged and audited."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "container": {
-                        "type": "string",
-                        "description": "Container name to start (e.g. 'cig')",
-                    },
-                    "intent": {
-                        "type": "string",
-                        "description": "Brief explanation of why this container needs to be started",
-                    },
-                },
-                "required": ["container", "intent"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "service_stop",
-            "description": (
-                "Stop a running homelab Docker container. DESTRUCTIVE — requires explicit "
-                "user approval via push notification before execution. The user MUST approve "
-                "on their device before the container is stopped. Use only when truly necessary. "
-                "You MUST provide a clear 'intent' explaining why the stop is needed."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "container": {
-                        "type": "string",
-                        "description": "Container name to stop (e.g. 'cig')",
-                    },
-                    "intent": {
-                        "type": "string",
-                        "description": "REQUIRED: Clear explanation of why this container needs to be stopped",
-                    },
-                },
-                "required": ["container", "intent"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "service_health_check",
-            "description": (
-                "Deep health check on homelab infrastructure — container state, ports, image, "
-                "PLUS application-level probes for CIG (email counts, calendar stats, "
-                "Neo4j/ChromaDB/LLM Gateway database status). "
-                "Use for: 'health check all services', 'homelab status', 'is hermes healthy', "
-                "'how are the email and calendar databases', 'deep check on hermes'. Read-only. "
-                "This is the BEST tool for a comprehensive homelab status report."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "container": {
-                        "type": "string",
-                        "description": "Specific container to check. Leave empty for all managed containers.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Homelab Operations - Unified skill (per /claude-skills spec)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "homelab_operations",
-            "description": (
-                "Manage homelab Docker containers and systemd services with approval gating. "
-                "Unified tool for all infrastructure operations — read-only actions need no approval, "
-                "mutating actions (restart/start/stop) require user approval via Dashboard or iOS. "
-                "Use for: 'restart hermes', 'check status of argus', 'get logs from container', "
-                "'health check all services', 'start/stop containers'. "
-                "Read-only actions: status, logs, health_check. Mutating actions: restart, start, stop."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["restart", "start", "stop", "status", "logs", "health_check"],
-                        "description": "Operation to perform: restart/start/stop (approval required), status/logs/health_check (read-only)",
-                    },
-                    "container": {
-                        "type": "string",
-                        "description": "Docker container name (e.g. 'cig', 'argus'). Required for restart/start/stop/logs.",
-                    },
-                    "service": {
-                        "type": "string",
-                        "description": "Systemd service name (e.g. 'pi-agent-hub.service'). Alternative to container for restart/start/stop.",
-                    },
-                    "lines": {
-                        "type": "integer",
-                        "description": "Number of log lines for 'logs' action (default: 50, max: 200)",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Ticket tracker (homelab issue tracking — Nova creates, Coder/Windsurf fix)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_ticket",
-            "description": (
-                "Create, list, read, update, or delegate tickets in the homelab ticket tracker. "
-                "Use this when you encounter bugs, issues, or feature gaps during conversations. "
-                "Actions: create (new ticket), list (browse tickets), get (full detail), "
-                "update (change status/priority/analysis), delegate (assign to Coder or Windsurf). "
-                "Coder agent handles minor code fixes (with approval). Windsurf handles structural work."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "list", "get", "update", "delegate"],
-                        "description": "Action to perform",
-                    },
-                    "ticket_id": {
-                        "type": "string",
-                        "description": "Ticket ID (for get/update/delegate actions)",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Ticket title (for create)",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Detailed description of the issue (for create)",
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["critical", "high", "medium", "low"],
-                        "description": "Ticket priority (for create/update)",
-                    },
-                    "severity": {
-                        "type": "string",
-                        "enum": ["critical", "major", "minor", "trivial"],
-                        "description": "Issue severity (for create)",
-                    },
-                    "category": {
-                        "type": "string",
-                        "enum": ["bug", "feature", "improvement", "investigation", "maintenance"],
-                        "description": "Ticket category (for create)",
-                    },
-                    "component": {
-                        "type": "string",
-                        "description": "Affected component (e.g. 'nova-agent', 'argus', 'cig', 'dashboard')",
-                    },
-                    "tags": {
-                        "type": "string",
-                        "description": "Comma-separated tags (for create)",
-                    },
-                    "source_context": {
-                        "type": "string",
-                        "description": "Conversation context that led to this ticket (for create)",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["open", "triaged", "analyzing", "in_progress", "awaiting_approval", "resolved", "closed", "wont_fix"],
-                        "description": "New status (for update)",
-                    },
-                    "assigned_to": {
-                        "type": "string",
-                        "description": "Assign to agent: 'coder', 'windsurf', or user (for update/create)",
-                    },
-                    "delegate_to": {
-                        "type": "string",
-                        "enum": ["coder", "windsurf"],
-                        "description": "Delegate ticket to Coder (minor fixes) or Windsurf (structural) (for delegate)",
-                    },
-                    "analysis": {
-                        "type": "string",
-                        "description": "Root cause analysis text (for update)",
-                    },
-                    "proposed_fix": {
-                        "type": "string",
-                        "description": "Proposed fix description (for update)",
-                    },
-                    "resolution": {
-                        "type": "string",
-                        "description": "Resolution summary (for update when closing)",
-                    },
-                    "affected_files": {
-                        "type": "string",
-                        "description": "Comma-separated file paths affected (for update)",
-                    },
-                    "limit": {
-                        "type": "string",
-                        "description": "Max tickets to return (for list, default 10)",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Workspace management (fast direct API calls)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_workspace",
-            "description": (
-                "Manage the Pi Workspace — your persistent Notion-like workspace for notes, "
-                "pages, databases, planner, forms, and AI-powered content. "
-                "All data persists across conversations and is context-grounded with CIG/PCG. "
-                "Actions: "
-                "list_pages (browse all pages/notes), "
-                "create_page (new note or document), "
-                "create_page_with_blocks (new page with multiple content blocks in one call — ideal for worksheets, quizzes, structured docs), "
-                "get_page (read page content and blocks), "
-                "delete_page (delete a page, requires intent for approval), "
-                "add_block (add content block to a page), "
-                "search (hybrid FTS + vector search across all content), "
-                "list_databases (browse databases), "
-                "create_database (new table with schema), "
-                "add_row (add row to a database), "
-                "update_row (edit database row properties), "
-                "list_rows (view database rows), "
-                "create_form (build a form attached to a database), "
-                "submit_form (submit form data), "
-                "planner (view daily planner with tasks and events), "
-                "create_task (add task to planner), "
-                "update_task (change task status/priority), "
-                "create_event (add calendar event to planner), "
-                "list_templates (browse page templates), "
-                "create_from_template (new page from template), "
-                "ai_chat (ask AI with full workspace context), "
-                "component_registry (list all workspace component types for PiCode Agent). "
-                "This is your PRIMARY tool for personal knowledge management, note-taking, "
-                "task tracking, and structured data. Use it proactively to store information "
-                "the user shares and to recall context from previous conversations."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "list_pages", "create_page", "create_page_with_blocks", "get_page", "add_block",
-                            "search",
-                            "list_databases", "create_database", "add_row", "update_row", "list_rows",
-                            "create_form", "submit_form",
-                            "planner", "create_task", "update_task", "delete_task",
-                            "create_event",
-                            "list_templates", "create_from_template",
-                            "ai_chat",
-                            "component_registry",
-                        ],
-                        "description": "Action to perform",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Title for pages, databases, tasks, events, forms",
-                    },
-                    "page_id": {
-                        "type": "string",
-                        "description": "Page ID (for get_page, add_block)",
-                    },
-                    "database_id": {
-                        "type": "string",
-                        "description": "Database ID (for add_row, list_rows, create_form)",
-                    },
-                    "row_id": {
-                        "type": "string",
-                        "description": "Database row ID (for update_row)",
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Planner task ID (for update_task, delete_task)",
-                    },
-                    "form_id": {
-                        "type": "string",
-                        "description": "Form ID (for submit_form)",
-                    },
-                    "template_id": {
-                        "type": "string",
-                        "description": "Template ID (for create_from_template)",
-                    },
-                    "block_type": {
-                        "type": "string",
-                        "description": "Block type for add_block: paragraph, heading_1, heading_2, heading_3, bulleted_list_item, numbered_list_item, to_do, callout, quote, code, divider, toggle, table, planner_day, planner_task",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Text content for blocks, pages, or search queries",
-                    },
-                    "properties": {
-                        "type": "object",
-                        "description": "Properties for database rows, form submissions, or block properties",
-                    },
-                    "schema": {
-                        "type": "array",
-                        "description": "Database schema definition (for create_database): array of {name, type} objects. Types: title, rich_text, number, select, multi_select, date, person, checkbox, url, email, phone_number",
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high", "urgent"],
-                        "description": "Task priority (for create_task, update_task)",
-                    },
-                    "status": {
-                        "type": "string",
-                        "description": "Task status (for update_task): not_started, in_progress, done, cancelled",
-                    },
-                    "due_date": {
-                        "type": "string",
-                        "description": "Due date for task (ISO date: 2026-04-17)",
-                    },
-                    "due_time": {
-                        "type": "string",
-                        "description": "Due time for task (HH:mm)",
-                    },
-                    "date": {
-                        "type": "string",
-                        "description": "Date for planner view (ISO date: 2026-04-17). Defaults to today.",
-                    },
-                    "start_time": {
-                        "type": "string",
-                        "description": "Event start time (ISO datetime: 2026-04-17T09:00:00)",
-                    },
-                    "end_time": {
-                        "type": "string",
-                        "description": "Event end time (ISO datetime: 2026-04-17T09:30:00)",
-                    },
-                    "location": {
-                        "type": "string",
-                        "description": "Event location",
-                    },
-                    "source_type": {
-                        "type": "string",
-                        "enum": ["manual", "cig_calendar", "pcg_goal", "agent_task"],
-                        "description": "Source of task/event. Use 'cig_calendar' for calendar-sourced, 'pcg_goal' for goal-derived.",
-                    },
-                    "source_id": {
-                        "type": "string",
-                        "description": "ID of the source (CIG email, PCG goal, etc.)",
-                    },
-                    "icon": {
-                        "type": "string",
-                        "description": "Emoji icon for pages (e.g. '📝', '🎯', '📊')",
-                    },
-                    "parent_id": {
-                        "type": "string",
-                        "description": "Parent page ID for nested pages/blocks",
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Tags for tasks",
-                    },
-                    "assignee": {
-                        "type": "string",
-                        "description": "Assignee for tasks",
-                    },
-                    "fields": {
-                        "type": "array",
-                        "description": "Form field definitions (for create_form): array of {name, type, required} objects",
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "Message for AI chat",
-                    },
-                    "intent": {
-                        "type": "string",
-                        "description": "Explanation of intent for approval-gated actions like delete_page",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Image Analysis (Qwen Vision)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_image",
-            "description": (
-                "Use the local Qwen Vision model (qwen-vision) on the RTX workstation "
-                "to interpret and describe an image given its URL. Always use this "
-                "when the user attaches an image or provides an image URL."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_url": {
-                        "type": "string",
-                        "description": "URL of the image to analyze",
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "Specific question or instruction for the vision model (default: 'Describe this image in detail.')",
-                    },
-                },
-                "required": ["image_url"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # EV Charging & Route Planning (NREL AFDC API)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "ev_route_planner",
-            "description": (
-                "Find EV charging stations and plan charging stops for road trips. "
-                "Uses NREL Alternative Fuel Stations API. Supports Tesla Superchargers "
-                "and all major networks. "
-                "Actions: "
-                "nearest (find stations near a location — address, city, or coordinates), "
-                "route (find stations along a driving route — pass waypoints like 'Houston,TX;Austin,TX;Dallas,TX'), "
-                "networks (list all available EV charging networks). "
-                "Filter by network (tesla, chargepoint, electrify_america, evgo, blink) "
-                "and DC fast chargers only. "
-                "NOTE: If no location is provided, uses your Tesla's current cached location."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["nearest", "route", "networks"],
-                        "description": "Action to perform",
-                    },
-                    "location": {
-                        "type": "string",
-                        "description": "Address, city/state, or ZIP (for 'nearest'). E.g. 'Humble, TX' or '77346'",
-                    },
-                    "latitude": {
-                        "type": "number",
-                        "description": "Latitude (alternative to location, for 'nearest')",
-                    },
-                    "longitude": {
-                        "type": "number",
-                        "description": "Longitude (alternative to location, for 'nearest')",
-                    },
-                    "waypoints": {
-                        "type": "string",
-                        "description": "Semicolon-separated route locations (for 'route'). E.g. 'Houston,TX;San Antonio,TX;Austin,TX'",
-                    },
-                    "radius": {
-                        "type": "number",
-                        "description": "Search radius in miles (default 25 for nearest, 10 for route; max 500)",
-                    },
-                    "network": {
-                        "type": "string",
-                        "description": "Filter by network: tesla, chargepoint, electrify_america, evgo, blink",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (default 10 for nearest, 20 for route; max 50)",
-                    },
-                    "dc_fast_only": {
-                        "type": "boolean",
-                        "description": "Only show DC fast chargers (default false)",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Tesla Vehicle Location
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "tesla_location_refresh",
-            "description": (
-                "Refresh Tesla vehicle location on-demand. "
-                "Triggers an immediate API call to get the latest vehicle location, "
-                "bypassing the normal 30-minute polling cycle. "
-                "Use this when you need current location for navigation, "
-                "charging station lookup, or trip planning. "
-                "The location is automatically cached and used by ev_route_planner "
-                "when no explicit location is provided."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "vin": {
-                        "type": "string",
-                        "description": "Vehicle VIN. If not provided, refreshes the first available vehicle.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # Notes & Productivity (meeting notes, action items, quick capture)
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_notes",
-            "description": (
-                "Create, edit, search, and manage notes — meeting notes, quick captures, "
-                "project notes, and journals. Supports action items with assignees and due dates. "
-                "Actions: "
-                "create (new note with optional action items), "
-                "list (browse notes by type/tag), "
-                "get (read a specific note), "
-                "update (edit note content/title/tags), "
-                "search (find notes by content), "
-                "add_action (add action item to note), "
-                "complete_action (mark action item done), "
-                "list_actions (show action items for a note). "
-                "Use for: 'take meeting notes', 'create a note about X', 'add action item', "
-                "'what are my pending action items', 'find my notes about Y'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "list", "get", "update", "search", "add_action", "complete_action", "list_actions"],
-                        "description": "Action to perform",
-                    },
-                    "note_id": {
-                        "type": "string",
-                        "description": "Note ID (for get, update, add_action, complete_action, list_actions)",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Note title (for create, update)",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Note content/body text (for create, update). Supports markdown.",
-                    },
-                    "note_type": {
-                        "type": "string",
-                        "enum": ["meeting", "quick", "project", "journal", "reference"],
-                        "description": "Type of note (for create, list filter). Default: quick",
-                    },
-                    "tags": {
-                        "type": "string",
-                        "description": "Comma-separated tags (for create, update, list filter). E.g. 'work,urgent,dr-coleman'",
-                    },
-                    "action_items": {
-                        "type": "string",
-                        "description": "Semicolon-separated action items (for create). E.g. 'Follow up with Dr. Coleman;Send proposal by Friday;Schedule next meeting'",
-                    },
-                    "meeting_date": {
-                        "type": "string",
-                        "description": "Meeting date in YYYY-MM-DD format (for create, update)",
-                    },
-                    "attendees": {
-                        "type": "string",
-                        "description": "Comma-separated attendee names (for create, update). E.g. 'Dr. Coleman,Sarah,Mike'",
-                    },
-                    "search": {
-                        "type": "string",
-                        "description": "Search query (for search action)",
-                    },
-                    "action_item_id": {
-                        "type": "string",
-                        "description": "Action item ID (for complete_action)",
-                    },
-                    "action_item_text": {
-                        "type": "string",
-                        "description": "Action item text (for add_action)",
-                    },
-                    "action_item_completed": {
-                        "type": "boolean",
-                        "description": "Mark action item complete/incomplete (for complete_action). Default: true",
-                    },
-                    "limit": {
-                        "type": "string",
-                        "description": "Max results (for list, search). Default: 20",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # ExoMind - Long-running tasks, reminders, and background job orchestration
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "exomind",
-            "description": (
-                "Delegate long-running tasks to ExoMind for background processing, "
-                "reminders, and follow-up tracking. ExoMind monitors jobs, sends "
-                "notifications when action is needed, and keeps you updated. "
-                "Use for tasks that: take longer than a conversation, need reminders, "
-                "require follow-up, or should run in the background. "
-                "Actions: "
-                "create (new background job/task), "
-                "list (show active jobs), "
-                "get (job details), "
-                "update (change status/progress), "
-                "complete (mark done), "
-                "cancel (stop a job), "
-                "remind (set a reminder/follow-up). "
-                "Examples: 'remind me to follow up with Dr. Coleman in 2 days', "
-                "'create a task to research X by Friday', 'what jobs are pending', "
-                "'mark the Coleman follow-up complete'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "list", "get", "update", "complete", "cancel", "remind"],
-                        "description": "Action to perform",
-                    },
-                    "job_id": {
-                        "type": "string",
-                        "description": "Job ID (for get, update, complete, cancel)",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Job/reminder title (for create, remind)",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Detailed description of the task",
-                    },
-                    "job_type": {
-                        "type": "string",
-                        "enum": ["task", "research", "monitor", "reminder", "followup"],
-                        "description": "Type of job. Default: task",
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high", "urgent"],
-                        "description": "Priority level. Default: medium",
-                    },
-                    "due_date": {
-                        "type": "string",
-                        "description": "Due date in YYYY-MM-DD or ISO format",
-                    },
-                    "due_in": {
-                        "type": "string",
-                        "description": "Relative due time: '2 hours', '3 days', 'tomorrow', 'end of week'",
-                    },
-                    "reminder_at": {
-                        "type": "string",
-                        "description": "Reminder time in ISO format",
-                    },
-                    "remind_in": {
-                        "type": "string",
-                        "description": "Relative reminder time: '30 minutes', '2 days', 'tomorrow'",
-                    },
-                    "recurrence": {
-                        "type": "string",
-                        "description": "Recurrence pattern: daily, weekly, monthly, or number of days",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["pending", "in_progress", "waiting_input", "completed", "failed"],
-                        "description": "Job status (for update)",
-                    },
-                    "progress": {
-                        "type": "integer",
-                        "description": "Progress percentage 0-100 (for update)",
-                    },
-                    "status_message": {
-                        "type": "string",
-                        "description": "Status message/note (for update, complete)",
-                    },
-                    "source_note_id": {
-                        "type": "string",
-                        "description": "Link to source note (if job originated from a note's action item)",
-                    },
-                    "limit": {
-                        "type": "string",
-                        "description": "Max results for list. Default: 20",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # YouTube - Search and play videos on Tesla dashboard
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "youtube",
-            "description": (
-                "Search YouTube and play videos on the Tesla dashboard Learn page. "
-                "Use for: 'play a video about X', 'find YouTube videos on Y', "
-                "'search for Z on YouTube', 'play some music videos'. "
-                "Actions: "
-                "search (find videos matching a query), "
-                "play (open a video on Tesla dashboard). "
-                "The video will start playing on the Tesla browser's Learn page."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["search", "play"],
-                        "description": "Action to perform",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Search query (for search action)",
-                    },
-                    "video_id": {
-                        "type": "string",
-                        "description": "YouTube video ID to play (for play action, from search results)",
-                    },
-                },
-                "required": ["action"],
-            },
-        },
-    },
-    # -------------------------------------------------------------------------
-    # PCG — Unified Personal Context Graph
-    # -------------------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "knowledge_query",
-            "description": (
-                "Query across personal knowledge (PIC) and general knowledge (PCG Knowledge Graph) through the Personal Context Graph (PCG). "
-                "Use for questions that might need both personal context AND general facts: "
-                "'What frameworks apply to my clinical workflow goal?', "
-                "'How should I approach the Coleman follow-up?', "
-                "'Find connections between my goals and what I know'. "
-                "This is the PRIMARY tool for complex knowledge synthesis."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language query. Be specific about what you need.",
-                    },
-                    "include_personal": {
-                        "type": "boolean",
-                        "description": "Include PIC identity, goals, preferences. Default: true",
-                    },
-                    "include_knowledge": {
-                        "type": "boolean",
-                        "description": "Include PCG Knowledge Graph entities, facts, documents. Default: true",
-                    },
-                    "include_dimensions": {
-                        "type": "boolean",
-                        "description": "Include LIAM dimension matches and frameworks. Default: true",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_enriched_context",
-            "description": (
-                "Get enriched personal context for this conversation from the Personal Context Graph (PCG). "
-                "Returns: identity, goals with applicable frameworks, relevant knowledge entities, "
-                "and a pre-formatted context prompt. Use at conversation start for grounding."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "include_goals": {
-                        "type": "boolean",
-                        "description": "Include active goals. Default: true",
-                    },
-                    "include_relationships": {
-                        "type": "boolean",
-                        "description": "Include relationship data. Default: false",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "link_goal_to_knowledge",
-            "description": (
-                "Create a bi-directional link between a PIC goal and a PCG Knowledge Graph knowledge entity. "
-                "Use when the user explicitly wants to connect a goal to relevant knowledge: "
-                "'Link my email workflow goal to the Filter Model framework'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "goal_id": {
-                        "type": "string",
-                        "description": "The PIC goal ID to link",
-                    },
-                    "entity_id": {
-                        "type": "string",
-                        "description": "The PCG Knowledge Graph entity ID to link",
-                    },
-                    "relevance": {
-                        "type": "number",
-                        "description": "Relevance score 0.0-1.0. Default: 0.5",
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "Optional context for why this link matters",
-                    },
-                },
-                "required": ["goal_id", "entity_id"],
-            },
-        },
-    },
-]
+TOOL_DEFINITIONS = []
 
 # ---------------------------------------------------------------------------
 # Merge skill-based tool definitions from SKILL.md frontmatter
@@ -1475,132 +159,85 @@ for _sd in _skill_defs:
 # Tool handlers
 # ---------------------------------------------------------------------------
 
-async def handle_get_weather(location: str):
-    """Get weather using OpenWeatherMap API (industry standard, reliable geocoding).
-    API key fetched from AI Inferencing Service (centralized key vault).
-
-    Returns a dict with:
-      - ``speakable``: short prose string fed back to the LLM as the tool result
-        (what the model paraphrases for the voice reply).
-      - ``card``: structured payload (``kind='weather'``) that bot.py forwards to
-        the iOS client as a ``{"type":"card"}`` server message so Hyperspace can
-        render a real weather card in the transcript bubble. This is how we get
-        "table-style" rendering without polluting TTS output with markdown pipes.
-    Falls back to a plain string on error paths (LLM-only, no card)."""
-    api_key = await _fetch_provider_key("openweathermap")
-    if not api_key:
-        logger.error("OpenWeatherMap key unavailable from AI Inferencing, falling back to wttr.in")
-        return await _wttr_fallback(location)
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Normalize location for OpenWeatherMap geocoding:
-            # Accepts "City", "City,US", "City,StateCode,US" but NOT "City ST" or "City, TX, 77346"
-            import re
-            loc = location.strip()
-            # Strip zip codes (5-digit or 5+4)
-            loc = re.sub(r',?\s*\d{5}(-\d{4})?', '', loc).strip().rstrip(',').strip()
-            # Strip 2-letter US state abbreviations ("Humble TX" → "Humble", "Humble, TX" → "Humble")
-            loc = re.sub(r',?\s+[A-Z]{2}$', '', loc).strip().rstrip(',').strip()
-            # If empty after stripping, use original
-            if not loc:
-                loc = location.strip()
-            # Append ,US for better US city disambiguation
-            if ',' not in loc:
-                loc = f"{loc},US"
-            logger.debug(f"OpenWeatherMap query: '{location}' → '{loc}'")
-            
-            wx_url = (
-                f"https://api.openweathermap.org/data/2.5/weather?"
-                f"q={loc.replace(' ', '+')}"
-                f"&appid={api_key}"
-                f"&units=imperial"
-            )
-            async with session.get(wx_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 404:
-                    return f"Could not find location: {location}"
-                if resp.status != 200:
-                    logger.warning(f"OpenWeatherMap API error: {resp.status}")
-                    return await _wttr_fallback(location)
-                
-                data = await resp.json()
-                name = data.get("name", location)
-                country = data.get("sys", {}).get("country", "")
-                main = data.get("main", {})
-                weather = data.get("weather", [{}])[0]
-                wind = data.get("wind", {})
-
-                temp = main.get("temp")
-                feels_like = main.get("feels_like")
-                temp_min = main.get("temp_min")
-                temp_max = main.get("temp_max")
-                humidity = main.get("humidity")
-                pressure = main.get("pressure")
-                wind_speed = wind.get("speed")
-                wind_deg = wind.get("deg")
-                desc = weather.get("description", "Unknown conditions").capitalize()
-                icon = weather.get("icon")
-                weather_main = weather.get("main")
-
-                place = f"{name}, {country}" if country else name
-                speakable = (
-                    f"{place}: {desc}, "
-                    f"{temp if temp is not None else '?'}°F, "
-                    f"{humidity if humidity is not None else '?'}% humidity, "
-                    f"wind {wind_speed if wind_speed is not None else '?'} mph"
-                )
-                return {
-                    "speakable": speakable,
-                    "card": {
-                        "kind": "weather",
-                        "location": place,
-                        "condition": desc,
-                        "conditionCode": weather_main,
-                        "iconCode": icon,
-                        "tempF": temp,
-                        "feelsLikeF": feels_like,
-                        "tempMinF": temp_min,
-                        "tempMaxF": temp_max,
-                        "humidityPct": humidity,
-                        "pressureHpa": pressure,
-                        "windMph": wind_speed,
-                        "windDeg": wind_deg,
-                        "source": "openweathermap",
-                    },
-                }
-    except Exception as e:
-        logger.error(f"OpenWeatherMap error: {e}")
-        return await _wttr_fallback(location)
+def _clean_weather_line(text: str) -> str:
+    cleaned = re.sub(r"\[[^\]]+\]\([^)]+\)", "", str(text or ""))
+    cleaned = re.sub(r"^\s*#+\s*", "", cleaned)
+    cleaned = cleaned.replace("**", "").replace("__", "")
+    cleaned = re.sub(r"^\s*[-*]\s*", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _wmo_code(code: int) -> str:
-    """Convert WMO weather code to short description."""
-    codes = {
-        0: "Clear sky", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
-        45: "Fog", 48: "Rime fog",
-        51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle",
-        61: "Light rain", 63: "Rain", 65: "Heavy rain",
-        71: "Light snow", 73: "Snow", 75: "Heavy snow",
-        80: "Light showers", 81: "Showers", 82: "Heavy showers",
-        95: "Thunderstorm", 96: "Thunderstorm w/ hail", 99: "Severe thunderstorm",
+def _weather_condition_code(condition: str) -> str:
+    normalized = str(condition or "").lower()
+    if any(term in normalized for term in ("thunder", "storm", "showers", "rain")):
+        return "rain"
+    if any(term in normalized for term in ("cloud", "overcast")):
+        return "clouds"
+    if any(term in normalized for term in ("sun", "clear", "hot", "warm")):
+        return "sun"
+    return "clouds"
+
+
+def _extract_weather_card(location: str, query: str, display: str, speech: str) -> dict[str, Any]:
+    clean_lines = [_clean_weather_line(line) for line in str(display or "").splitlines()]
+    clean_lines = [line for line in clean_lines if line and not line.startswith("(")]
+    title = next((line for line in clean_lines if "weather" in line.lower() or "forecast" in line.lower()), "")
+    if not title:
+        title = f"Weather for {location}"
+    subtitle_match = re.search(r"\(([^)]*(?:sat|sun|mon|tue|wed|thu|fri|today|tomorrow)[^)]*)\)", title, flags=re.IGNORECASE)
+    subtitle = subtitle_match.group(1).strip() if subtitle_match else ""
+    periods: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    period_re = re.compile(r"^(?P<label>today|tonight|tomorrow|saturday(?: night)?|sunday(?: night)?|monday(?: night)?|tuesday(?: night)?|wednesday(?: night)?|thursday(?: night)?|friday(?: night)?|weekend)\b(?:\s*\([^)]+\))?\s*:?\s*(?P<rest>.*)", re.IGNORECASE)
+    for line in clean_lines:
+        match = period_re.match(line)
+        if match:
+            if current:
+                periods.append(current)
+            current = {
+                "name": match.group("label").strip().title(),
+                "summary": match.group("rest").strip(),
+            }
+        elif current and line:
+            current["summary"] = f"{current.get('summary', '').strip()} {line}".strip()
+    if current:
+        periods.append(current)
+    if not periods and clean_lines:
+        periods.append({"name": "Forecast", "summary": clean_lines[1] if len(clean_lines) > 1 else clean_lines[0]})
+    for period in periods:
+        summary = str(period.get("summary") or "")
+        temps = [int(value) for value in re.findall(r"(-?\d{1,3})\s*°?\s*F", summary, flags=re.IGNORECASE)]
+        if temps:
+            period["highF"] = max(temps)
+            period["lowF"] = min(temps)
+        precip = re.search(r"(\d{1,3}\s*(?:-|to)\s*\d{1,3}%|\d{1,3}%)\s*(?:chance|rain|showers|storm|t-storm|precip)", summary, flags=re.IGNORECASE)
+        if not precip:
+            precip = re.search(r"(?:chance|rain|showers|storm|t-storm|precip)[^.\d]*(\d{1,3}\s*(?:-|to)\s*\d{1,3}%|\d{1,3}%)", summary, flags=re.IGNORECASE)
+        if precip:
+            precip_text = precip.group(1).replace(" to ", "-")
+            precip_values = [int(value) for value in re.findall(r"\d{1,3}", precip_text)]
+            if precip_values:
+                period["precipChancePct"] = max(precip_values)
+        wind = re.search(r"(winds?\s+[^.]+(?:mph|light|calm))", summary, flags=re.IGNORECASE)
+        if wind:
+            period["wind"] = re.sub(r"^winds?:\s*", "", wind.group(1).strip(), flags=re.IGNORECASE)
+        period["conditionCode"] = _weather_condition_code(summary)
+    alerts: list[str] = []
+    for line in clean_lines:
+        if "alert" in line.lower():
+            alerts.append(line)
+    return {
+        "kind": "weather_forecast",
+        "schemaVersion": 2,
+        "location": location,
+        "title": title,
+        "subtitle": subtitle,
+        "summary": _clean_weather_line(speech) or (periods[0].get("summary") if periods else title),
+        "periods": periods[:6],
+        "alerts": alerts[:3],
+        "source": "perplexity",
+        "query": query,
     }
-    return codes.get(code, "Unknown conditions")
-
-
-async def _wttr_fallback(location: str) -> str:
-    """Fallback to wttr.in if Open-Meteo fails."""
-    loc = location.replace(" ", "+")
-    url = f"https://wttr.in/{loc}?format=%l:+%c+%t+%h+%w"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return f"Weather lookup failed for {location}."
-                text = await resp.text()
-                return text.strip()
-    except Exception as e:
-        logger.error(f"wttr.in fallback also failed: {e}")
-        return f"Could not get weather for {location}."
 
 
 async def handle_control_lights(action: str, target: str = "", value: str = "") -> str:
@@ -1824,6 +461,13 @@ async def handle_hub_delegate(
             "run": "agents.run",
             "dispatch": "orchestrator.dispatch",
             "delegate": "orchestrator.dispatch",
+        },
+        "scribe": {
+            "edit": "agents.run",
+            "format": "agents.run",
+            "document": "agents.run",
+            "write": "agents.run",
+            "run": "agents.run",
         },
     }
     
@@ -2219,7 +863,7 @@ _conversation_search_count: dict[str, int] = {}
 
 async def handle_search_past_conversations(
     query: str, days_back: int = 90, limit: int = 5, user_id: str = "default",
-    from_days: int = None, to_days: int = None,
+    from_days: int = None, to_days: int = None, exclude_conversation_id: str = "",
 ) -> str:
     """Search past conversations for historical context."""
     from nova.store import search_past_conversations
@@ -2240,10 +884,14 @@ async def handle_search_past_conversations(
         from_days = min(max(0, from_days), 365)
         to_days = min(max(0, to_days), 365)
         results = await search_past_conversations(
-            user_id, query, limit=limit, from_days=from_days, to_days=to_days
+            user_id, query, limit=limit, from_days=from_days, to_days=to_days,
+            exclude_conversation_id=exclude_conversation_id,
         )
     else:
-        results = await search_past_conversations(user_id, query, days_back, limit)
+        results = await search_past_conversations(
+            user_id, query, days_back, limit,
+            exclude_conversation_id=exclude_conversation_id,
+        )
     
     if not results:
         logger.info(f"Conversation search: no matches for '{query}' (last {days_back} days)")
@@ -2257,7 +905,7 @@ async def handle_search_past_conversations(
     output = [f"Found {len(results)} relevant past conversation(s):\n"]
     for i, r in enumerate(results, 1):
         title = r.get("title", "Untitled")
-        snippet = r.get("snippet", "")[:300]
+        snippet = r.get("snippet", "")[:1500]
         msg_count = r.get("message_count", "")
         date = r.get("date", r.get("created_at", ""))
         date_display = f" [{date}]" if date else ""
@@ -2282,7 +930,8 @@ def reset_conversation_search_count(user_id: str = ""):
 # ---------------------------------------------------------------------------
 
 async def handle_check_studio(
-    studio: str, action: str = "recent", item_id: str = "", query: str = ""
+    studio: str, action: str = "recent", item_id: str = "", query: str = "",
+    user_tz: str = "America/Chicago",
 ) -> str:
     """Read status/results from homelab studios via ecosystem dashboard API."""
     base = ECOSYSTEM_URL
@@ -2298,71 +947,88 @@ async def handle_check_studio(
             if studio == "calendar":
                 timeout = aiohttp.ClientTimeout(total=12)
 
-                # Briefing — AI-generated daily summary with email context
-                if action == "briefing":
-                    url = f"{hermes}/v1/calendar-intelligence/briefing"
-                    params: dict[str, Any] = {}
-                    if query:
-                        params["date"] = query  # YYYY-MM-DD
-                    async with session.get(url, params=params, headers=hermes_headers, timeout=timeout) as resp:
-                        if resp.status != 200:
-                            return f"Calendar briefing API returned HTTP {resp.status}."
-                        data = await resp.json()
-                        headline = data.get("headline", "")
-                        summary = data.get("executive_summary", "")
-                        meetings = data.get("total_meetings", 0)
-                        focus = data.get("focus_time_minutes", 0)
-                        recs = data.get("preparation_recommendations", [])
-                        briefs = data.get("meeting_briefs", [])
-                        parts = []
-                        if headline:
-                            parts.append(headline)
-                        if summary:
-                            parts.append(summary)
-                        parts.append(f"{meetings} meetings, {focus} minutes of focus time.")
-                        for b in briefs[:5]:
-                            t = b.get("title", "")
-                            st = b.get("start_time", "")
-                            loc = b.get("location", "")
-                            if "T" in str(st):
-                                st = str(st).split("T")[1][:5]
-                            line = f"- {st} {t}"
-                            if loc:
-                                line += f" at {loc}"
-                            parts.append(line)
-                        if recs:
-                            parts.append("Tips: " + "; ".join(recs[:3]))
-                        return "\n".join(parts)
+                # Local timezone helpers for display and filtering
+                import zoneinfo as _zi
+                from datetime import datetime as _dt, timezone as _utc, timedelta as _td
+                try:
+                    _tz_obj = _zi.ZoneInfo(user_tz)
+                except Exception:
+                    _tz_obj = _zi.ZoneInfo("America/Chicago")
+                _now_local = _dt.now(_utc.utc).astimezone(_tz_obj)
+                _today_local = _now_local.date()
 
-                # Today / Tomorrow / This Week shortcuts
-                elif action in ("today", "tomorrow", "this_week"):
-                    slug = action.replace("_", "-")
-                    url = f"{hermes}/v1/calendar/search/{slug}"
-                    params = {}
-                    if query:
-                        params["query"] = query
+                def _parse_local(dt_str):
+                    """Parse a CT ISO string (with offset) to a local datetime."""
+                    if not dt_str:
+                        return None
+                    try:
+                        s = str(dt_str)
+                        if s.endswith("Z"):
+                            d = _dt.fromisoformat(s[:-1]).replace(tzinfo=_utc.utc)
+                        else:
+                            d = _dt.fromisoformat(s)
+                            if d.tzinfo is None:
+                                d = d.replace(tzinfo=_utc.utc)
+                        return d.astimezone(_tz_obj)
+                    except Exception:
+                        return None
+
+                def _fmt_ct(dt_str):
+                    """Return a readable local time string: '8:00 PM'."""
+                    local = _parse_local(dt_str)
+                    if not local:
+                        return ""
+                    return local.strftime("%-I:%M %p")
+
+                def _is_on_date(dt_str, target_date):
+                    local = _parse_local(dt_str)
+                    return local is not None and local.date() == target_date
+
+                # Briefing / Today / Tomorrow / This Week — all use /v1/calendar/events
+                # with local-day filtering since the shortcut endpoints are not available.
+                if action in ("briefing", "today", "tomorrow", "this_week"):
+                    url = f"{hermes}/v1/calendar/events"
+                    params: dict[str, Any] = {"days": 8}  # fetch 8 days, filter locally
                     async with session.get(url, params=params, headers=hermes_headers, timeout=timeout) as resp:
                         if resp.status != 200:
-                            return f"Calendar search API returned HTTP {resp.status}."
+                            return f"Calendar API returned HTTP {resp.status}."
                         data = await resp.json()
-                        results = data.get("results", [])
-                        if not results:
-                            return f"No events {action.replace('_', ' ')}."
-                        lines = []
-                        for r in results[:8]:
-                            title = r.get("title", "Untitled")
-                            st = r.get("start_time", "")
-                            loc = r.get("location", "")
-                            cal = r.get("calendar_name", "")
-                            if "T" in str(st):
-                                st = str(st).split("T")[1][:5]
-                            line = f"- {st} {title}"
-                            if loc:
-                                line += f" ({loc})"
-                            if cal:
-                                line += f" [{cal}]"
-                            lines.append(line)
-                        return f"{len(results)} events {action.replace('_', ' ')}:\n" + "\n".join(lines)
+                        events = data.get("events", [])
+
+                    if action in ("briefing", "today"):
+                        target_date = _today_local
+                        label = "today"
+                    elif action == "tomorrow":
+                        target_date = _today_local + _td(days=1)
+                        label = "tomorrow"
+                    else:  # this_week
+                        target_date = None
+                        label = "this week"
+
+                    if target_date is not None:
+                        filtered = [ev for ev in events if _is_on_date(ev.get("start_time", ""), target_date)]
+                    else:
+                        week_end = _today_local + _td(days=7)
+                        filtered = [ev for ev in events
+                                    if _parse_local(ev.get("start_time", "")) is not None
+                                    and _today_local <= _parse_local(ev.get("start_time", "")).date() < week_end]
+
+                    if not filtered:
+                        return f"No events on your calendar {label}."
+                    lines = []
+                    for ev in filtered[:8]:
+                        title = ev.get("title", "Untitled")
+                        st = _fmt_ct(ev.get("start_time", ""))
+                        loc = (ev.get("location") or "").split("\n")[0]
+                        cal = ev.get("calendar_name", "")
+                        line = f"- {st} {title}"
+                        if loc:
+                            line += f" at {loc}"
+                        if cal:
+                            line += f" [{cal}]"
+                        lines.append(line)
+                    return (f"{len(filtered)} event(s) {label} (Central Time):\n"
+                            + "\n".join(lines))
 
                 # Stats / Count — how many calendars are connected
                 elif action in ("stats", "count", "status"):
@@ -2394,26 +1060,7 @@ async def handle_check_studio(
                 # Default: upcoming events
                 else:
                     url = f"{hermes}/v1/calendar/events"
-                    params = {"days_forward": 7}
-                    if query:
-                        # Use search endpoint for keyword queries
-                        url = f"{hermes}/v1/calendar/search"
-                        async with session.post(url, json={"query": query, "date_relative": "next_7_days", "top_k": 10}, headers=hermes_headers, timeout=timeout) as resp:
-                            if resp.status != 200:
-                                return f"Calendar search returned HTTP {resp.status}."
-                            data = await resp.json()
-                            results = data.get("results", [])
-                            if not results:
-                                return f"No calendar events matching '{query}'."
-                            lines = []
-                            for r in results[:7]:
-                                title = r.get("title", "Untitled")
-                                st = r.get("start_time", "")
-                                if "T" in str(st):
-                                    st = str(st).split("T")[0] + " " + str(st).split("T")[1][:5]
-                                lines.append(f"- {title} ({st})")
-                            return f"{len(results)} matching events:\n" + "\n".join(lines)
-
+                    params = {"days": 7}
                     async with session.get(url, params=params, headers=hermes_headers, timeout=timeout) as resp:
                         if resp.status != 200:
                             return f"Calendar API returned HTTP {resp.status}."
@@ -2424,11 +1071,13 @@ async def handle_check_studio(
                         lines = []
                         for ev in events[:8]:
                             title = ev.get("title", "Untitled")
-                            start = ev.get("start_time", "")
-                            if "T" in str(start):
-                                start = str(start).split("T")[0] + " " + str(start).split("T")[1][:5]
-                            lines.append(f"- {title} ({start})")
-                        return f"{len(events)} upcoming events:\n" + "\n".join(lines)
+                            st = _fmt_ct(ev.get("start_time", ""))
+                            loc = (ev.get("location") or "").split("\n")[0]
+                            line = f"- {st} {title}"
+                            if loc:
+                                line += f" at {loc}"
+                            lines.append(line)
+                        return f"{len(events)} upcoming events (Central Time):\n" + "\n".join(lines)
 
             # --- Email Intelligence (via CIG :8780) ---
             elif studio == "email":
@@ -2606,11 +1255,8 @@ async def handle_check_studio(
                         q = data.get("question", "")
                         rstatus = data.get("status", "")
                         if report:
-                            # Truncate for voice — first 500 chars
-                            summary = report[:500].strip()
-                            if len(report) > 500:
-                                summary += "... (truncated for voice, full report available in dashboard)"
-                            return f"Research: {q}\nStatus: {rstatus}\n\n{summary}"
+                            # Let _trim_tool_result_for_llm in bot.py handle the truncation limits appropriately
+                            return f"Research: {q}\nStatus: {rstatus}\n\n{report}"
                         return f"Research '{q}' — status: {rstatus}. No report yet."
 
                 # Status: aggregate counts by status
@@ -3540,97 +2186,132 @@ async def handle_manage_ticket(
 # ---------------------------------------------------------------------------
 
 async def handle_analyze_image(
-    image_url: str,
-    prompt: str = "Describe this image in detail.",
+    url: str,
+    instruction: str = "Describe this image in detail.",
     **kwargs
 ) -> str:
-    """Download an image and send it to the local Qwen Vision model via AI Gateway or llama.cpp asynchronously."""
+    """Download an image and send it to the local Qwen Vision model via AI Gateway or llama.cpp synchronously."""
     import aiohttp
     import base64
     import os
     import asyncio
-    from nova.events import event_bus, Event
     
-    user_id = kwargs.get("_internal_user_id", "default")
+    # Fallback in case old args are passed
+    image_url = url or kwargs.get("image_url", "")
+    prompt = instruction or kwargs.get("prompt", "Describe this image in detail.")
+    if not image_url:
+        return "No image URL provided."
     
-    async def _background_analyze():
-        try:
-            # Download image first and encode as base64
-            async with aiohttp.ClientSession() as session:
-                async with session.get(image_url) as resp:
-                    if resp.status != 200:
-                        await event_bus.emit(Event(
-                            type="job.failed",
-                            user_id=user_id,
-                            data={"summary": f"Failed to download image from {image_url}. Status: {resp.status}"}
-                        ))
-                        return
-                    image_bytes = await resp.read()
-                    mime_type = resp.headers.get('Content-Type', 'image/jpeg')
-            
-            b64_image = base64.b64encode(image_bytes).decode('utf-8')
-            data_url = f"data:{mime_type};base64,{b64_image}"
-            
-            payload = {
-                "model": "qwen-vision",
+    try:
+        # Download image first and encode as base64
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    return f"Failed to download image from {image_url}. Status: {resp.status}"
+                image_bytes = await resp.read()
+        
+        # Resize image to prevent massive token explosion (Qwen2.5-VL uses many tokens per pixel)
+        import io
+        from PIL import Image
+        source_img = Image.open(io.BytesIO(image_bytes))
+        if source_img.mode != "RGB":
+            source_img = source_img.convert("RGB")
+
+        def _build_payload(max_side: int) -> dict:
+            img = source_img.copy()
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            out_io = io.BytesIO()
+            img.save(out_io, format="JPEG", quality=82)
+            resized_bytes = out_io.getvalue()
+            b64_image = base64.b64encode(resized_bytes).decode("utf-8")
+            data_url = f"data:image/jpeg;base64,{b64_image}"
+            return {
+                "model": os.environ.get("AI_GATEWAY_VISION_MODEL", "qwen-vision"),
                 "messages": [
                     {
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": data_url}}
-                        ]
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
                     }
                 ],
-                "max_tokens": 1000
+                "max_tokens": 512,
             }
-            
-            # Try AI Gateway first, fallback to direct llama.cpp if needed
-            vision_url = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1").replace("/api/v1", "/v1/chat/completions")
-            if "api/v1" not in os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1") and "v1" not in vision_url:
-                vision_url = "http://127.0.0.1:8777/v1/chat/completions"
-                
-            async with aiohttp.ClientSession() as session:
-                # We use a 90 second timeout as vision models can be slow
-                async with session.post(vision_url, json=payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        result = data["choices"][0]["message"]["content"]
-                    elif resp.status == 404:
-                        # Fallback to direct Qwen Vision vLLM port if AI Gateway doesn't route it
-                        direct_url = "http://127.0.0.1:8013/v1/chat/completions"
-                        direct_payload = {**payload, "model": "qwen2.5-vl-7b"}
-                        async with session.post(direct_url, json=direct_payload, timeout=aiohttp.ClientTimeout(total=90)) as direct_resp:
-                            if direct_resp.status == 200:
-                                data = await direct_resp.json()
-                                result = data["choices"][0]["message"]["content"]
-                            else:
-                                result = f"Vision model returned status {direct_resp.status}: {await direct_resp.text()}"
-                    else:
-                        result = f"AI Gateway returned status {resp.status}: {await resp.text()}"
-                        
-            await event_bus.emit(Event(
-                type="job.completed",
-                user_id=user_id,
-                data={"summary": f"I finished looking at the image you attached. Here is what I found: {result}"}
-            ))
-            
-        except Exception as e:
-            logger.error(f"Background image analysis failed: {e}")
-            await event_bus.emit(Event(
-                type="job.failed",
-                user_id=user_id,
-                data={"summary": f"My background image analysis failed: {str(e)}"}
-            ))
 
-    # Fire and forget
-    asyncio.create_task(_background_analyze())
-    
-    return "SYSTEM: Image analysis has started in the background. Tell the user you are looking at it and will let them know when it's ready. Do NOT wait for the result."
+        async with aiohttp.ClientSession() as session:
+            gateway_base = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8777/api/v1").rstrip("/")
+            if gateway_base.endswith("/chat/completions"):
+                vision_url = gateway_base
+            elif gateway_base.endswith("/api/v1"):
+                vision_url = f"{gateway_base[:-7]}/v1/chat/completions"
+            elif gateway_base.endswith("/v1"):
+                vision_url = f"{gateway_base}/chat/completions"
+            else:
+                vision_url = f"{gateway_base}/v1/chat/completions"
+            gateway_key = os.environ.get("AI_GATEWAY_API_KEY", AI_GATEWAY_API_KEY)
+            headers = {"X-API-Key": gateway_key} if gateway_key else {}
+            result = ""
+            for max_side in (768, 512):
+                payload = _build_payload(max_side)
+                async with session.post(vision_url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        data = json.loads(body)
+                        result = data["choices"][0]["message"]["content"]
+                        break
+                    retryable_size_error = (
+                        resp.status == 400
+                        and ("max_tokens" in body or "context" in body.lower() or "token" in body.lower())
+                        and max_side != 512
+                    )
+                    if retryable_size_error:
+                        logger.warning(f"Vision image too large at {max_side}px, retrying smaller")
+                        continue
+                    result = f"Vision model returned status {resp.status}: {body}"
+                    break
+                    
+        return result
+        
+    except Exception as e:
+        logger.error(f"Image analysis failed: {e}")
+        return f"Image analysis failed: {str(e)}"
 
 # ---------------------------------------------------------------------------
 # Workspace management (fast direct API calls)
 # ---------------------------------------------------------------------------
+
+_NOVA_CATEGORY_LABELS = {
+    "article":      "Articles",
+    "case_study":   "Case Studies",
+    "research":     "Research",
+    "worksheet":    "Worksheets",
+    "briefing":     "Briefings",
+    "note":         "Notes",
+    "report":       "Reports",
+    "template":     "Templates",
+}
+
+def _build_nova_metadata(
+    category: str = "",
+    topic: str = "",
+    tags: list | None = None,
+) -> dict:
+    """Build the standard Nova page metadata dict stamped into properties.metadata."""
+    import datetime
+    cat = (category or "note").lower().replace(" ", "_")
+    if cat not in _NOVA_CATEGORY_LABELS:
+        cat = "note"
+    return {
+        "source": "nova",
+        "agent": "nova-agent",
+        "category": cat,
+        "category_label": _NOVA_CATEGORY_LABELS[cat],
+        "topic": topic or "",
+        "tags": tags or [],
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
 
 async def handle_manage_workspace(
     action: str,
@@ -3662,6 +2343,8 @@ async def handle_manage_workspace(
     fields: list | None = None,
     message: str = "",
     intent: str = "",
+    category: str = "",
+    topic: str = "",
     **kwargs,
 ) -> str:
     """Handle Pi Workspace operations via the Workspace API (port 8762)."""
@@ -3679,6 +2362,9 @@ async def handle_manage_workspace(
     def _full_id_line(label: str, value: str) -> str:
         return f"{label}: {value}"
 
+    import re as _re_pg
+    _UUID_RE = _re_pg.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", _re_pg.IGNORECASE)
+
     async def _resolve_page_id(page_ref: str) -> tuple[str, str]:
         ref = (page_ref or "").strip()
         if not ref:
@@ -3687,6 +2373,21 @@ async def handle_manage_workspace(
         exact = [p for p in pages if p.get("id") == ref]
         if exact:
             return ref, ""
+        # Hallucination guard: if the input is shaped exactly like a UUID but
+        # does NOT match any real page, refuse it instead of forwarding the
+        # bogus UUID downstream. This is the most common loop pattern — the
+        # model invents a plausible-looking UUID and retries it for 5+ turns.
+        if _UUID_RE.match(ref):
+            sample = ", ".join(
+                f"{_plain_title(p.get('title','Untitled'))} ({p.get('id')})"
+                for p in pages[:5]
+            )
+            return "", (
+                f"REJECTED hallucinated page_id '{ref}'. This UUID does not exist in the workspace. "
+                f"Do NOT retry with this id. Use one of the real page_ids below, "
+                f"or call manage_workspace(action='list') / action='search' to find the correct one. "
+                f"Real pages (sample): {sample or '(no pages yet — use create_page or create_page_with_blocks)'}"
+            )
         prefix = ref.removesuffix("...").strip()
         if len(prefix) >= 4:
             matches = [p for p in pages if str(p.get("id", "")).startswith(prefix)]
@@ -3719,7 +2420,10 @@ async def handle_manage_workspace(
         elif action == "create_page":
             if not title:
                 return "Title is required to create a page."
-            page = await create_page(title, parent_id=parent_id, icon=icon)
+            _nova_meta = _build_nova_metadata(category=category, topic=topic, tags=tags)
+            page = await create_page(title, parent_id=parent_id, icon=icon,
+                                     properties={"metadata": _nova_meta},
+                                     created_by="nova-agent")
             if not page:
                 return "Failed to create page."
             # If content provided, add a paragraph block
@@ -3727,7 +2431,7 @@ async def handle_manage_workspace(
                 await create_block(page["id"], "paragraph",
                                    {"richText": [{"type": "text", "text": {"content": content}, "plainText": content}]},
                                    parent_id=page.get("rootBlockId", ""))
-            return f"\u2705 Page created: \"{title}\" ({_full_id_line('page_id', page['id'])})"
+            return f"\u2705 Page created: \"{title}\" ({_full_id_line('page_id', page['id'])})  category={_nova_meta.get('category','uncategorized')}"
 
         elif action == "create_page_with_blocks":
             if not title:
@@ -3737,11 +2441,14 @@ async def handle_manage_workspace(
             blocks = properties.get("blocks", [])
             if not blocks:
                 return "'blocks' array in properties is required. Each block: {type, content?, properties?}"
-            page = await create_page_with_blocks(title, blocks, icon=icon, parent_id=parent_id)
+            _nova_meta = _build_nova_metadata(category=category, topic=topic, tags=tags)
+            page = await create_page_with_blocks(title, blocks, icon=icon, parent_id=parent_id,
+                                                 properties={"metadata": _nova_meta},
+                                                 created_by="nova-agent")
             if not page:
                 return "Failed to create page with blocks."
             bc = page.get("block_count", 0)
-            return f"\u2705 Page created: \"{title}\" with {bc} blocks ({_full_id_line('page_id', page['id'])})"
+            return f"\u2705 Page created: \"{title}\" with {bc} blocks ({_full_id_line('page_id', page['id'])})  category={_nova_meta.get('category','uncategorized')}"
 
         elif action == "get_page":
             if not page_id:
@@ -3758,6 +2465,9 @@ async def handle_manage_workspace(
                 lines.append(resolution_message)
             # Get blocks
             blocks = await get_page_blocks(resolved_page_id)
+            if not blocks:
+                lines.append("  (Page is empty — no content blocks. Do not call get_page again for this page_id. If the page should have content, use create_page_with_blocks or add blocks first.)")
+                return "\n".join(lines)
             for b in (blocks or [])[:20]:
                 bt = b.get("type", "")
                 props = b.get("properties", {})
@@ -4158,9 +2868,9 @@ async def handle_get_enriched_context(
     include_relationships: bool = False,
 ) -> str:
     """Get enriched personal context from PCG."""
-    from nova.pcg import query as pcg_query
+    from nova.context_bridge import get_enriched_context as cb_get_enriched_context
     
-    result = await pcg_query(
+    result = await cb_get_enriched_context(
         agent_id="nova-agent",
         include_goals=include_goals,
         include_relationships=include_relationships,
@@ -4292,12 +3002,14 @@ TOOL_HANDLERS = {
 }
 
 
-def set_progress_context(callback: Optional[ProgressCallback], user_id: Optional[str], location: Optional[Any] = None):
+def set_progress_context(callback: Optional[ProgressCallback], user_id: Optional[str], location: Optional[Any] = None, conversation_id: Optional[str] = None):
     """Set the current progress callback, user ID, and location for tool calls."""
-    global _current_progress_callback, _current_user_id, _current_user_location
+    global _current_progress_callback, _current_user_id, _current_user_location, _current_conversation_id
     _current_progress_callback = callback
     _current_user_id = user_id
     _current_user_location = location
+    if conversation_id is not None:
+        _current_conversation_id = conversation_id
 
 
 async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
@@ -4318,10 +3030,12 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         "homelab_operations",  # Mutating actions (restart/start/stop)
         "save_memory", "forget_memory",  # Mutating PIC
         "hub_delegate",  # Long-running, approval-gated Hub tasks
+        "analyze_image",  # Async background vision job
         "query_cig",  # User-specific CIG analytics
         "query_frameworks",  # Dynamic LIAM framework discovery
         "set_reminder", "manage_timer",  # Mutating
         "control_lights",  # Mutating
+        "get_weather",  # Weather data is highly temporal and should be fetched fresh
         "manage_ticket", "manage_workspace", "manage_notes", "exomind",  # Mutating
         "tesla_charge_control", "tesla_climate_control",  # Mutating
         "tesla_lock_control", "tesla_trunk_control",  # Mutating
@@ -4353,6 +3067,8 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         # Inject user_id for conversation search
         if name == "search_past_conversations" or name.startswith("tesla_"):
             args["user_id"] = _current_user_id or "default"
+        if name == "search_past_conversations" and _current_conversation_id:
+            args.setdefault("exclude_conversation_id", _current_conversation_id)
             
         # Extract _internal_user_id if present to avoid TypeError for tools without **kwargs
         internal_user_id = args.pop("_internal_user_id", None)
@@ -4376,10 +3092,30 @@ async def dispatch_tool(name: str, args: dict[str, Any]) -> str:
         return result
     except TypeError as e:
         logger.error(f"Tool {name} argument error: {e}")
-        return f"Tool error: {str(e)}"
+        import traceback
+        tb = traceback.format_exc()
+        return (
+            f"Tool argument error: {str(e)}\n\n"
+            f"SYSTEM: A code or parameter failure occurred in the '{name}' tool.\n"
+            f"Traceback:\n{tb}\n\n"
+            "INSTRUCTION: 1. Inform the user that you encountered a code/parameter bug.\n"
+            "2. Explain that you are delegating the fix to the 'coder' agent.\n"
+            "3. Call hub_delegate(agent='coder', method='fix', params={'task': 'Fix tool parameter mismatch', 'context': '...'}) passing this traceback.\n"
+            "4. Tell the user they will receive an approval request on their iPhone for the code fix."
+        )
     except Exception as e:
         logger.error(f"Tool {name} execution error: {e}")
-        return f"Tool error: {str(e)}"
+        import traceback
+        tb = traceback.format_exc()
+        return (
+            f"Tool execution error: {str(e)}\n\n"
+            f"SYSTEM: A code execution failure occurred in the '{name}' tool.\n"
+            f"Traceback:\n{tb}\n\n"
+            "INSTRUCTION: 1. Inform the user that you encountered a code bug.\n"
+            "2. Explain that you are delegating the fix to the 'coder' agent.\n"
+            "3. Call hub_delegate(agent='coder', method='fix', params={'task': 'Fix tool execution error', 'context': '...'}) passing this traceback.\n"
+            "4. Tell the user they will receive an approval request on their iPhone for the code fix."
+        )
 
 # ---------------------------------------------------------------------------
 # Unified Tesla Control Tool (Claude Skills Format)
@@ -5035,51 +3771,374 @@ async def handle_search_framework_catalog(**kwargs) -> dict:
         }
 
 
-SEARCH_FRAMEWORK_CATALOG_TOOL = {
+TOOL_HANDLERS["search_framework_catalog"] = handle_search_framework_catalog
+
+
+# ---------------------------------------------------------------------------
+# Active Goal Management — cross-session work continuity
+# ---------------------------------------------------------------------------
+
+async def handle_set_active_goal(goal: str, intent: str = "multi_session_task", workspace_page_id: str = "", **kwargs) -> str:
+    """Record an active multi-session goal so Nova remembers it across conversations."""
+    from nova.action_ledger import create_action_entry
+    from nova.store import upsert_action_ledger_entry
+    metadata = {}
+    if workspace_page_id:
+        metadata["workspace_page_id"] = workspace_page_id
+    entry = create_action_entry(
+        intent=intent,
+        active_goal=goal,
+        status="running",
+        user_id=_current_user_id or "default",
+        metadata=metadata,
+    )
+    await upsert_action_ledger_entry(entry)
+    logger.info(f"Active goal set: {goal!r} page_id={workspace_page_id!r}")
+    anchor = f" Workspace page: {workspace_page_id}." if workspace_page_id else ""
+    return f"Active goal recorded: '{goal}'.{anchor} I'll carry this context into future sessions."
+
+
+async def handle_complete_active_goal(goal_fragment: str = "", **kwargs) -> str:
+    """Mark an active goal as completed so it stops appearing in session context."""
+    from nova.store import get_recent_action_ledger_entries, upsert_action_ledger_entry, DB_PATH
+    import aiosqlite, time as _time
+
+    matched = 0
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """SELECT * FROM nova_action_ledger
+                   WHERE status NOT IN ('completed', 'cancelled')
+                   ORDER BY updated_at DESC LIMIT 10"""
+            )
+            for row in rows:
+                r = dict(row)
+                ag = (r.get("active_goal") or r.get("intent") or "").lower()
+                if not goal_fragment or goal_fragment.lower() in ag:
+                    await db.execute(
+                        "UPDATE nova_action_ledger SET status='completed', updated_at=? WHERE action_id=?",
+                        (_time.time(), r["action_id"]),
+                    )
+                    matched += 1
+            await db.commit()
+    except Exception as e:
+        logger.error(f"complete_active_goal failed: {e}")
+        return f"Could not mark goal complete: {e}"
+
+    if matched:
+        return f"Marked {matched} active goal(s) as completed."
+    return "No matching active goals found."
+
+
+SET_ACTIVE_GOAL_TOOL = {
     "type": "function",
     "function": {
-        "name": "search_framework_catalog",
+        "name": "set_active_goal",
         "description": (
-            "Search or browse the LIAM Framework Database catalog, including both framework "
-            "entries and LIAM dimensions. Use this for inventory, admin, author/source, and "
-            "existence questions such as 'is Nassim Taleb included?', "
-            "'which Daniel Kahneman frameworks do we have?', 'list heuristics', or "
-            "'show frameworks from Thinking, Fast and Slow'. This is NOT the problem-ranking "
-            "tool; use query_frameworks only when selecting frameworks for a decision or problem."
+            "Record a multi-session goal or ongoing task so Nova remembers it across "
+            "separate conversations. Call this when the user starts a project that will "
+            "span multiple sessions (e.g. 'let's work on my managerial overreach article'). "
+            "The goal and its workspace_page_id anchor will appear in the system prompt of every future session."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {
+                "goal": {
                     "type": "string",
-                    "description": "Free-text catalog search across id, name/label, source/scientific basis, description, key concepts, dimensions, and limitations."
+                    "description": "Plain-language description of the active work, e.g. 'Writing article on managerial overreach and lack of physician input'",
                 },
-                "author": {
+                "intent": {
                     "type": "string",
-                    "description": "Author/source-name filter, e.g. 'Taleb', 'Kahneman', 'Nassim Nicholas Taleb', or 'Daniel Kahneman'."
+                    "description": "Short intent tag, e.g. 'article_writing', 'case_study', 'project_planning'",
                 },
-                "source": {
+                "workspace_page_id": {
                     "type": "string",
-                    "description": "Source/work filter, e.g. 'Incerto', 'Thinking, Fast and Slow', 'Model Thinker'."
+                    "description": "The page_id of the workspace page that anchors this work. Always create or find the page first, then pass its ID here.",
                 },
-                "category": {
-                    "type": "string",
-                    "description": "Optional framework category filter."
-                },
-                "dimension": {
-                    "type": "string",
-                    "description": "Optional LIAM dimension id filter, e.g. 'metacognition' or 'financial'."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of frameworks to return.",
-                    "default": 20
-                }
             },
-            "required": []
-        }
-    }
+            "required": ["goal"],
+        },
+    },
 }
 
-TOOL_DEFINITIONS.append(SEARCH_FRAMEWORK_CATALOG_TOOL)
-TOOL_HANDLERS["search_framework_catalog"] = handle_search_framework_catalog
+COMPLETE_ACTIVE_GOAL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "complete_active_goal",
+        "description": "Mark an active multi-session goal as completed so it stops appearing in future session context.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal_fragment": {
+                    "type": "string",
+                    "description": "A word or phrase from the goal to match (leave empty to complete all active goals)",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+TOOL_DEFINITIONS.append(SET_ACTIVE_GOAL_TOOL)
+TOOL_DEFINITIONS.append(COMPLETE_ACTIVE_GOAL_TOOL)
+TOOL_HANDLERS["set_active_goal"] = handle_set_active_goal
+TOOL_HANDLERS["complete_active_goal"] = handle_complete_active_goal
+
+
+# ---------------------------------------------------------------------------
+# Self-introspection — what does Nova know about her own present state?
+# ---------------------------------------------------------------------------
+
+async def handle_query_self_state(**kwargs) -> str:
+    """Return Nova's self-context: dream insights, active goals, favorites,
+    recent session topics. Backed by the Nova Context Layer (NCL).
+
+    Call this whenever the user asks about Nova's own state, dreams, memory,
+    learning, or what she knows about herself — instead of denying capability.
+    """
+    user_id = str(kwargs.get("_internal_user_id") or kwargs.get("user_id") or "")
+    try:
+        from nova.context_layer import self_state
+        state = await self_state(user_id)
+    except Exception as e:
+        return f"Self-state lookup failed: {e}"
+
+    lines: list[str] = []
+    if state.get("dreamed_last_night"):
+        lines.append("Yes, I dreamed within the last 36 hours.")
+    else:
+        lines.append("No dream cycle has run in the last 36 hours.")
+
+    dreams = state.get("dream_insights") or []
+    if dreams:
+        lines.append(f"Latest dream insights ({len(dreams)}):")
+        for d in dreams[:5]:
+            date = d.get("date", "")
+            text = d.get("text", "")
+            cat = d.get("category", "behavior")
+            lines.append(f"- [{date} · {cat}] {text[:240]}")
+
+    goals = state.get("active_goals") or []
+    if goals:
+        lines.append(f"Active goals ({len(goals)}):")
+        for g in goals[:4]:
+            g_text = (g.get("active_goal") or g.get("intent") or "").strip()
+            page = g.get("workspace_page_id", "")
+            anchor = f" (page {page})" if page else ""
+            if g_text:
+                lines.append(f"- {g_text}{anchor}")
+
+    favs = state.get("favorites") or []
+    if favs:
+        lines.append(f"Favorites on record ({len(favs)}):")
+        for f in favs[:6]:
+            lines.append(f"- {f.get('label', '?')}: {str(f.get('value', ''))[:120]}")
+
+    topics = state.get("recent_session_topics") or []
+    if topics:
+        lines.append("Recent session topics: " + ", ".join(topics[:6]))
+
+    return "\n".join(lines) if lines else "I have no current self-state to report."
+
+
+QUERY_SELF_STATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "query_self_state",
+        "description": (
+            "Return Nova's own state: did she dream recently, what insights "
+            "did the dream cycle produce, what active multi-session goals exist, "
+            "what favorites are on record, what topics did recent sessions cover. "
+            "Call this BEFORE denying introspection ('I don't dream', 'I don't remember', "
+            "'we're starting fresh'). Use it when the user asks about Nova's memory, "
+            "dreams, learning, or what she knows about her own state."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+}
+
+TOOL_DEFINITIONS.append(QUERY_SELF_STATE_TOOL)
+TOOL_HANDLERS["query_self_state"] = handle_query_self_state
+
+
+# ---------------------------------------------------------------------------
+# Task Planner — cross-session work continuity with full session history
+# ---------------------------------------------------------------------------
+
+import datetime as _datetime
+
+
+def _ts(ts: float) -> str:
+    """Format a Unix timestamp as a readable date."""
+    try:
+        return _datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+async def handle_manage_task_plan(
+    action: str,
+    plan_id: str = "",
+    topic: str = "",
+    description: str = "",
+    summary: str = "",
+    content: str = "",
+    sources: list | None = None,
+    next_steps: list | None = None,
+    step_title: str = "",
+    step_id: str = "",
+    step_status: str = "",
+    step_notes: str = "",
+    step_order: int = 0,
+    workspace_page_id: str = "",
+    **kwargs,
+) -> str:
+    from nova.task_plan import (
+        create_plan, get_plan, list_plans, add_session_entry,
+        add_step, update_step, complete_plan, set_workspace_page,
+    )
+
+    user_id = _current_user_id or "default"
+    conv_id = _current_conversation_id or ""
+
+    # ── create ──────────────────────────────────────────────────────────────
+    if action == "create":
+        if not topic:
+            return "topic is required to create a plan."
+        # Dedup: return existing active plan with same topic to prevent duplicates on retry
+        existing_plans = await list_plans(user_id=user_id, status="active")
+        topic_lower = topic.strip().lower()
+        for ep in existing_plans:
+            if ep.get("topic", "").strip().lower() == topic_lower:
+                pid = ep["plan_id"]
+                logger.info(f"Task plan already exists for topic {topic!r}: plan_id={pid}")
+                return (
+                    f"✅ Task plan already exists: \"{topic}\"\n"
+                    f"plan_id: {pid}\n"
+                    f"Use this existing plan_id for all subsequent actions. Do NOT create another plan."
+                )
+        plan = await create_plan(topic, description=description, user_id=user_id, workspace_page_id=workspace_page_id)
+        pid = plan["plan_id"]
+        logger.info(f"Task plan created: {topic!r} plan_id={pid}")
+        return (
+            f"✅ Task plan created: \"{topic}\"\n"
+            f"plan_id: {pid}\n"
+            f"Use add_session at the end of each session. Use add_step to define your checklist.\n"
+            f"Tip: after creating a workspace page for this work, call manage_task_plan action=link_page to anchor it."
+        )
+
+    # ── get ─────────────────────────────────────────────────────────────────
+    elif action == "get":
+        if not plan_id:
+            return "plan_id is required for get."
+        plan = await get_plan(plan_id)
+        if not plan:
+            return f"No plan found with plan_id={plan_id}."
+        lines = [
+            f"📋 Plan: {plan['topic']}",
+            f"Status: {plan['status']} | Created: {_ts(plan['created_at'])} | Last updated: {_ts(plan['updated_at'])}",
+        ]
+        if plan.get("description"):
+            lines.append(f"Goal: {plan['description']}")
+        if plan.get("workspace_page_id"):
+            lines.append(f"Workspace page_id: {plan['workspace_page_id']}")
+
+        steps = plan.get("steps", [])
+        if steps:
+            lines.append("\nSteps:")
+            icons = {"pending": "☐", "in_progress": "🔄", "done": "✅", "skipped": "⏭"}
+            for s in steps:
+                icon = icons.get(s.get("status", "pending"), "☐")
+                note = f" — {s['notes']}" if s.get("notes") else ""
+                lines.append(f"  {icon} [{s['step_id'][:8]}] {s['title']}{note}")
+
+        sessions = plan.get("sessions", [])
+        if sessions:
+            lines.append(f"\nSession history ({len(sessions)} entries, most recent first):")
+            for s in sessions[:5]:
+                lines.append(f"  • [{_ts(s['timestamp'])}] conv={s.get('conversation_id','')[:12]} — {s.get('summary','(no summary)')[:120]}")
+                if s.get("sources"):
+                    lines.append(f"    Sources: {', '.join(str(x) for x in s['sources'][:4])}")
+                if s.get("next_steps"):
+                    lines.append(f"    Next: {', '.join(str(x) for x in s['next_steps'][:3])}")
+        else:
+            lines.append("\nNo session entries yet. Call add_session at end of each work session.")
+        return "\n".join(lines)
+
+    # ── list ─────────────────────────────────────────────────────────────────
+    elif action == "list":
+        status_filter = kwargs.get("status", "active")
+        plans = await list_plans(user_id=user_id, status=status_filter)
+        if not plans:
+            return f"No {status_filter} task plans found."
+        lines = [f"📋 {len(plans)} {status_filter} plan(s):"]
+        for p in plans:
+            page_note = f" | page: {p['workspace_page_id'][:8]}..." if p.get("workspace_page_id") else ""
+            lines.append(f"  • [{p['plan_id'][:8]}] {p['topic']}{page_note} (updated {_ts(p['updated_at'])})")
+        return "\n".join(lines)
+
+    # ── add_session ───────────────────────────────────────────────────────────
+    elif action == "add_session":
+        if not plan_id:
+            return "plan_id is required for add_session."
+        if not summary:
+            return "summary is required — describe what was accomplished this session."
+        entry = await add_session_entry(
+            plan_id,
+            conversation_id=conv_id,
+            summary=summary,
+            content=content,
+            sources=sources or [],
+            next_steps=next_steps or [],
+        )
+        logger.info(f"Task plan session logged: plan_id={plan_id} conv={conv_id}")
+        return (
+            f"✅ Session logged for plan {plan_id[:8]}...\n"
+            f"Summary: {summary}\n"
+            f"Next steps: {next_steps or '(none recorded)'}"
+        )
+
+    # ── add_step ──────────────────────────────────────────────────────────────
+    elif action == "add_step":
+        if not plan_id or not step_title:
+            return "plan_id and step_title are required for add_step."
+        step = await add_step(plan_id, step_title, order_num=step_order, notes=step_notes)
+        return f"✅ Step added: \"{step_title}\" [{step['step_id'][:8]}] status=pending"
+
+    # ── update_step ────────────────────────────────────────────────────────────
+    elif action == "update_step":
+        if not step_id or not step_status:
+            return "step_id and step_status are required for update_step."
+        valid = {"pending", "in_progress", "done", "skipped"}
+        if step_status not in valid:
+            return f"Invalid step_status. Must be one of: {', '.join(sorted(valid))}"
+        await update_step(step_id, step_status, notes=step_notes)
+        return f"✅ Step {step_id[:8]} marked as {step_status}."
+
+    # ── link_page ─────────────────────────────────────────────────────────────
+    elif action == "link_page":
+        if not plan_id or not workspace_page_id:
+            return "plan_id and workspace_page_id are required for link_page."
+        await set_workspace_page(plan_id, workspace_page_id)
+        return f"✅ Plan {plan_id[:8]} linked to workspace page {workspace_page_id}."
+
+    # ── complete ──────────────────────────────────────────────────────────────
+    elif action == "complete":
+        if not plan_id:
+            return "plan_id is required for complete."
+        await complete_plan(plan_id)
+        return f"✅ Plan {plan_id[:8]} marked as completed."
+
+    else:
+        return (
+            "Unknown action. Available: create, get, list, add_session, "
+            "add_step, update_step, link_page, complete"
+        )
+
+
+TOOL_HANDLERS["manage_task_plan"] = handle_manage_task_plan

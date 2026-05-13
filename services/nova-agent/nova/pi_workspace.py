@@ -33,7 +33,11 @@ async def _ws_get(path: str, params: dict | None = None) -> dict | list | None:
     async with aiohttp.ClientSession(timeout=_timeout) as s:
         async with s.get(f"{PI_WORKSPACE_URL}{path}", params=params, headers=_headers()) as r:
             if r.status == 200:
-                return await r.json()
+                data = await r.json()
+                if isinstance(data, dict) and data.get("error"):
+                    logger.warning(f"Workspace GET {path} returned 200 with error body: {data.get('error')}")
+                    return None
+                return data
             text = await r.text()
             logger.warning(f"Workspace GET {path} failed: {r.status} {text[:200]}")
             return None
@@ -92,17 +96,42 @@ def _plain_title(title_field: Any) -> str:
 # Pages (Notes)
 # ---------------------------------------------------------------------------
 
-async def create_page(title: str, parent_id: str = "", icon: str = "") -> dict:
+async def create_page(
+    title: str,
+    parent_id: str = "",
+    icon: str = "",
+    properties: dict | None = None,
+    ai_context: dict | None = None,
+    template_id: str = "",
+    created_by: str = "",
+) -> dict:
     ws_id = await _get_workspace_id()
     body: dict = {"title": title}
     if parent_id:
         body["parentId"] = parent_id
     if icon:
         body["icon"] = {"type": "emoji", "emoji": icon}
+    if properties:
+        body["properties"] = properties
+    if ai_context:
+        body["aiContext"] = ai_context
+    if template_id:
+        body["templateId"] = template_id
+    if created_by:
+        body["createdBy"] = created_by
     return await _ws_post(f"/api/workspaces/{ws_id}/pages", body) or {}
 
 
-async def create_page_with_blocks(title: str, blocks: list[dict], icon: str = "", parent_id: str = "") -> dict:
+async def create_page_with_blocks(
+    title: str,
+    blocks: list[dict],
+    icon: str = "",
+    parent_id: str = "",
+    properties: dict | None = None,
+    ai_context: dict | None = None,
+    template_id: str = "",
+    created_by: str = "",
+) -> dict:
     """Create a page and populate it with multiple blocks in one call.
 
     Args:
@@ -119,7 +148,9 @@ async def create_page_with_blocks(title: str, blocks: list[dict], icon: str = ""
     Returns:
         Created page dict with block_ids list
     """
-    page = await create_page(title, parent_id=parent_id, icon=icon)
+    page = await create_page(title, parent_id=parent_id, icon=icon,
+                             properties=properties, ai_context=ai_context,
+                             template_id=template_id, created_by=created_by)
     if not page or "id" not in page:
         return {}
     page_id = page["id"]

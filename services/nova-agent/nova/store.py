@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, asdict
 from typing import Optional
 from loguru import logger
@@ -129,7 +130,7 @@ def _canonical_search_content(content: str) -> str:
     return (content or "").strip()
 
 
-def _format_search_content(role: str, content: str, max_chars: int = 150) -> str:
+def _format_search_content(role: str, content: str, max_chars: int = 500) -> str:
     cleaned = _canonical_search_content(content)
     if role == "system" or not cleaned or _is_search_meta_content(cleaned):
         return ""
@@ -247,6 +248,89 @@ async def init_db(path: str = DB_PATH):
             ON turn_policy_observations(deterministic_intent, timestamp DESC)
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS turn_evidence_envelopes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                intent TEXT NOT NULL,
+                claim_type TEXT NOT NULL,
+                query TEXT NOT NULL,
+                tools_used TEXT NOT NULL,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                evidence_preview TEXT,
+                confidence TEXT,
+                no_evidence INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT,
+                user_id TEXT,
+                conversation_id TEXT,
+                session_id TEXT,
+                envelope_json TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_evidence_timestamp
+            ON turn_evidence_envelopes(timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_evidence_intent
+            ON turn_evidence_envelopes(intent, timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS nova_action_ledger (
+                action_id TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                expires_at REAL NOT NULL DEFAULT 0,
+                user_id TEXT,
+                conversation_id TEXT,
+                session_id TEXT,
+                parent_turn_id TEXT,
+                intent TEXT NOT NULL,
+                status TEXT NOT NULL,
+                active_goal TEXT,
+                target_json TEXT NOT NULL,
+                required_tools_json TEXT NOT NULL,
+                required_evidence_json TEXT NOT NULL,
+                tool_attempts_json TEXT NOT NULL,
+                last_tool_result_json TEXT NOT NULL,
+                last_error TEXT,
+                evidence_status TEXT NOT NULL,
+                user_visible_status TEXT,
+                metadata_json TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_nova_action_ledger_active
+            ON nova_action_ledger(user_id, session_id, status, updated_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_nova_action_ledger_conversation
+            ON nova_action_ledger(conversation_id, updated_at DESC)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grounded_recall_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                user_id TEXT NOT NULL,
+                normalized_topic TEXT NOT NULL,
+                trigger_phrases_json TEXT NOT NULL,
+                route TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                evidence_conversation_ids_json TEXT NOT NULL,
+                evidence_preview TEXT,
+                success_count INTEGER NOT NULL DEFAULT 1,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_success_at REAL,
+                confidence TEXT,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(user_id, normalized_topic, route)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_grounded_recall_patterns_user_updated
+            ON grounded_recall_patterns(user_id, updated_at DESC)
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS turn_policy_embeddings (
                 observation_id INTEGER PRIMARY KEY,
                 model TEXT NOT NULL,
@@ -309,6 +393,92 @@ async def init_db(path: str = DB_PATH):
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_learning_events_session
             ON learning_events(session_id, timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS task_artifacts (
+                task_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                session_id TEXT,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                goal TEXT,
+                source_context_json TEXT NOT NULL,
+                requirements_json TEXT NOT NULL,
+                decisions_json TEXT NOT NULL,
+                open_questions_json TEXT NOT NULL,
+                candidate_outputs_json TEXT NOT NULL,
+                selected_output_json TEXT,
+                execution_json TEXT NOT NULL,
+                qa_json TEXT NOT NULL,
+                handoff_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_artifacts_user_updated
+            ON task_artifacts(user_id, updated_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_artifacts_conversation
+            ON task_artifacts(conversation_id, updated_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_artifacts_status
+            ON task_artifacts(status, updated_at DESC)
+        """)
+        # ── Task Planner ─────────────────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS nova_task_plans (
+                plan_id TEXT PRIMARY KEY,
+                topic TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                workspace_page_id TEXT DEFAULT '',
+                user_id TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_nova_task_plans_user_status
+            ON nova_task_plans(user_id, status, updated_at DESC)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS nova_task_plan_sessions (
+                entry_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                conversation_id TEXT DEFAULT '',
+                session_id TEXT DEFAULT '',
+                timestamp REAL NOT NULL,
+                summary TEXT DEFAULT '',
+                content TEXT DEFAULT '',
+                sources_json TEXT DEFAULT '[]',
+                next_steps_json TEXT DEFAULT '[]',
+                status TEXT DEFAULT 'complete'
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_nova_task_plan_sessions_plan
+            ON nova_task_plan_sessions(plan_id, timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS nova_task_plan_steps (
+                step_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                order_num INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_nova_task_plan_steps_plan
+            ON nova_task_plan_steps(plan_id, order_num ASC)
         """)
         await db.commit()
 
@@ -413,6 +583,52 @@ async def append_turn(
         await db.commit()
 
 
+
+
+async def get_recent_active_conversation(
+    user_id: str,
+    exclude_conversation_id: str,
+    max_age_secs: int = 1800,
+    min_turns: int = 2,
+    path: str = DB_PATH,
+) -> Optional[dict]:
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id)
+    cutoff = time.time() - max_age_secs
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT
+                s.session_id,
+                s.user_id,
+                s.conversation_id,
+                s.last_active,
+                COUNT(t.id) AS turn_count
+            FROM sessions s
+            LEFT JOIN turns t ON t.session_id = s.session_id
+            WHERE s.user_id = ?
+              AND s.conversation_id != ?
+              AND s.last_active >= ?
+            GROUP BY s.session_id
+            HAVING turn_count >= ?
+            ORDER BY s.last_active DESC
+            LIMIT 1
+            """,
+            (user_id, exclude_conversation_id, cutoff, min_turns),
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "session_id": row["session_id"],
+        "user_id": row["user_id"],
+        "conversation_id": row["conversation_id"],
+        "last_active": row["last_active"],
+        "turn_count": row["turn_count"],
+    }
+
+
 async def append_turn_policy_observation(observation, path: str = DB_PATH):
     features = observation.features.to_dict()
     if not str(features.get("normalized_text") or "").strip():
@@ -490,6 +706,397 @@ async def append_turn_policy_observation(observation, path: str = DB_PATH):
     # Async generate and store embedding without blocking
     if features.get("normalized_text"):
         asyncio.create_task(_store_observation_embedding(obs_id, features["normalized_text"], path))
+
+
+async def append_turn_evidence_envelope(envelope: dict, path: str = DB_PATH) -> int:
+    payload = dict(envelope or {})
+    async with aiosqlite.connect(path) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS turn_evidence_envelopes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                intent TEXT NOT NULL,
+                claim_type TEXT NOT NULL,
+                query TEXT NOT NULL,
+                tools_used TEXT NOT NULL,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                evidence_preview TEXT,
+                confidence TEXT,
+                no_evidence INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT,
+                user_id TEXT,
+                conversation_id TEXT,
+                session_id TEXT,
+                envelope_json TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_evidence_timestamp
+            ON turn_evidence_envelopes(timestamp DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_evidence_intent
+            ON turn_evidence_envelopes(intent, timestamp DESC)
+        """)
+        cursor = await db.execute(
+            """
+            INSERT INTO turn_evidence_envelopes (
+                timestamp,
+                intent,
+                claim_type,
+                query,
+                tools_used,
+                evidence_count,
+                evidence_preview,
+                confidence,
+                no_evidence,
+                stop_reason,
+                user_id,
+                conversation_id,
+                session_id,
+                envelope_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                float(payload.get("ts") or time.time()),
+                str(payload.get("intent") or ""),
+                str(payload.get("claim_type") or ""),
+                str(payload.get("query") or ""),
+                json.dumps(payload.get("tools_used") or []),
+                int(payload.get("evidence_count") or 0),
+                str(payload.get("evidence_preview") or ""),
+                str(payload.get("confidence") or ""),
+                int(bool(payload.get("no_evidence"))),
+                str(payload.get("stop_reason") or ""),
+                str(payload.get("user_id") or ""),
+                str(payload.get("conversation_id") or ""),
+                str(payload.get("session_id") or ""),
+                json.dumps(payload),
+            ),
+        )
+        evidence_id = int(cursor.lastrowid or 0)
+        await db.commit()
+        return evidence_id
+
+
+async def get_recent_turn_evidence_envelopes(limit: int = 100, path: str = DB_PATH) -> list[dict]:
+    safe_limit = max(1, min(int(limit or 100), 500))
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM turn_evidence_envelopes ORDER BY timestamp DESC LIMIT ?",
+            (safe_limit,),
+        )
+    results = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["tools_used"] = json.loads(item.get("tools_used") or "[]")
+        except json.JSONDecodeError:
+            item["tools_used"] = []
+        try:
+            item["envelope"] = json.loads(item.get("envelope_json") or "{}")
+        except json.JSONDecodeError:
+            item["envelope"] = {}
+        results.append(item)
+    return results
+
+
+async def upsert_grounded_recall_pattern(
+    *,
+    user_id: str,
+    normalized_topic: str,
+    trigger_phrase: str,
+    route: str,
+    tool_name: str,
+    evidence_conversation_ids: Optional[list[str]] = None,
+    evidence_preview: str = "",
+    confidence: str = "medium",
+    metadata: Optional[dict] = None,
+    path: str = DB_PATH,
+) -> int:
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id or "default")
+    topic = re.sub(r"\s+", " ", (normalized_topic or "").strip().lower())
+    if not topic:
+        return 0
+    now = time.time()
+    evidence_conversation_ids = evidence_conversation_ids or []
+    metadata = metadata or {}
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grounded_recall_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                user_id TEXT NOT NULL,
+                normalized_topic TEXT NOT NULL,
+                trigger_phrases_json TEXT NOT NULL,
+                route TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                evidence_conversation_ids_json TEXT NOT NULL,
+                evidence_preview TEXT,
+                success_count INTEGER NOT NULL DEFAULT 1,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_success_at REAL,
+                confidence TEXT,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(user_id, normalized_topic, route)
+            )
+        """)
+        rows = await db.execute_fetchall(
+            "SELECT * FROM grounded_recall_patterns WHERE user_id = ? AND normalized_topic = ? AND route = ?",
+            (user_id, topic, route),
+        )
+        if rows:
+            row = rows[0]
+            try:
+                triggers = json.loads(row["trigger_phrases_json"] or "[]")
+            except json.JSONDecodeError:
+                triggers = []
+            if trigger_phrase and trigger_phrase not in triggers:
+                triggers.append(trigger_phrase)
+            try:
+                existing_ids = json.loads(row["evidence_conversation_ids_json"] or "[]")
+            except json.JSONDecodeError:
+                existing_ids = []
+            merged_ids = list(dict.fromkeys(existing_ids + evidence_conversation_ids))[:20]
+            cursor = await db.execute(
+                """
+                UPDATE grounded_recall_patterns
+                SET updated_at = ?, trigger_phrases_json = ?, evidence_conversation_ids_json = ?,
+                    evidence_preview = ?, success_count = success_count + 1, last_success_at = ?,
+                    confidence = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    json.dumps(triggers[-20:]),
+                    json.dumps(merged_ids),
+                    evidence_preview[:1000],
+                    now,
+                    confidence,
+                    json.dumps(metadata),
+                    int(row["id"]),
+                ),
+            )
+            await db.commit()
+            return int(row["id"])
+        cursor = await db.execute(
+            """
+            INSERT INTO grounded_recall_patterns (
+                created_at, updated_at, user_id, normalized_topic, trigger_phrases_json,
+                route, tool_name, evidence_conversation_ids_json, evidence_preview,
+                success_count, failure_count, last_success_at, confidence, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)
+            """,
+            (
+                now,
+                now,
+                user_id,
+                topic,
+                json.dumps([trigger_phrase] if trigger_phrase else []),
+                route,
+                tool_name,
+                json.dumps(evidence_conversation_ids),
+                evidence_preview[:1000],
+                now,
+                confidence,
+                json.dumps(metadata),
+            ),
+        )
+        pattern_id = int(cursor.lastrowid or 0)
+        await db.commit()
+        return pattern_id
+
+
+async def find_grounded_recall_patterns(
+    user_id: str,
+    query: str,
+    limit: int = 5,
+    path: str = DB_PATH,
+) -> list[dict]:
+    from nova.user_resolver import canonical_user_id
+    user_id = canonical_user_id(user_id or "default")
+    terms = [t.lower() for t in re.findall(r"[a-zA-Z0-9]+", query or "") if len(t) >= 4]
+    if not terms:
+        return []
+    safe_limit = max(1, min(int(limit or 5), 20))
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS grounded_recall_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                user_id TEXT NOT NULL,
+                normalized_topic TEXT NOT NULL,
+                trigger_phrases_json TEXT NOT NULL,
+                route TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                evidence_conversation_ids_json TEXT NOT NULL,
+                evidence_preview TEXT,
+                success_count INTEGER NOT NULL DEFAULT 1,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_success_at REAL,
+                confidence TEXT,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(user_id, normalized_topic, route)
+            )
+        """)
+        rows = await db.execute_fetchall(
+            """
+            SELECT * FROM grounded_recall_patterns
+            WHERE user_id IN (?, 'default')
+            ORDER BY updated_at DESC
+            LIMIT 100
+            """,
+            (user_id,),
+        )
+    scored = []
+    query_terms = set(terms)
+    for row in rows:
+        item = dict(row)
+        topic = str(item.get("normalized_topic") or "")
+        try:
+            triggers = json.loads(item.get("trigger_phrases_json") or "[]")
+        except json.JSONDecodeError:
+            triggers = []
+        haystack = " ".join([topic] + [str(t) for t in triggers]).lower()
+        hay_terms = set(re.findall(r"[a-zA-Z0-9]+", haystack))
+        overlap = query_terms & hay_terms
+        if not overlap:
+            continue
+        score = len(overlap) / max(1, min(len(query_terms), 12))
+        if score < 0.18:
+            continue
+        item["match_score"] = round(score, 4)
+        item["matched_terms"] = sorted(overlap)
+        try:
+            item["trigger_phrases"] = triggers
+        except Exception:
+            item["trigger_phrases"] = []
+        try:
+            item["evidence_conversation_ids"] = json.loads(item.get("evidence_conversation_ids_json") or "[]")
+        except json.JSONDecodeError:
+            item["evidence_conversation_ids"] = []
+        scored.append(item)
+    scored.sort(key=lambda x: (float(x.get("match_score") or 0), int(x.get("success_count") or 0), float(x.get("updated_at") or 0)), reverse=True)
+    return scored[:safe_limit]
+
+
+async def get_grounding_summary(limit: int = 500, path: str = DB_PATH) -> dict:
+    rows = await get_recent_turn_evidence_envelopes(limit=limit, path=path)
+    by_intent = Counter()
+    by_claim_type = Counter()
+    by_tool = Counter()
+    by_stop_reason = Counter()
+    no_evidence_count = 0
+    for row in rows:
+        by_intent[str(row.get("intent") or "")] += 1
+        by_claim_type[str(row.get("claim_type") or "")] += 1
+        by_stop_reason[str(row.get("stop_reason") or "")] += 1
+        if int(row.get("no_evidence") or 0):
+            no_evidence_count += 1
+        for tool in row.get("tools_used") or []:
+            by_tool[str(tool)] += 1
+    total = len(rows)
+    return {
+        "total": total,
+        "sample_limit": max(1, min(int(limit or 500), 500)),
+        "by_intent": dict(by_intent),
+        "by_claim_type": dict(by_claim_type),
+        "by_tool": dict(by_tool),
+        "no_evidence": {
+            "count": no_evidence_count,
+            "rate": round(no_evidence_count / total, 4) if total else 0,
+        },
+        "recent_stop_reasons": dict(by_stop_reason),
+        "read_only": True,
+        "durable": True,
+    }
+
+
+async def get_recent_no_evidence_envelopes(limit: int = 100, path: str = DB_PATH) -> list[dict]:
+    safe_limit = max(1, min(int(limit or 100), 500))
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM turn_evidence_envelopes WHERE no_evidence = 1 ORDER BY timestamp DESC LIMIT ?",
+            (safe_limit,),
+        )
+    results = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["tools_used"] = json.loads(item.get("tools_used") or "[]")
+        except json.JSONDecodeError:
+            item["tools_used"] = []
+        try:
+            item["envelope"] = json.loads(item.get("envelope_json") or "{}")
+        except json.JSONDecodeError:
+            item["envelope"] = {}
+        results.append(item)
+    return results
+
+
+async def get_grounding_risk_observations(limit: int = 100, path: str = DB_PATH) -> dict:
+    safe_limit = max(1, min(int(limit or 100), 500))
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT *
+            FROM turn_policy_observations
+            WHERE deterministic_intent = 'pass_through'
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (safe_limit * 3,),
+        )
+    risky = []
+    risk_counts = Counter()
+    risk_flags = (
+        "asks_current_data",
+        "asks_email",
+        "asks_personal_data",
+        "asks_side_effect",
+        "asks_weather",
+        "asks_workflow",
+        "asks_workspace",
+    )
+    for row in rows:
+        item = dict(row)
+        try:
+            features = json.loads(item.get("features_json") or "{}")
+        except json.JSONDecodeError:
+            features = {}
+        flags = [flag for flag in risk_flags if bool(features.get(flag))]
+        if not flags:
+            continue
+        tools_used = []
+        try:
+            tools_used = json.loads(item.get("tools_used") or "[]")
+        except json.JSONDecodeError:
+            tools_used = []
+        if tools_used:
+            continue
+        for flag in flags:
+            risk_counts[flag] += 1
+        item["features"] = features
+        item["risk_flags"] = flags
+        risky.append(item)
+        if len(risky) >= safe_limit:
+            break
+    return {
+        "risk_observations": risky,
+        "total": len(risky),
+        "risk_counts": dict(risk_counts),
+        "definition": "recent pass_through turn-policy observations with risky feature flags and no recorded tools_used",
+        "read_only": True,
+        "durable": True,
+    }
 
 
 async def append_learning_event(
@@ -601,6 +1208,228 @@ async def get_recent_learning_events(limit: int = 100, path: str = DB_PATH) -> l
         )
         return [dict(row) for row in rows]
 
+async def get_recent_turn_evidence_envelopes(limit: int = 50, path: str = DB_PATH) -> list[dict]:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM turn_evidence_envelopes ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+
+def _action_ledger_row_to_dict(row) -> dict:
+    payload = dict(row)
+    for source_key, target_key, default in (
+        ("target_json", "target", {}),
+        ("required_tools_json", "required_tools", []),
+        ("required_evidence_json", "required_evidence", []),
+        ("tool_attempts_json", "tool_attempts", []),
+        ("last_tool_result_json", "last_tool_result", {}),
+        ("metadata_json", "metadata", {}),
+    ):
+        raw_value = payload.get(source_key)
+        if isinstance(raw_value, (dict, list)):
+            payload[target_key] = raw_value
+            continue
+        try:
+            payload[target_key] = json.loads(raw_value or json.dumps(default))
+        except (TypeError, json.JSONDecodeError):
+            payload[target_key] = default
+    return payload
+
+
+async def upsert_action_ledger_entry(entry, path: str = DB_PATH) -> str:
+    payload = entry.to_dict() if hasattr(entry, "to_dict") else dict(entry)
+    now = time.time()
+    action_id = str(payload.get("action_id") or "")
+    if not action_id:
+        raise ValueError("action_id is required")
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """
+            INSERT INTO nova_action_ledger (
+                action_id, created_at, updated_at, expires_at, user_id, conversation_id, session_id,
+                parent_turn_id, intent, status, active_goal, target_json, required_tools_json,
+                required_evidence_json, tool_attempts_json, last_tool_result_json, last_error,
+                evidence_status, user_visible_status, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(action_id) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                expires_at=excluded.expires_at,
+                user_id=excluded.user_id,
+                conversation_id=excluded.conversation_id,
+                session_id=excluded.session_id,
+                parent_turn_id=excluded.parent_turn_id,
+                intent=excluded.intent,
+                status=excluded.status,
+                active_goal=excluded.active_goal,
+                target_json=excluded.target_json,
+                required_tools_json=excluded.required_tools_json,
+                required_evidence_json=excluded.required_evidence_json,
+                tool_attempts_json=excluded.tool_attempts_json,
+                last_tool_result_json=excluded.last_tool_result_json,
+                last_error=excluded.last_error,
+                evidence_status=excluded.evidence_status,
+                user_visible_status=excluded.user_visible_status,
+                metadata_json=excluded.metadata_json
+            """,
+            (
+                action_id,
+                float(payload.get("created_at") or now),
+                float(payload.get("updated_at") or now),
+                float(payload.get("expires_at") or 0),
+                str(payload.get("user_id") or ""),
+                str(payload.get("conversation_id") or ""),
+                str(payload.get("session_id") or ""),
+                str(payload.get("parent_turn_id") or ""),
+                str(payload.get("intent") or ""),
+                str(payload.get("status") or ""),
+                str(payload.get("active_goal") or ""),
+                json.dumps(payload.get("target") if "target" in payload else (payload.get("target_json") or {})),
+                json.dumps(payload.get("required_tools") or []),
+                json.dumps(payload.get("required_evidence") or []),
+                json.dumps(payload.get("tool_attempts") or []),
+                json.dumps(payload.get("last_tool_result") or {}),
+                str(payload.get("last_error") or ""),
+                str(payload.get("evidence_status") or "missing"),
+                str(payload.get("user_visible_status") or ""),
+                json.dumps(payload.get("metadata") or {}),
+            ),
+        )
+        await db.commit()
+    return action_id
+
+
+async def get_action_ledger_entry(action_id: str, path: str = DB_PATH) -> dict | None:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall("SELECT * FROM nova_action_ledger WHERE action_id = ?", (action_id,))
+    return _action_ledger_row_to_dict(rows[0]) if rows else None
+
+
+async def get_recent_action_ledger_entries(limit: int = 100, status: str = "", path: str = DB_PATH) -> list[dict]:
+    safe_limit = max(1, min(int(limit or 100), 500))
+    clauses = []
+    params: list[str | int] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            f"SELECT * FROM nova_action_ledger {where} ORDER BY updated_at DESC LIMIT ?",
+            tuple(params + [safe_limit]),
+        )
+    return [_action_ledger_row_to_dict(row) for row in rows]
+
+
+async def get_action_ledger_summary(limit: int = 500, path: str = DB_PATH) -> dict:
+    rows = await get_recent_action_ledger_entries(limit=limit, path=path)
+    by_status = Counter()
+    by_intent = Counter()
+    by_evidence_status = Counter()
+    active_statuses = {"planned", "awaiting_confirmation", "running", "tool_failed", "evidence_missing", "needs_clarification"}
+    active_count = 0
+    failed_count = 0
+    satisfied_count = 0
+    attempts_count = 0
+    for row in rows:
+        status = str(row.get("status") or "unknown")
+        evidence_status = str(row.get("evidence_status") or "unknown")
+        by_status[status] += 1
+        by_intent[str(row.get("intent") or "unknown")] += 1
+        by_evidence_status[evidence_status] += 1
+        if status in active_statuses:
+            active_count += 1
+        if status == "tool_failed" or evidence_status == "failed":
+            failed_count += 1
+        if evidence_status == "satisfied":
+            satisfied_count += 1
+        attempts_count += len(row.get("tool_attempts") or [])
+    return {
+        "total": len(rows),
+        "active": active_count,
+        "failed": failed_count,
+        "satisfied": satisfied_count,
+        "tool_attempts": attempts_count,
+        "by_status": dict(by_status),
+        "by_intent": dict(by_intent),
+        "by_evidence_status": dict(by_evidence_status),
+        "read_only": True,
+        "durable": True,
+    }
+
+
+async def get_active_action_ledger_entry(
+    *,
+    user_id: str = "",
+    session_id: str = "",
+    conversation_id: str = "",
+    path: str = DB_PATH,
+) -> dict | None:
+    active_statuses = ("planned", "awaiting_confirmation", "running", "tool_failed", "evidence_missing", "needs_clarification")
+    params = list(active_statuses)
+    clauses = [f"status IN ({','.join('?' for _ in active_statuses)})"]
+    if user_id:
+        clauses.append("user_id = ?")
+        params.append(user_id)
+    if session_id:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if conversation_id:
+        clauses.append("conversation_id = ?")
+        params.append(conversation_id)
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            f"SELECT * FROM nova_action_ledger WHERE {' AND '.join(clauses)} ORDER BY updated_at DESC LIMIT 1",
+            tuple(params),
+        )
+    return _action_ledger_row_to_dict(rows[0]) if rows else None
+
+
+async def update_action_ledger_status(
+    action_id: str,
+    status: str,
+    *,
+    evidence_status: str | None = None,
+    user_visible_status: str | None = None,
+    last_error: str | None = None,
+    path: str = DB_PATH,
+) -> bool:
+    entry = await get_action_ledger_entry(action_id, path=path)
+    if not entry:
+        return False
+    entry["status"] = status
+    entry["updated_at"] = time.time()
+    if evidence_status is not None:
+        entry["evidence_status"] = evidence_status
+    if user_visible_status is not None:
+        entry["user_visible_status"] = user_visible_status
+    if last_error is not None:
+        entry["last_error"] = last_error
+    await upsert_action_ledger_entry(entry, path=path)
+    return True
+
+
+async def append_action_ledger_evidence(action_id: str, evidence: dict, *, status: str | None = None, path: str = DB_PATH) -> bool:
+    entry = await get_action_ledger_entry(action_id, path=path)
+    if not entry:
+        return False
+    attempts = list(entry.get("tool_attempts") or [])
+    attempts.append(dict(evidence or {}))
+    entry["tool_attempts"] = attempts
+    entry["last_tool_result"] = dict(evidence or {})
+    entry["updated_at"] = time.time()
+    if status:
+        entry["status"] = status
+    if str((evidence or {}).get("status") or "").lower() in {"success", "succeeded", "completed"}:
+        entry["evidence_status"] = "satisfied"
+    await upsert_action_ledger_entry(entry, path=path)
+    return True
+
 async def _store_observation_embedding(obs_id: int, text: str, path: str):
     emb = await generate_embedding(text)
     if emb:
@@ -638,6 +1467,55 @@ async def get_successful_turn_policy_observations(limit: int = 200, path: str = 
             (limit,),
         )
         return [dict(row) for row in rows]
+
+
+async def get_turn_policy_metrics(limit: int = 500, path: str = DB_PATH) -> dict:
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT deterministic_intent, handled, outcome, tools_used, stop_reason, latency_ms
+            FROM turn_policy_observations
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    total = len(rows)
+    handled = sum(1 for row in rows if row["handled"] == 1)
+    fallback = sum(1 for row in rows if row["handled"] == 0)
+    intents: dict[str, int] = {}
+    tools: dict[str, int] = {}
+    stop_reasons: dict[str, int] = {}
+    outcomes: dict[str, int] = {}
+    latencies = []
+    for row in rows:
+        intent = row["deterministic_intent"] or "unknown"
+        intents[intent] = intents.get(intent, 0) + 1
+        outcome = row["outcome"] or "unknown"
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if row["stop_reason"]:
+            stop_reasons[row["stop_reason"]] = stop_reasons.get(row["stop_reason"], 0) + 1
+        if row["handled"] == 1 and row["latency_ms"]:
+            latencies.append(int(row["latency_ms"]))
+        try:
+            for tool in json.loads(row["tools_used"] or "[]"):
+                tools[tool] = tools.get(tool, 0) + 1
+        except json.JSONDecodeError:
+            pass
+    return {
+        "source": "sqlite_turn_policy_observations",
+        "window": limit,
+        "total_turns": total,
+        "handled_turns": handled,
+        "fallback_turns": fallback,
+        "fallback_rate": round(fallback / total, 3) if total else 0,
+        "avg_handled_latency_ms": int(sum(latencies) / len(latencies)) if latencies else 0,
+        "intents": intents,
+        "tools": tools,
+        "stop_reasons": stop_reasons,
+        "outcomes": outcomes,
+    }
 
 
 async def label_turn_policy_observation(
@@ -825,6 +1703,7 @@ async def _sync_message_to_backend(
     model: str = None,
     tokens_used: int = 0,
     tool_calls: list = None,
+    metadata: dict = None,
     _retry: int = 0,
 ):
     """Sync a message directly to PostgreSQL via asyncpg.
@@ -865,8 +1744,7 @@ async def _sync_message_to_backend(
                     importance_score, is_preserved, embedding)
                    VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::jsonb, $7, $8, $9::vector)""",
                 pg_conv_id, role, safe_content, model, tokens_used or 0,
-                json.dumps({"tool_calls": tool_calls} if tool_calls else {}),
-                importance, is_preserved, embedding_str,
+                json.dumps(metadata) if metadata else '{}', importance, is_preserved, embedding_str
             )
         else:
             await pool.execute(
@@ -875,8 +1753,7 @@ async def _sync_message_to_backend(
                     importance_score, is_preserved)
                    VALUES ($1::uuid, $2, $3, $4, $5, 0, $6::jsonb, $7, $8)""",
                 pg_conv_id, role, safe_content, model, tokens_used or 0,
-                json.dumps({"tool_calls": tool_calls} if tool_calls else {}),
-                importance, is_preserved,
+                json.dumps(metadata) if metadata else '{}', importance, is_preserved
             )
         
         # Update conversation stats
@@ -957,6 +1834,7 @@ async def search_past_conversations(
     limit: int = 5,
     from_days: int | None = None,
     to_days: int | None = None,
+    exclude_conversation_id: str = "",
 ) -> list[dict]:
     """Search past conversations: PostgreSQL vector search first, then keyword fallbacks.
     
@@ -975,12 +1853,13 @@ async def search_past_conversations(
     user_id = canonical_user_id(user_id)
     # 1. PostgreSQL vector search first (semantic — understands meaning, not just keywords)
     results = await _search_postgres_direct(user_id, query, days_back, limit,
-                                             from_days=from_days, to_days=to_days)
+                                             from_days=from_days, to_days=to_days,
+                                             exclude_conversation_id=exclude_conversation_id)
     if results:
         return results
     
     # 2. SQLite keyword search as local fallback
-    results = await _search_local_conversations(user_id, query, days_back, limit)
+    results = await _search_local_conversations(user_id, query, days_back, limit, exclude_conversation_id=exclude_conversation_id)
     
     return results
 
@@ -990,6 +1869,7 @@ async def _search_local_conversations(
     query: str,
     days_back: int,
     limit: int,
+    exclude_conversation_id: str = "",
 ) -> list[dict]:
     """Search recent conversations in local SQLite.
     
@@ -1023,6 +1903,7 @@ async def _search_local_conversations(
                 (f"s.user_id IN (?, 'default')", "user+default"),
                 ("1=1", "all_users"),
             ]:
+                exclude_filter = "AND s.conversation_id != ?" if exclude_conversation_id else ""
                 # Find matching messages directly — not grouped by conversation
                 match_rows = await db.execute_fetchall(
                     f"""SELECT t.rowid, t.role, t.content, t.timestamp,
@@ -1031,11 +1912,13 @@ async def _search_local_conversations(
                         JOIN sessions s ON t.session_id = s.session_id
                         WHERE {user_filter}
                           AND t.timestamp >= ?
+                          {exclude_filter}
                           AND ({placeholders})
                         ORDER BY t.timestamp DESC
                         LIMIT ?""",
-                    [user_id, cutoff] + params + [limit * 3] if label == "user+default"
-                    else [cutoff] + params + [limit * 3],
+                    ([user_id, cutoff] + ([exclude_conversation_id] if exclude_conversation_id else []) + params + [limit * 3])
+                    if label == "user+default"
+                    else ([cutoff] + ([exclude_conversation_id] if exclude_conversation_id else []) + params + [limit * 3]),
                 )
                 
                 if not match_rows:
@@ -1092,7 +1975,7 @@ async def _search_local_conversations(
                     results.append({
                         "conversation_id": conv_id,
                         "title": title,
-                        "snippet": "\n".join(context_parts)[:400],
+                        "snippet": "\n".join(context_parts)[:1500],
                         "date": date_str,
                         "relevance_score": 0.7,
                         "source": f"sqlite({label})",
@@ -1119,6 +2002,7 @@ async def _search_postgres_direct(
     limit: int,
     from_days: int | None = None,
     to_days: int | None = None,
+    exclude_conversation_id: str = "",
 ) -> list[dict]:
     """Search conversations in PostgreSQL via asyncpg using vector similarity.
 
@@ -1132,6 +2016,7 @@ async def _search_postgres_direct(
 
     try:
         pool = await _get_pg_pool()
+        vector_results: list[dict] = []
 
         # Include 'default' user for historical data
         user_filter = (
@@ -1145,6 +2030,10 @@ async def _search_postgres_direct(
             time_filter = f"c.created_at BETWEEN {interval_str}"
         else:
             time_filter = f"c.created_at >= NOW() - INTERVAL '{min(days_back, 365)} days'"
+        exclude_filter = (
+            "AND (c.id::text != $6 AND COALESCE(c.config->>'external_id', '') != $6)"
+            if exclude_conversation_id else ""
+        )
 
         # ── Primary: Vector similarity search via NVIDIA NIM embeddings ──
         query_embedding = await generate_embedding(query, input_type="query")
@@ -1180,12 +2069,17 @@ async def _search_postgres_direct(
                              AND m.embedding IS NOT NULL
                              AND vector_dims(m.embedding) = $4
                              AND NOT (m.content ILIKE ANY($5::text[]))
+                             {exclude_filter}
                        )
                        SELECT * FROM RankedMessages
                        WHERE rn = 1
                        ORDER BY similarity DESC
                        LIMIT $2""",
-                    user_id, limit, embedding_str, embedding_dims, _SEARCH_META_PATTERNS,
+                    *((
+                        user_id, limit, embedding_str, embedding_dims, _SEARCH_META_PATTERNS, exclude_conversation_id,
+                    ) if exclude_conversation_id else (
+                        user_id, limit, embedding_str, embedding_dims, _SEARCH_META_PATTERNS,
+                    )),
                 )
 
                 if rows:
@@ -1222,9 +2116,9 @@ async def _search_postgres_direct(
                                 if formatted:
                                     parts.append(formatted)
                             if parts:
-                                snippet = "\n".join(parts)[:400]
+                                snippet = "\n".join(parts)[:1500]
                         if not snippet:
-                            snippet = _format_search_content(r["role"], initial_snippet, 300)
+                            snippet = _format_search_content(r["role"], initial_snippet, 800)
 
                         results.append({
                             "conversation_id": str(r["conversation_id"]),
@@ -1236,8 +2130,8 @@ async def _search_postgres_direct(
                             "source": "postgres_vector",
                         })
 
+                    vector_results = results
                     logger.info(f"Vector search found {len(results)} conversations for '{query}'")
-                    return results
 
         # ── Fallback: ILIKE keyword search ──
         terms = [t for t in query.split() if len(t) >= 2]
@@ -1246,7 +2140,11 @@ async def _search_postgres_direct(
         significant_terms = [
             t.lower()
             for t in terms
-            if len(t) >= 4 and t.lower() not in {"this", "that", "with", "from", "about"}
+            if len(t) >= 4 and t.lower() not in {
+                "this", "that", "with", "from", "about", "without", "proper",
+                "awareness", "removal", "processes", "policies", "govern",
+                "management", "conversation", "previous", "discussed",
+            }
         ]
 
         param_idx = 3  # $1=user_id, $2=limit
@@ -1258,6 +2156,12 @@ async def _search_postgres_direct(
             params.append(like_val)
             param_idx += 1
         conditions_sql = " OR ".join(conditions)
+        meta_param_idx = param_idx
+        exclude_param_idx = meta_param_idx + 1
+        keyword_exclude_filter = (
+            f"AND (c.id::text != ${exclude_param_idx} AND COALESCE(c.config->>'external_id', '') != ${exclude_param_idx})"
+            if exclude_conversation_id else ""
+        )
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -1265,6 +2169,7 @@ async def _search_postgres_direct(
                        SELECT 
                                c.id as conversation_id,
                                c.title,
+                               m.id as message_id,
                                m.role,
                                m.content as snippet,
                                c.importance_score as relevance_score,
@@ -1283,14 +2188,14 @@ async def _search_postgres_direct(
                          AND c.retention_tier != 'archived'
                          AND {time_filter}
                          AND m.role IN ('user', 'assistant')
-                         AND NOT (m.content ILIKE ANY(${param_idx}::text[]))
+                         AND NOT (m.content ILIKE ANY(${meta_param_idx}::text[]))
+                         {keyword_exclude_filter}
                          AND ({conditions_sql})
                    )
                    SELECT * FROM RankedMessages
-                   WHERE rn = 1
-                   ORDER BY relevance_score DESC, created_at DESC
-                   LIMIT $2 * 10""",
-                *params, _SEARCH_META_PATTERNS,
+                   ORDER BY created_at DESC
+                   LIMIT $2 * 200""",
+                *(params + [_SEARCH_META_PATTERNS] + ([exclude_conversation_id] if exclude_conversation_id else [])),
             )
 
             results = []
@@ -1300,10 +2205,18 @@ async def _search_postgres_direct(
                 cleaned_lower = cleaned.lower()
                 lexical_hits = sum(1 for t in terms if t.lower() in cleaned_lower)
                 significant_hits = sum(1 for t in significant_terms if t in cleaned_lower)
+                anchor_hits = sum(
+                    1 for t in significant_terms
+                    if t in cleaned_lower and t in {
+                        "exam", "table", "paper", "clinic", "clinics",
+                        "physician", "physicians", "stakeholder", "stakeholders",
+                        "overreach", "regional", "region-wide",
+                    }
+                )
                 if len(significant_terms) >= 2 and significant_hits < 2:
                     continue
                 phrase_bonus = 3 if query.lower() in cleaned_lower else 0
-                role_bonus = 2 if r["role"] == "user" else 0
+                role_bonus = 6 if r["role"] == "user" else 0
                 noise_penalty = 4 if any(term in cleaned_lower for term in (
                     "semantic search",
                     "search infrastructure",
@@ -1313,7 +2226,7 @@ async def _search_postgres_direct(
                     "isn't returning",
                     "not returning",
                 )) else 0
-                score = lexical_hits + phrase_bonus + role_bonus - noise_penalty
+                score = lexical_hits + (significant_hits * 2) + (anchor_hits * 6) + phrase_bonus + role_bonus - noise_penalty
                 if score <= 0:
                     continue
                 ranked_rows.append((score, r, cleaned))
@@ -1328,6 +2241,31 @@ async def _search_postgres_direct(
                 if conv_id in seen_conversations:
                     continue
                 snippet = _format_search_content(r["role"], cleaned, 200)
+                context_rows = await conn.fetch(
+                    """WITH target AS (
+                           SELECT created_at
+                           FROM workspace.ai_messages
+                           WHERE id = $2::uuid
+                       )
+                       SELECT m.role, m.content
+                       FROM workspace.ai_messages m, target
+                       WHERE m.conversation_id = $1::uuid
+                         AND m.role IN ('user', 'assistant')
+                         AND m.created_at BETWEEN target.created_at - INTERVAL '10 minutes'
+                                              AND target.created_at + INTERVAL '10 minutes'
+                         AND NOT (m.content ILIKE ANY($3::text[]))
+                       ORDER BY m.created_at ASC
+                       LIMIT 7""",
+                    conv_id, r["message_id"], _SEARCH_META_PATTERNS,
+                )
+                if context_rows:
+                    parts = [snippet] if snippet else []
+                    for cr in context_rows:
+                        formatted = _format_search_content(cr["role"], cr["content"])
+                        if formatted and formatted not in parts:
+                            parts.append(formatted)
+                    if parts:
+                        snippet = "\n".join(parts)[:1500]
                 if not snippet:
                     continue
                 results.append({
@@ -1345,7 +2283,27 @@ async def _search_postgres_direct(
 
             if results:
                 logger.info(f"Keyword search found {len(results)} conversations for '{query}'")
-            return results
+                merged: list[dict] = []
+                seen: set[str] = set()
+                for r in results + vector_results:
+                    conv_id = str(r.get("conversation_id") or "")
+                    if not conv_id or conv_id in seen:
+                        continue
+                    seen.add(conv_id)
+                    merged.append(r)
+                    if len(merged) >= limit:
+                        break
+                return merged
+            if vector_results:
+                query_terms = [t.lower() for t in terms if len(t) >= 4]
+                filtered_vector_results = []
+                for r in vector_results:
+                    haystack = f"{r.get('title', '')}\n{r.get('snippet', '')}".lower()
+                    hits = sum(1 for t in query_terms if t in haystack)
+                    if hits >= 2 or float(r.get("relevance_score") or 0) >= 0.82:
+                        filtered_vector_results.append(r)
+                return filtered_vector_results[:limit]
+            return []
     except Exception as e:
         logger.warning(f"Direct PG search error: {e}")
         return []
@@ -1752,6 +2710,53 @@ async def run_compaction_cycle(user_id: str = "default") -> list[dict]:
         logger.error(f"Compaction cycle error: {e}")
     
     return results
+
+
+async def get_recent_session_digest(
+    user_id: str,
+    max_conversations: int = 3,
+    exclude_conversation_id: str = "",
+    max_age_days: int = 7,
+) -> list[dict]:
+    """Return a lightweight digest of recent compacted conversations.
+
+    Reads the already-computed ``summary`` and ``topics`` fields from
+    ``workspace.ai_conversations`` — no LLM call, no vector search.
+    Intended for one-time session-start pre-loading into the system prompt.
+
+    Returns a list of dicts: {title, summary, topics, last_message_at}.
+    """
+    if not _HAS_ASYNCPG:
+        return []
+    try:
+        pool = await _get_pg_pool()
+        rows = await pool.fetch(
+            """SELECT id, title, summary, topics, last_message_at, updated_at, message_count
+               FROM workspace.ai_conversations
+               WHERE user_id = ANY($1::text[])
+                 AND ($2 = '' OR id::text != $2)
+                 AND COALESCE(last_message_at, updated_at) > NOW() - ($3 || ' days')::interval
+                 AND message_count > 0
+               ORDER BY COALESCE(last_message_at, updated_at) DESC
+               LIMIT $4""",
+            [user_id, "default"],
+            exclude_conversation_id,
+            str(max_age_days),
+            max_conversations,
+        )
+        return [
+            {
+                "title": r["title"] or "Untitled",
+                "summary": r["summary"] or "",
+                "topics": r["topics"] or [],
+                "message_count": r["message_count"] or 0,
+                "last_message_at": (r["last_message_at"] or r["updated_at"]).isoformat() if (r["last_message_at"] or r["updated_at"]) else "",
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.debug(f"get_recent_session_digest: {e}")
+        return []
 
 
 async def get_compacted_context(

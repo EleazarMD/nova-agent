@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "timestamp": 1777046703332,
+  "budgetTokens": 3000,
+  "providers": {
+    "email": {
+      "active": null,
+      "passive": [],
+      "tokens": 0,
+      "priority": 50,
+      "status": "ok"
+    },
+    "calendar": {
+      "active": null,
+      "passive": [],
+      "tokens": 0,
+      "priority": 50,
+      "status": "ok"
+    },
+    "graph": {
+      "active": null,
+      "passive": [],
+      "tokens": 0,
+      "priority": 50,
+      "status": "ok"
+    },
+    "editor": {
+      "active": null,
+      "passive": [],
+      "tokens": 0,
+      "priority": 50,
+      "status": "ok"
+    },
+    "research": {
+      "active": null,
+      "passive": [],
+      "tokens": 0,
+      "priority": 50,
+      "status": "ok"
+    }
+  },
+  "budget": {
+    "totalUsed": 0,
+    "totalDropped": 0,
+    "dropped": []
+  }
+}

@@ -11,6 +11,8 @@ import json
 import aiohttp
 from typing import Optional
 from loguru import logger
+import asyncio
+from nova.events import event_bus, Event
 
 TESLA_RELAY_URL = os.environ.get("TESLA_RELAY_URL", "http://localhost:18810")
 
@@ -38,7 +40,7 @@ async def _tesla_api(method: str, path: str, body: dict = None) -> dict:
                     detail = text
                 # Check for vehicle unavailable/asleep/offline in any format
                 if "vehicle unavailable" in detail or "vehicle is offline" in detail or "asleep" in detail:
-                    return {"error": "vehicle_unavailable", "detail": detail}
+                    return {"error": "TESLA_ASLEEP", "detail": detail}
                 return {"error": f"Tesla API error: {resp.status}"}
             return await resp.json()
 
@@ -180,7 +182,7 @@ async def _get_single_vehicle_status(vin: str) -> str:
     result = await _tesla_api("GET", f"/vehicles/{vin}/data")
     
     # If vehicle is unavailable/asleep/offline, try to wake it and retry
-    if result.get("error") == "vehicle_unavailable" or \
+    if result.get("error") == "TESLA_ASLEEP" or \
        (result.get("error") and "412" in str(result.get("error"))):
         wake_result = await _tesla_api("POST", f"/vehicles/{vin}/wake_up")
         if wake_result.get("error"):
@@ -193,7 +195,7 @@ async def _get_single_vehicle_status(vin: str) -> str:
         # Retry data fetch
         result = await _tesla_api("GET", f"/vehicles/{vin}/data")
         if result.get("error"):
-            if result.get("error") == "vehicle_unavailable":
+            if result.get("error") == "TESLA_ASLEEP":
                 return "Vehicle is still waking up. It may take 10-20 seconds to come online. Try asking again in a moment."
             return f"Vehicle woke up but couldn't get data: {result.get('error', 'unknown')}"
     elif result.get("error"):
@@ -731,7 +733,43 @@ async def handle_tesla_telemetry(
 # Unified Tesla Control Handler (Claude Skills Format)
 # ---------------------------------------------------------------------------
 
-async def handle_tesla_control(
+async def _async_wake_and_notify(user_id: str, vin: str, original_action: str):
+    logger.info(f"TESLA_WAKE_TASK | Starting async wake for VIN {vin} for action '{original_action}'")
+    max_retries = 10
+    
+    # Send the wake command first
+    wake_result = await _tesla_api("POST", f"/vehicles/{vin}/command", {"command": "wake_up"})
+    if wake_result.get("error") and wake_result["error"] != "TESLA_ASLEEP":
+        await event_bus.emit(Event(
+            type="job.failed",
+            user_id=user_id,
+            data={"summary": f"Failed to send wake command to Tesla for '{original_action}': {wake_result.get('detail', wake_result['error'])}"}
+        ))
+        return
+
+    for i in range(max_retries):
+        await asyncio.sleep(6) # 6 seconds between polls
+        status_check = await _tesla_api("GET", f"/vehicles/{vin}/vehicle_data")
+        
+        if not status_check.get("error") or (status_check.get("error") == "TESLA_ASLEEP" and "vehicle unavailable" not in status_check.get("detail", "")):
+            # Vehicle is awake or error is not "unavailable"
+            await event_bus.emit(Event(
+                type="job.completed",
+                user_id=user_id,
+                data={"summary": f"Your Tesla is now awake and ready for the '{original_action}' command."}
+            ))
+            logger.info(f"TESLA_WAKE_TASK | Successfully woke VIN {vin} for action '{original_action}'")
+            return
+            
+    # Failed to wake
+    await event_bus.emit(Event(
+        type="job.failed",
+        user_id=user_id,
+        data={"summary": f"I tried to wake the Tesla for '{original_action}' but it didn't respond after multiple attempts."}
+    ))
+    logger.warning(f"TESLA_WAKE_TASK | Failed to wake VIN {vin} for action '{original_action}' after {max_retries} retries")
+
+async def _execute_tesla_action(
     user_id: str,
     action: str,
     vehicle_identifier: Optional[str] = None,
@@ -859,3 +897,37 @@ async def handle_tesla_control(
     
     else:
         return f"Unknown Tesla action: {action}. Valid actions: vehicles, status, climate, charge, lock, trunk, wake, honk_flash, navigation, waypoints, software_update, nearby_charging, live_camera, charging_sessions, telemetry"
+
+async def handle_tesla_control(
+    user_id: str,
+    action: str,
+    vehicle_identifier: Optional[str] = None,
+    destination: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    command: Optional[str] = None,
+    value: Optional[float] = None,
+    vin: Optional[str] = None,
+) -> str:
+    """
+    Unified Tesla control handler following Claude Skills pattern.
+    """
+    result = await _execute_tesla_action(
+        user_id, action, vehicle_identifier, destination, latitude, 
+        longitude, command, value, vin
+    )
+    
+    if isinstance(result, str) and result == "TESLA_ASLEEP":
+        # Resolve VIN if not provided
+        resolved_vin = vin
+        if not resolved_vin:
+            vehicles_result = await _tesla_api("GET", "/vehicles")
+            vehicles = vehicles_result if isinstance(vehicles_result, list) else vehicles_result.get("response", [])
+            if vehicles:
+                resolved_vin = vehicles[0].get("vin")
+        
+        if resolved_vin:
+            asyncio.create_task(_async_wake_and_notify(user_id, resolved_vin, action))
+            return "The car is sleeping, I'm waking it up now and will notify you when it's ready."
+            
+    return result

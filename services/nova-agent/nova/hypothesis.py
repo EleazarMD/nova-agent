@@ -152,7 +152,7 @@ class HypothesisValidator:
         # Tool executes (called by tool handler)
         await validator.tool_started("get_weather")
         result = await get_weather({"location": "Dallas"})
-        await validator.tool_completed("get_weather", result, Citation("OpenWeatherMap", type="api"))
+        await validator.tool_completed("get_weather", result, Citation("Perplexity", type="web"))
         
         # Validate and potentially correct
         await validator.validate(
@@ -169,6 +169,7 @@ class HypothesisValidator:
         self._send_msg = send_msg_fn
         self._current_session: Optional[HypothesisSession] = None
         self._sessions: list[HypothesisSession] = []
+        self._current_turn_id: str = ""
     
     @property
     def active(self) -> bool:
@@ -179,6 +180,10 @@ class HypothesisValidator:
     def current_session(self) -> Optional[HypothesisSession]:
         return self._current_session
     
+    def set_turn_id(self, turn_id: str) -> None:
+        """Pin the current turn_id so all subsequent emissions carry it."""
+        self._current_turn_id = turn_id
+
     async def start_hypothesis(
         self,
         text: str,
@@ -215,21 +220,27 @@ class HypothesisValidator:
         # Send hypothesis to frontend ONLY if there's user-facing text
         # Skip empty hypotheses (internal reasoning, tool calls, etc.)
         if text.strip() and confidence > 0:
-            await self._send_msg({
+            msg: dict[str, Any] = {
                 "type": "hypothesis",
                 "text": text,
                 "confidence": confidence,
-            })
+            }
+            if self._current_turn_id:
+                msg["turn_id"] = self._current_turn_id
+            await self._send_msg(msg)
             logger.info(f"[Hypothesis] Started: '{text[:60]}...' (conf={confidence}, tools={tools})")
         else:
             logger.debug(f"[Hypothesis] Skipped empty hypothesis (conf={confidence}, tools={tools})")
         
         # If tools specified, send validating message
         if tools:
-            await self._send_msg({
+            validating_msg: dict[str, Any] = {
                 "type": "validating",
                 "tools": tools,
-            })
+            }
+            if self._current_turn_id:
+                validating_msg["turn_id"] = self._current_turn_id
+            await self._send_msg(validating_msg)
         return session
     
     async def tool_started(self, tool_name: str):
@@ -239,11 +250,14 @@ class HypothesisValidator:
         
         self._current_session.start_tool(tool_name)
         
-        await self._send_msg({
+        step_msg: dict[str, Any] = {
             "type": "validationStep",
             "tool": tool_name,
             "status": "running",
-        })
+        }
+        if self._current_turn_id:
+            step_msg["turn_id"] = self._current_turn_id
+        await self._send_msg(step_msg)
         
         logger.debug(f"[Hypothesis] Tool started: {tool_name}")
     
@@ -259,11 +273,18 @@ class HypothesisValidator:
         
         self._current_session.complete_tool(tool_name, result, citation)
         
-        await self._send_msg({
+        step = self._current_session.steps.get(tool_name)
+        completed_msg: dict[str, Any] = {
             "type": "validationStep",
             "tool": tool_name,
             "status": "completed",
-        })
+            "result_preview": result[:200].strip() if result else "",
+        }
+        if step and step.duration_ms is not None:
+            completed_msg["latency_ms"] = step.duration_ms
+        if self._current_turn_id:
+            completed_msg["turn_id"] = self._current_turn_id
+        await self._send_msg(completed_msg)
         
         logger.debug(f"[Hypothesis] Tool completed: {tool_name} ({len(result)} chars)")
     
@@ -274,11 +295,15 @@ class HypothesisValidator:
         
         self._current_session.fail_tool(tool_name, error)
         
-        await self._send_msg({
+        failed_msg: dict[str, Any] = {
             "type": "validationStep",
             "tool": tool_name,
             "status": "failed",
-        })
+            "result": error[:100] if error else "",
+        }
+        if self._current_turn_id:
+            failed_msg["turn_id"] = self._current_turn_id
+        await self._send_msg(failed_msg)
         
         logger.warning(f"[Hypothesis] Tool failed: {tool_name} - {error}")
     
@@ -349,6 +374,8 @@ class HypothesisValidator:
             "hypothesis": session.hypothesis_text,
             "confidence": session.confidence,
         }
+        if self._current_turn_id:
+            msg["turn_id"] = self._current_turn_id
         
         # Include text field (required by spec)
         if validated_text:

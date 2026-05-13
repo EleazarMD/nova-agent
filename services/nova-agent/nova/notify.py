@@ -33,21 +33,21 @@ def format_notification(event: Event) -> str | None:
 
     if event.type == "job.completed":
         summary = d.get("summary", "Task finished.")
-        return f"Your background task is done. {summary}"
+        return f"[SYSTEM: A background task completed. Relate this to the user naturally and apply markdown formatting to the results.]\n\n{summary}"
 
     if event.type == "job.failed":
         summary = d.get("summary", "Something went wrong.")
-        return f"A background task failed: {summary}"
+        return f"[SYSTEM: A background task failed. Inform the user.]\n\n{summary}"
 
     if event.type == "job.waiting_approval":
         desc = d.get("approval_description", "An action needs your approval.")
-        return f"I need your approval: {desc}"
+        return f"[SYSTEM: An action needs approval.] {desc}"
 
     # Generic fallback
-    return f"Notification: {event.type} — {d.get('summary', d.get('message', str(d)))}"
+    return f"[SYSTEM: Notification: {event.type}] {d.get('summary', d.get('message', str(d)))}"
 
 
-def create_event_handler(task, user_id: str):
+def create_event_handler(task, user_id: str, server_msg_fn=None):
     """Create an event handler bound to a Pipecat task.
 
     Returns an async function suitable for EventBus.subscribe_user().

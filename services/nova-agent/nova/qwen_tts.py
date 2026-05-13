@@ -12,7 +12,7 @@ from typing import Optional, Dict, List
 from loguru import logger
 
 QWEN_TTS_API = os.environ.get("QWEN_TTS_API", "http://localhost:4200")
-QWEN_TTS_GATEWAY = os.environ.get("QWEN_TTS_GATEWAY", "http://localhost:8404/api/ai-gateway/qwen-tts")
+QWEN_TTS_GATEWAY = os.environ.get("QWEN_TTS_GATEWAY", "http://localhost:8777/api/ai-gateway/qwen-tts")
 
 
 class Qwen3TTSService:

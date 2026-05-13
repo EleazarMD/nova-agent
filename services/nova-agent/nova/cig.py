@@ -349,6 +349,24 @@ async def query_action_items(days: int = 30) -> dict[str, Any]:
         return {"error": str(e)}
 
 
+async def query_priority_email_briefing(days: int = 14, limit: int = 25, profile: str = "default") -> dict[str, Any]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/emails/priority-briefing",
+                params={"days": days, "limit": limit, "profile": profile},
+                headers=_HEADERS,
+                timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                text = await resp.text()
+                return {"error": f"CIG priority briefing returned HTTP {resp.status}: {text[:100]}"}
+    except Exception as e:
+        logger.warning(f"CIG priority briefing error: {e}")
+        return {"error": str(e)}
+
+
 async def query_cig(
     user_id: str,
     domain: str = "email",
@@ -529,6 +547,33 @@ async def query_cig(
         # 10 most-recent inbox items (which would ignore the query
         # and confuse the LLM into thinking nothing matched).
         q = (query or "").strip()
+        if q.lower() in (
+            "briefing", "priority", "important", "important emails", "email briefing",
+            "urgent", "urgent emails", "urgent messages", "action required"
+        ):
+            data = await query_priority_email_briefing(
+                days=kwargs.get("days", 14),
+                limit=kwargs.get("limit", 25),
+                profile=kwargs.get("profile", "default"),
+            )
+            if "error" in data:
+                return f"Priority email briefing unavailable: {data['error']}"
+            buckets = data.get("buckets") or {}
+            items = data.get("items") or []
+            if not items:
+                return "No priority email briefing items found."
+            lines = [f"Priority email briefing ({len(items)} items, {data.get('days', 14)}d):"]
+            for bucket, rows in buckets.items():
+                lines.append(f"{bucket.replace('_', ' ').title()}:")
+                for e in rows[:8]:
+                    reason = ", ".join(str(r) for r in (e.get("briefing_reasons") or [])[:3])
+                    line = f"  - [{e.get('briefing_priority', '?')}] {_format_email_line(e)}"
+                    if e.get("program"):
+                        line += f" — program: {e.get('program')}"
+                    if reason:
+                        line += f" ({reason})"
+                    lines.append(line)
+            return "\n".join(lines)
         if q:
             data = await search_cig_kg(user_id, q, limit=kwargs.get("limit", 10))
             if "error" in data:
@@ -676,12 +721,40 @@ async def query_cig(
         results = data.get("results", data.get("entities", []))
         if not results:
             return f"No CIG knowledge graph results for '{query}'."
-        lines = [f"CIG knowledge graph results for '{query}':"]
+        # search_cig_kg actually calls /v1/search/emails which returns EMAIL
+        # records (subject/snippet/sender_email/sent_date/...), NOT generic
+        # entity nodes. Render emails properly; fall back to entity-shape if
+        # the row lacks email fields (true KG node).
+        lines = [f"CIG search results for '{query}':"]
         for r in results[:10]:
-            name = r.get("name", "Unknown")
-            etype = r.get("type", r.get("entity_type", "entity"))
-            context = r.get("context", r.get("description", ""))[:100]
-            lines.append(f"  - {name} ({etype}) — {context}")
+            # Email record detection — has sender + (subject or snippet/body_preview)
+            sender = r.get("sender_email") or r.get("sender_name") or ""
+            subject = (r.get("subject") or "").strip()
+            snippet = (r.get("snippet") or r.get("body_preview") or "").strip()
+            sent_date = (r.get("sent_date") or r.get("date") or "")[:16]
+            msg_id = r.get("message_id") or r.get("id") or ""
+            if sender or subject or snippet:
+                # Marketing/receipt emails often have blank subjects — fall back
+                # to the first informative line of the snippet so the LLM has
+                # something to anchor on (this is why "Wingstop Order Confirmation"
+                # was previously rendered as just "Unknown (entity) — ").
+                display = subject or snippet.split("\n", 1)[0][:80] or "(no subject)"
+                line = f"  - {display}"
+                if sender:
+                    line += f" — from {sender}"
+                if sent_date:
+                    line += f" ({sent_date})"
+                if msg_id:
+                    line += f"\n    id: {msg_id}"
+                if snippet and snippet[:80] != display:
+                    line += f"\n    {snippet[:140]}"
+                lines.append(line)
+            else:
+                # True knowledge-graph entity fallback (original behaviour)
+                name = r.get("name", "Unknown")
+                etype = r.get("type", r.get("entity_type", "entity"))
+                context = (r.get("context") or r.get("description") or "")[:100]
+                lines.append(f"  - {name} ({etype}) — {context}")
         return "\n".join(lines)
 
     elif domain in ("briefing", "briefings"):
@@ -689,6 +762,8 @@ async def query_cig(
         # (morning | evening | heartbeat | meeting-prep | urgency-scan).
         briefing_type = (query or "").strip() or None
         data = await get_latest_briefing(briefing_type)
+        if briefing_type in {"morning", "evening", "urgency-scan"} and not data.get("briefing"):
+            data = await get_latest_briefing(f"comms-sweep-{briefing_type}")
         if "error" in data:
             return f"Briefing unavailable: {data['error']}"
         b = data.get("briefing")
@@ -702,8 +777,410 @@ async def query_cig(
         )
         return header + "\n\n" + (b.get("content") or "").strip()
 
+    # ------------------------------------------------------------------
+    # 5th-order / convergence — strategic alerts + morning brief
+    # ------------------------------------------------------------------
+    if domain in ("alerts", "strategic-alerts", "strategic_alerts"):
+        data = await query_strategic_alerts(
+            severity=kwargs.get("severity"),
+            alert_type=kwargs.get("alert_type"),
+            limit=kwargs.get("limit", 20),
+        )
+        if "error" in data:
+            return f"Strategic alerts unavailable: {data['error']}"
+        alerts = data.get("alerts", [])
+        if not alerts:
+            return "No active strategic alerts."
+        lines = [f"Active strategic alerts ({len(alerts)}):"]
+        for a in alerts[:20]:
+            sev = (a.get("severity") or "?").upper()
+            lines.append(f"  [{sev}] {a.get('title','')}")
+            body = (a.get("body") or "").strip()
+            if body:
+                lines.append(f"        {body[:200]}")
+        return "\n".join(lines)
+
+    if domain in ("morning-brief", "morning_brief", "brief"):
+        data = await query_morning_brief(days_ahead=kwargs.get("days_ahead", 1))
+        if "error" in data:
+            return f"Morning brief unavailable: {data['error']}"
+        s = data.get("summary", {})
+        lines = [
+            "Morning brief:",
+            f"  Events: {s.get('event_count',0)} ({s.get('prep_needed',0)} need prep)",
+            f"  Strategic alerts: {s.get('alert_count',0)} ({s.get('high_alerts',0)} high)",
+            f"  Open commitments: {s.get('open_commitment_count',0)}",
+            f"  Trending topics: {s.get('trending_topic_count',0)}",
+            f"  Cooling VIPs: {s.get('cooling_vip_count',0)}",
+            f"  Urgent unread emails: {s.get('urgent_email_count',0)}",
+        ]
+        for a in (data.get("active_alerts") or [])[:5]:
+            lines.append(f"  ! [{(a.get('severity') or '?').upper()}] {a.get('title','')}")
+        for ev in (data.get("today_events") or [])[:5]:
+            prep = " (prep needed)" if ev.get("preparation_needed") else ""
+            lines.append(f"  · {ev.get('start_time','')[:16]} — {ev.get('title','')}{prep}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # 4th-order — network topology
+    # ------------------------------------------------------------------
+    if domain in ("topology", "network-topology"):
+        sub = (query or "centrality").lower().strip()
+        if sub == "bridges":
+            data = await query_topology_bridges(limit=kwargs.get("limit", 20))
+            if "error" in data:
+                return f"Topology bridges unavailable: {data['error']}"
+            bridges = data.get("bridges", [])
+            if not bridges:
+                return "No bridge nodes detected (network may not yet have GDS topology computed)."
+            lines = [f"Network bridge nodes ({len(bridges)}) — losing them would partition your network:"]
+            for b in bridges[:20]:
+                vip = "★ " if b.get("is_vip") else ""
+                trend = b.get("health_trend", "stable")
+                trend_glyph = {"declining": "↓", "warming": "↑"}.get(trend, "·")
+                lines.append(
+                    f"  {vip}{b.get('name') or b.get('email','?')} "
+                    f"(centrality {b.get('network_centrality',0):.3f}, "
+                    f"cluster {b.get('cluster_id','?')}, health {b.get('health_score',0)} {trend_glyph})"
+                )
+            return "\n".join(lines)
+        if sub == "clusters":
+            data = await query_topology_clusters(
+                limit=kwargs.get("limit", 10),
+                sample_size=kwargs.get("sample_size", 5),
+            )
+            if "error" in data:
+                return f"Topology clusters unavailable: {data['error']}"
+            clusters = data.get("clusters", [])
+            if not clusters:
+                return "No clusters found — network topology may not yet be computed."
+            lines = [f"Network clusters ({len(clusters)}):"]
+            for c in clusters[:10]:
+                lines.append(f"  Cluster {c.get('cluster_id')} — {c.get('size',0)} members")
+                for m in c.get("sample_members", [])[:5]:
+                    flag = "★" if m.get("is_vip") else ("⚡" if m.get("is_bridge") else " ")
+                    lines.append(f"    {flag} {m.get('name') or m.get('email','?')} (c={m.get('centrality',0):.3f})")
+            return "\n".join(lines)
+        if sub.startswith("cluster:") or sub.startswith("cluster "):
+            try:
+                cid = int(sub.split(":")[-1].split()[-1])
+            except ValueError:
+                return "Cluster id must be an integer, e.g. query='cluster:7'."
+            data = await query_topology_cluster_members(cid, limit=kwargs.get("limit", 50))
+            if "error" in data:
+                return f"Cluster {cid} unavailable: {data['error']}"
+            members = data.get("members", [])
+            lines = [f"Cluster {cid} — {len(members)} members (ordered by centrality):"]
+            for m in members[:30]:
+                vip = "★ " if m.get("is_vip") else ""
+                bridge = "⚡" if m.get("is_bridge") else ""
+                lines.append(f"  {vip}{bridge}{m.get('name') or m.get('email','?')} (c={m.get('network_centrality',0):.3f}, health {m.get('health_score',0)})")
+            return "\n".join(lines)
+        # Default: centrality
+        data = await query_topology_centrality(
+            limit=kwargs.get("limit", 20),
+            min_score=kwargs.get("min_score", 0.0),
+        )
+        if "error" in data:
+            return f"Topology centrality unavailable: {data['error']}"
+        people = data.get("people", [])
+        if not people:
+            return "No centrality data — run POST /v1/intelligence/topology/compute first."
+        lines = [f"Most central people in your network ({len(people)}):"]
+        for p in people[:20]:
+            vip = "★ " if p.get("is_vip") else ""
+            bridge = "⚡ " if p.get("is_bridge") else ""
+            lines.append(
+                f"  {vip}{bridge}{p.get('name') or p.get('email','?')} — "
+                f"centrality {p.get('network_centrality',0):.3f}, "
+                f"cluster {p.get('cluster_id','?')}, health {p.get('health_score',0)}"
+            )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # META — derivations status (which layers are populated)
+    # ------------------------------------------------------------------
+    if domain in ("status", "derivations", "derivations-status"):
+        data = await query_derivations_status()
+        if "error" in data:
+            return f"Derivations status unavailable: {data['error']}"
+        p1 = data.get("phase_1_3rd_order", {})
+        p2 = data.get("phase_2_4th_order", {})
+        p3 = data.get("phase_3_5th_order", {})
+        hs = p1.get("health_score", {})
+        nt = p2.get("network_topology", {})
+        sa = p2.get("sentiment_arcs", {})
+        eo = p2.get("event_outcomes", {})
+        al = p3.get("strategic_alerts", {})
+        lines = [
+            "CIG derivations status:",
+            f"  Persons: {data.get('people', {}).get('total', 0)} total, "
+            f"{data.get('people', {}).get('vips', 0)} VIPs",
+            "  Phase 1 (3rd-order):",
+            f"    health_score:    {hs.get('covered',0)}/{hs.get('total',0)}",
+            f"    commitments:     {p1.get('commitments', {}).get('open',0)} open / {p1.get('commitments', {}).get('total',0)} total",
+            f"    topic_trends:    {p1.get('topic_trends', {}).get('total',0)} (latest: {p1.get('topic_trends', {}).get('latest_period','?')})",
+            f"    thread_summaries:{p1.get('thread_summaries', {}).get('total',0)}",
+            "  Phase 2 (4th-order):",
+            f"    topology:        {nt.get('with_centrality',0)}/{nt.get('total_persons',0)} centrality, {nt.get('bridge_nodes',0)} bridges",
+            f"    sentiment_arcs:  {sa.get('covered',0)}/{sa.get('total_edges',0)} edges",
+            f"    event_outcomes:  {eo.get('outcome_count',0)} (latest: {eo.get('latest_outcome','?')})",
+            "  Phase 3 (5th-order):",
+            f"    strategic_alerts:{al.get('active',0)} active, {al.get('dismissed',0)} dismissed, {al.get('expired',0)} expired",
+        ]
+        return "\n".join(lines)
+
     else:
         return (
             f"Unknown CIG domain '{domain}'. "
-            "Use: email, calendar, contacts, search, briefing."
+            "Use: email, calendar, contacts, search, briefing, "
+            "alerts, morning-brief, topology, status."
         )
+
+
+# ============================================================================
+# Derivative-order intelligence wrappers (Phase 1-3)
+# See skill: cig-intelligence/SKILL.md for endpoint semantics.
+# ============================================================================
+
+async def query_strategic_alerts(
+    severity: Optional[str] = None,
+    alert_type: Optional[str] = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """GET /v1/intelligence/alerts — active strategic alerts (P3.1)."""
+    params: dict[str, Any] = {"limit": limit}
+    if severity:
+        params["severity"] = severity
+    if alert_type:
+        params["alert_type"] = alert_type
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/alerts",
+                params=params, headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}", "alerts": []}
+    except Exception as e:
+        logger.warning(f"CIG strategic alerts error: {e}")
+        return {"error": str(e), "alerts": []}
+
+
+async def dismiss_strategic_alert(alert_id: str) -> dict[str, Any]:
+    """POST /v1/intelligence/alerts/{id}/dismiss."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{CIG_URL}/v1/intelligence/alerts/{alert_id}/dismiss",
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def query_morning_brief(days_ahead: int = 1) -> dict[str, Any]:
+    """GET /v1/intelligence/morning-brief — pre-computed graph brief (P3.2).
+    Single sub-second call returning events, alerts, commitments, trends,
+    cooling VIPs, urgent unread emails."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/morning-brief",
+                params={"days_ahead": days_ahead},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        logger.warning(f"CIG morning brief error: {e}")
+        return {"error": str(e)}
+
+
+async def query_topology_centrality(
+    limit: int = 20, min_score: float = 0.0,
+) -> dict[str, Any]:
+    """GET /v1/intelligence/topology/centrality — top by PageRank (P2.1)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/topology/centrality",
+                params={"limit": limit, "min_score": min_score},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}", "people": []}
+    except Exception as e:
+        return {"error": str(e), "people": []}
+
+
+async def query_topology_bridges(limit: int = 20) -> dict[str, Any]:
+    """GET /v1/intelligence/topology/bridges — bridge nodes (P2.1)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/topology/bridges",
+                params={"limit": limit},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}", "bridges": []}
+    except Exception as e:
+        return {"error": str(e), "bridges": []}
+
+
+async def query_topology_clusters(
+    limit: int = 20, sample_size: int = 5,
+) -> dict[str, Any]:
+    """GET /v1/intelligence/topology/clusters — Louvain communities (P2.1)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/topology/clusters",
+                params={"limit": limit, "sample_size": sample_size},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}", "clusters": []}
+    except Exception as e:
+        return {"error": str(e), "clusters": []}
+
+
+async def query_topology_cluster_members(
+    cluster_id: int, limit: int = 100,
+) -> dict[str, Any]:
+    """GET /v1/intelligence/topology/clusters/{cluster_id}."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/topology/clusters/{cluster_id}",
+                params={"limit": limit},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}", "members": []}
+    except Exception as e:
+        return {"error": str(e), "members": []}
+
+
+async def compute_topology() -> dict[str, Any]:
+    """POST /v1/intelligence/topology/compute — on-demand GDS recompute.
+    Heavy; only call when status shows 0% coverage or user explicitly asks."""
+    long_timeout = aiohttp.ClientTimeout(total=120)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{CIG_URL}/v1/intelligence/topology/compute",
+                headers=_HEADERS, timeout=long_timeout,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def query_derivations_status() -> dict[str, Any]:
+    """GET /v1/intelligence/derivations/status — coverage % per layer.
+    Call this first if uncertain whether a derivation is populated."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/derivations/status",
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def query_person_context(email_addr: str, days: int = 90) -> dict[str, Any]:
+    """GET /v1/intelligence/context/person — cross-modal person dossier (P2.4)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/context/person",
+                params={"email": email_addr, "days": days},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def query_topic_context(topic: str, days: int = 30) -> dict[str, Any]:
+    """GET /v1/intelligence/context/topic — cross-modal topic dossier (P2.4)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/intelligence/context/topic",
+                params={"topic": topic, "days": days},
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def query_sentiment_arc(email_addr: str) -> dict[str, Any]:
+    """GET /v1/contacts/{email}/sentiment-arc — 2-week sentiment buckets (P2.2)."""
+    import urllib.parse
+    encoded = urllib.parse.quote(email_addr, safe="")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/contacts/{encoded}/sentiment-arc",
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def query_event_outcome(event_id: str) -> dict[str, Any]:
+    """GET /v1/calendar/{event_id}/outcome — post-meeting intelligence (P2.3)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CIG_URL}/v1/calendar/{event_id}/outcome",
+                headers=_HEADERS, timeout=_TIMEOUT,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def generate_event_outcome(event_id: str) -> dict[str, Any]:
+    """POST /v1/calendar/{event_id}/outcome — force on-demand extraction (P2.3).
+    Use when GET returns 404 for a recent meeting."""
+    long_timeout = aiohttp.ClientTimeout(total=45)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{CIG_URL}/v1/calendar/{event_id}/outcome",
+                headers=_HEADERS, timeout=long_timeout,
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": str(e)}

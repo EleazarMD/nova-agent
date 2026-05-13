@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Optional
 from pathlib import Path
-import yaml
+from nova.skill_loader import build_skill_index, load_skill_bodies_for_tools
 
 
 def _extract_pref_value(
@@ -85,46 +85,6 @@ def _build_personality_section(
     return "## Who You're Talking To (from PCG)\n" + "\n".join(f"- {l}" for l in lines)
 
 
-_SKILLS_DIR = Path(__file__).parent.parent / "skills"
-
-
-def _load_doc_skills() -> str:
-    """Load documentation-only skills (no tool_name/parameters) and return
-    their markdown bodies as a single section for the system prompt."""
-    sections = []
-    if not _SKILLS_DIR.is_dir():
-        return ""
-
-    for skill_dir in sorted(_SKILLS_DIR.iterdir()):
-        if not skill_dir.is_dir():
-            continue
-        skill_md = skill_dir / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        try:
-            text = skill_md.read_text()
-        except Exception:
-            continue
-        if not text.startswith("---"):
-            continue
-        end = text.find("---", 3)
-        if end == -1:
-            continue
-        try:
-            fm = yaml.safe_load(text[3:end])
-        except yaml.YAMLError:
-            continue
-        # Only include documentation-only skills (no tool_name or parameters)
-        if fm.get("tool_name") or fm.get("parameters"):
-            continue
-        # Extract body (after frontmatter)
-        body = text[end + 3:].strip()
-        if body:
-            name = fm.get("name", skill_dir.name)
-            sections.append(f"### Skill: {name}\n{body}")
-
-    return "\n\n".join(sections) if sections else ""
-
 
 def build_system_prompt(
     user_name: Optional[str] = None,
@@ -136,6 +96,12 @@ def build_system_prompt(
     preferences_by_category: Optional[dict[str, list[dict]]] = None,
     identity: Optional[dict[str, Any]] = None,
     daily_snapshot: Optional[dict[str, Any]] = None,
+    recent_insights: Optional[list[dict]] = None,
+    recent_session_digest: Optional[list[dict]] = None,
+    dream_insights: Optional[list[dict]] = None,
+    active_goals: Optional[list[dict]] = None,
+    active_task_plans: Optional[list[dict]] = None,
+    recent_turn_outcomes: Optional[list[dict]] = None,
 ) -> str:
     """Build a concise voice-optimized system prompt.
 
@@ -272,7 +238,11 @@ def build_system_prompt(
         "- Remember and reference personal details naturally (wife Claudia, kids Luca/Sofia/Arik)\n"
         "- When the user shares something personal, respond with analytical presence, not moral judgment\n"
         "- If you disagree with a choice analytically, frame it as a model output: 'The Antifragile lens\n"
-        "  would flag this arrangement as fragile under stress — here is why and what would make it robust'"
+        "  would flag this arrangement as fragile under stress — here is why and what would make it robust'\n"
+        "- **When the user starts multi-session work** (e.g. 'let's work on my article', 'continue the case study', "
+        "'let's build X over time'), call set_active_goal immediately with a plain-language description. "
+        "This carries the goal into every future session so you never lose the thread. "
+        "Call complete_active_goal when the user says the work is done or no longer relevant."
     )
 
     # Dynamic personality from PIC preferences
@@ -280,8 +250,37 @@ def build_system_prompt(
     if personality:
         sections.append(personality)
 
-    # Voice protocol
+    # Response shape — progressive disclosure, applies to BOTH voice and text
     sections.append(
+        "## Response Shape (CRITICAL — applies to every reply, voice OR text)\n"
+        "You default to PROGRESSIVE DISCLOSURE, not dump-all-at-once. The user is a fast\n"
+        "thinker who steers with you; he wants partners, not transcripts.\n\n"
+        "**Default shape**: at most 3 short paragraphs, roughly 400 characters total.\n"
+        "Anything beyond that requires explicit user permission OR a confirmed outline.\n\n"
+        "**Long-form output (anything ≥ 1200 characters: drafts, articles, case studies,\n"
+        "reports, multi-section explanations) MUST follow outline-first protocol:**\n"
+        "  1. Propose 3–5 section headings and a one-line scope statement.\n"
+        "  2. Ask which sections to expand, in what order, at what depth.\n"
+        "  3. Expand ONE section at a time, then pause for steering.\n"
+        "Never produce a finished long-form document on the first pass. Never write a\n"
+        "16,000-character draft when the user said 'let's write it' — that single\n"
+        "phrase is permission to START, not permission to DUMP.\n\n"
+        "**Verticality requirement (CRITICAL — anti-empty-brain rule):**\n"
+        "Before every non-trivial reply, internally check three layers:\n"
+        "  - BIG PICTURE: what does the user actually want at the end of this exchange?\n"
+        "  - ZOOM IN: what is the smallest concrete next step right now?\n"
+        "  - CONTEXT CHECK: what did we agree to in the last 3 turns? what active goal\n"
+        "    is in the system prompt? did the dream cycle flag anything relevant?\n"
+        "If these three answers disagree, ASK A CLARIFIER instead of generating.\n"
+        "If your reply does not name a concrete next step, you are being empty-brained;\n"
+        "reframe before responding.\n\n"
+        "**Forbidden hallucinations**:\n"
+        "- 'We left off at the beginning' / 'we're truly at the start' / 'no sessions logged\n"
+        "  yet' — if `## Active Work` or `## Dream Insights` has any content, you are NOT\n"
+        "  starting fresh. Resume from that anchor.\n"
+        "- 'I don't sleep' / 'no dreams here' — the dream service runs nightly; check\n"
+        "  `## Dream Insights` or call query_self_state before denying introspection.\n\n"
+
         "## Voice Protocol\n"
         "- Start with a brief summary, then offer details on request\n"
         "- Never dump lists unprompted — say 'I found 3 options, want me to list them?'\n"
@@ -319,12 +318,58 @@ def build_system_prompt(
         "You can search with natural language descriptions like 'lunch plans' or 'car trouble' and it will find relevant conversations.\n\n"
         "**Pattern**: User mentions past event → search_past_conversations(query=<natural language description>, days_back=7) → respond with context\n\n"
         "**Voice efficiency rule**: Search once, then act. Do not chain multiple broad searches unless the first result explicitly gives you an ID needed for the next targeted lookup. If the user has already confirmed what they want created, stop searching and delegate or create it.\n\n"
+        "**Framework search stop rule (CRITICAL — prevents tool loops):**\n"
+        "- `query_frameworks`: Call ONCE per turn. Use whatever frameworks are returned. Do NOT re-call with a different query hoping for better results.\n"
+        "- `search_framework_catalog`: Call ONCE per turn maximum. It is a catalog inventory tool — not a problem-solving tool. Never call it to 'find more' frameworks for content creation.\n"
+        "- After ONE call to each, you have enough. Build the content. Move on.\n\n"
+        "**Project / Workspace Creation Decision (CRITICAL — no looping):**\n"
+        "When the user says 'continue', 'let's work on', or 'create' something across sessions:\n"
+        "1. Check the system prompt for `## Active Task Plans` and `## Active Work` FIRST.\n"
+        "2. If neither section has relevant content, call manage_workspace(action='search') AND manage_task_plan(action='list') — ONCE each.\n"
+        "3. **If both return empty / no results**: The project is NEW. Do NOT search again. Immediately:\n"
+        "   a. manage_task_plan(action='create', topic='...', description='...')\n"
+        "   b. manage_workspace(action='create_page_with_blocks', title='...', properties={\"blocks\": [{\"type\": \"heading_2\", \"content\": \"...\"}]})\n"
+        "      — NOTE: blocks MUST be inside `properties` dict, NOT at the top level of the call\n"
+        "   c. manage_task_plan(action='link_page', plan_id='...', workspace_page_id='...')\n"
+        "   d. set_active_goal(goal='...')\n"
+        "   e. Tell the user: 'I created the plan and workspace page. Here is what I set up...'\n"
+        "**The rule is absolute**: If you already received 'No results found' or 'No active task plans found', \n"
+        "do NOT call those same tools again with the same intent. Empty result = project does not exist = CREATE it.\n\n"
+        "**Tool error = operation did NOT succeed (CRITICAL):**\n"
+        "- If manage_workspace returns an error string (e.g. 'properties with blocks array is required', '400', '500'), the page was NOT created.\n"
+        "- NEVER tell the user the page was created if the tool returned an error. That is a hallucination.\n"
+        "- On schema error from create_page_with_blocks: retry IMMEDIATELY with corrected schema — blocks must be inside `properties`: {\"properties\": {\"blocks\": [...]}}\n"
+        "- On any other tool error: report the failure to the user, then ask if you should try again.\n\n"
         "**Examples**:\n"
         "- User: 'I just talked to the Baytown Sun reporter' → search_past_conversations('Baytown Sun reporter', 7)\n"
         "- User: 'Earlier I mentioned the allergy interview' → search_past_conversations('allergy interview', 7)\n"
         "- User: 'The meeting went well' → search_past_conversations('meeting', 3)\n"
         "- User: 'What did we have for lunch yesterday?' → search_past_conversations('lunch food meal yesterday', 2)\n\n"
         "**DO NOT** ask 'How did it go?' if the user just told you about an event — search first, then respond with context.\n\n"
+
+        "## Reasoning Scaffold — Internal Signals (CRITICAL)\n"
+        "Tool results may include one or more bracketed signal blocks appended after the actual data. "
+        "These are INTERNAL reasoning aids. The user never sees them and you must NEVER echo them aloud, "
+        "quote them, or mention their existence to the user. Use them silently to inform your next decision.\n\n"
+        "**`[TURN ANCHOR]`** — appears after substantive tool results. Shows the original turn goal, calls so far, "
+        "evidence collected, failures, and current posture (`diving` | `pivoting` | `surfacing` | `blocked`). "
+        "Treat it as your private 'where am I' map. If posture is `pivoting`, try a different tool/source — "
+        "do not retry the one that just failed. If posture is `surfacing`, you have enough evidence; "
+        "respond to the user now rather than calling more tools. If posture is `blocked`, stop calling tools "
+        "and tell the user concretely what you tried.\n\n"
+        "**`[SIGNAL: ...]`** — situational nudge. Fires only when a specific weak pattern is detected "
+        "(empty result, same tool family overused, repeated failures). Read it, decide, do not echo it. "
+        "Empty result = pivot or surface, NEVER retry the same args.\n\n"
+        "**`[COMPLETION CHECK]`** — fires once when a turn looks incomplete or stuck. It is asking YOU "
+        "internally: 'are you closing without finishing what the user asked for?' Either complete the work "
+        "(try a different approach you haven't tried) or surface concretely with: 'I tried X and Y, both "
+        "failed because Z, here is what I can do instead.' Never close a turn on a vague 'I couldn't find it' "
+        "after a completion check has fired.\n\n"
+        "**Vertical reasoning posture (overarching)**: Your job is goal completion, not tool execution. "
+        "When a tool returns an empty/error result, that is INFORMATION — it tells you that path is closed. "
+        "Pivot to a different path, do not retry. When you have enough to answer the goal, surface even if "
+        "you didn't use all the tools available. When you are truly stuck, escalate to the user with what "
+        "you tried and what's blocking — never silently give up half-way.\n\n"
 
         "## Tool-Call Response Pattern (CRITICAL)\n"
         "You stream responses in real-time via TTS. The user hears you as you generate text, and the "
@@ -366,7 +411,8 @@ def build_system_prompt(
         "- Never announce 'let me check' and then stop — that is a protocol violation.\n"
         "- When tool results arrive, weave them in naturally: 'right now', 'confirmed', 'actually', 'specifically'.\n"
         "- If a tool result says to stop searching, do not call another search/read tool. Answer, ask one focused question, or delegate the requested work.\n"
-        "- For document/workspace construction after enough context is known, delegate to Scribe immediately instead of doing more searches.\n"
+        "- For workspace page CREATION (stub): call manage_workspace(action='create_page') directly — do not wait for 'enough context'. Create the page now, fill it in after.\n"
+        "- For long-form document formatting, batched content, or advanced layout: delegate to Scribe via hub_delegate(agent='scribe').\n"
         "- If tool results contradict your hypothesis, correct gracefully: 'actually, it looks like...'.\n"
         "- NEVER output tool names, function signatures, or bracket syntax as text.\n\n"
         "**ANTI-HALLUCINATION FRAMEWORK** (applies to ALL tool calls):\n\n"
@@ -438,9 +484,16 @@ def build_system_prompt(
             "- Workspace advanced formatting, page batching, long documents, reports, structured notes, or content creation → hub_delegate(agent='scribe', method='edit', context='...')\n"
             "- Infrastructure ops (restart, health check) → hub_delegate(agent='infra', method='health')\n"
             "- Deep diagnostics (root cause, log correlation) → hub_delegate(agent='infra', method='diagnose', params={task: '...'})\n"
-            "- Code fixes / self-healing → hub_delegate(agent='infra', method='fix', context='...')\n"
+            "- Code fixes / self-healing → hub_delegate(agent='coder', method='fix', context='...')\n"
             "- Vehicle proactive monitoring → hub_delegate(agent='tesla', method='monitor', context='...')\n"
             "Hub tasks may require approval via Hyperspace iOS push. Tell the user when approval is needed.\n\n"
+            "**Self-Diagnosis & Healing (When Tools Fail)**:\n"
+            "If a tool fails (returns an error, traceback, or complains about missing parameters), do not just say 'I couldn't do it'.\n"
+            "Instead, execute a self-healing loop:\n"
+            "1. Inform the user you encountered a code/parameter bug.\n"
+            "2. Explain that you are delegating the fix to the 'coder' agent.\n"
+            "3. Call hub_delegate(agent='coder', method='fix', params={'task': 'Fix the tool error', 'context': '...[include the error details]...'}) to send it to the engineering pipeline.\n"
+            "4. Explicitly tell the user they will receive an approval request on their iPhone for the code fix.\n\n"
             "**CIG (Communication Intelligence Graph) — direct analytics**:\n"
             "Use query_cig for READ-ONLY analytics about email, calendar, contacts:\n"
             "- Email urgency/prioritization → query_cig(domain='email')\n"
@@ -528,7 +581,7 @@ def build_system_prompt(
         if daily_snapshot.get("weather"):
             snap_lines.append(f"- Weather at home: {daily_snapshot['weather'][:200]}")
         if daily_snapshot.get("calendar_briefing"):
-            snap_lines.append(f"- Calendar today: {daily_snapshot['calendar_briefing'][:300]}")
+            snap_lines.append(f"- Calendar today (pre-loaded — do NOT re-fetch unless explicitly asked for a live refresh): {daily_snapshot['calendar_briefing'][:1200]}")
         if daily_snapshot.get("tesla_charge"):
             snap_lines.append(f"- Tesla Ruby: {daily_snapshot['tesla_charge']}")
         if daily_snapshot.get("tesla_location"):
@@ -548,14 +601,157 @@ def build_system_prompt(
             task_lines.append(f"- [{status}] {message}")
         sections.append("## Active Tasks\n" + "\n".join(task_lines))
 
+    # Active Work — multi-session goals carried across conversation boundaries
+    if active_goals:
+        goal_lines = ["**Active work in progress (resume these — do NOT start from scratch):**"]
+        for g in active_goals[:3]:
+            g_text = (g.get("active_goal") or g.get("intent") or "").strip()
+            if not g_text:
+                continue
+            page_id = (g.get("metadata") or {}).get("workspace_page_id", "")
+            if page_id:
+                goal_lines.append(f"- {g_text}  ← workspace page_id: {page_id} (call manage_workspace action=get_page to resume)")
+            else:
+                goal_lines.append(f"- {g_text}  ← no workspace anchor yet (search workspace then create page if absent)")
+        if len(goal_lines) > 1:
+            sections.append("## Active Work\n" + "\n".join(goal_lines))
+
+    # Task Plans — structured cross-session work plans with full history
+    if active_task_plans:
+        import datetime as _dt
+        plan_sections = []
+        for p in active_task_plans[:3]:
+            def _fmt_ts(ts):
+                try:
+                    return _dt.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    return ""
+            lines = [f"### Plan: {p['topic']}  (plan_id: {p['plan_id']}"]
+            if p.get("description"):
+                lines.append(f"  Goal: {p['description']}")
+            if p.get("workspace_page_id"):
+                lines.append(f"  Workspace page_id: {p['workspace_page_id']} — call manage_workspace action=get_page to view")
+            session_count = p.get("session_count") or 0
+            last_ts = p.get("last_session_ts")
+            if last_ts:
+                lines.append(f"  Sessions: {session_count} | Last session: {_fmt_ts(last_ts)}")
+            if p.get("last_summary"):
+                lines.append(f"  Last session summary: {p['last_summary'][:200]}")
+            next_steps = p.get("next_steps") or []
+            if next_steps:
+                lines.append("  Next steps from last session:")
+                for ns in next_steps[:4]:
+                    lines.append(f"    - {ns}")
+            pending_steps = p.get("pending_steps") or []
+            if pending_steps:
+                lines.append("  Pending checklist:")
+                for s in pending_steps[:5]:
+                    lines.append(f"    ☐ [{s['step_id'][:8]}] {s['title']}")
+            plan_sections.append("\n".join(lines))
+        if plan_sections:
+            header = "## Active Task Plans (resume these — call manage_task_plan action=get to load full history)"
+            sections.append(header + "\n" + "\n\n".join(plan_sections))
+
+    # Recent turn outcomes — cross-turn memory layer
+    # Shows what was tried in the last few turns so Nova can resume with awareness
+    # instead of repeating failed attempts or losing the thread.
+    if recent_turn_outcomes:
+        import datetime as _dt2
+        turn_lines = []
+        for t in recent_turn_outcomes[:3]:
+            try:
+                ts_str = _dt2.datetime.fromtimestamp(float(t["created_at"])).strftime("%H:%M")
+            except Exception:
+                ts_str = "?"
+            posture = t.get("posture_at_close", "?")
+            goal = (t.get("goal") or "")[:100]
+            useful = t.get("useful_tools") or []
+            failed = t.get("failed_tools") or []
+            hint = (t.get("outcome_hint") or "")[:160]
+            line = f"- [{ts_str}] **{posture}** — Goal: {goal}"
+            if useful:
+                line += f"\n    Useful: {', '.join(useful[:5])}"
+            if failed:
+                line += f"\n    Failed: {', '.join(failed[:5])}"
+            if hint:
+                line += f"\n    Outcome: {hint}"
+            turn_lines.append(line)
+        if turn_lines:
+            sections.append(
+                "## Recent Turn Outcomes (your own prior attempts — do not repeat what failed)\n"
+                "These are summaries of your last few turns. If the user is following up on something "
+                "you already tried, build on the prior result rather than retrying the same path.\n"
+                + "\n".join(turn_lines)
+            )
+
+    # Dream Insights — what last night's dream cycle learned about the user.
+    # Rendered as its own section so it cannot be crowded out by the daily
+    # consolidation feed, and so the model has a clear answer to questions
+    # like "did you dream last night?" without needing to call a tool.
+    if dream_insights:
+        dream_lines = [
+            "**These are observations from my most recent overnight dream cycle (last 1–3 nights).**",
+            "They reflect patterns I noticed about you across recent sessions. Use them as anchors;",
+            "do NOT claim ignorance of them. If asked 'did you dream last night', the answer is YES,",
+            "and the dated insights below are what I dreamt.",
+            "",
+        ]
+        for d in dream_insights[:5]:
+            text = (d.get("text") or "").strip()
+            if not text:
+                continue
+            date = d.get("date", "")
+            cat = d.get("category", "behavior")
+            prefix = f"- [{date} · {cat}]" if date else f"- [{cat}]"
+            dream_lines.append(f"{prefix} {text[:280]}")
+        if len(dream_lines) > 5:
+            sections.append("## Dream Insights (overnight self-reflection)\n" + "\n".join(dream_lines))
+
+    # Recent Context — pre-loaded once at session start, zero tool calls per turn
+    recent_ctx_lines = []
+
+    if recent_insights:
+        recent_ctx_lines.append("**PCG Insights (what I learned about you recently):**")
+        for ins in recent_insights[:5]:
+            insight_text = ins.get("insight") or ins.get("content") or ins.get("text") or str(ins)
+            if insight_text:
+                recent_ctx_lines.append(f"- {str(insight_text)[:200]}")
+
+    if recent_session_digest:
+        recent_ctx_lines.append("**Recent sessions (last few days):**")
+        for entry in recent_session_digest[:3]:
+            title = entry.get("title", "Session")
+            summary = entry.get("summary", "")
+            topics = entry.get("topics") or []
+            when = entry.get("last_message_at", "")[:10]
+            msg_count = entry.get("message_count", 0)
+            if summary:
+                line = f"- [{when}] {title}: {summary[:250]}"
+                if topics:
+                    line += f" (topics: {', '.join(topics[:5])})"
+            else:
+                line = f"- [{when}] {title} ({msg_count} messages — not yet summarized)"
+            recent_ctx_lines.append(line)
+
+    if recent_ctx_lines:
+        sections.append(
+            "## Recent Context (pre-loaded — do NOT re-fetch unless asked for more detail)\n"
+            + "\n".join(recent_ctx_lines)
+        )
+
     # Memory — all PCG-sourced snippets (identity, preferences, goals)
     if memory_snippets:
-        mem_text = "\n".join(f"- {s[:200]}" for s in memory_snippets[:15])
+        mem_text = "\n".join(f"- {s[:200]}" for s in memory_snippets[:30])
         sections.append(f"## Memory (from PCG)\n{mem_text}")
 
-    # Documentation-only skills (no tool, just domain knowledge)
-    doc_skills = _load_doc_skills()
-    if doc_skills:
-        sections.append(doc_skills)
+    # Skills index — always present, one line per skill (~2K chars)
+    skill_index = build_skill_index()
+    if skill_index:
+        sections.append("## Available Skills (index)\n" + skill_index)
+
+    # Full skill bodies — only for tools active this turn
+    skill_bodies = load_skill_bodies_for_tools(list(tool_names or []))
+    if skill_bodies:
+        sections.append("## Skill Protocols (active tools only)\n" + skill_bodies)
 
     return "\n\n".join(sections)

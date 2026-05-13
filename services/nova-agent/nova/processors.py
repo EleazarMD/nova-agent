@@ -20,6 +20,7 @@ from typing import Callable, Optional
 from loguru import logger
 
 from pipecat.frames.frames import (
+    FunctionCallsStartedFrame,
     InputTransportMessageFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -30,6 +31,18 @@ from pipecat.processors.frame_processor import FrameProcessor
 
 from nova.store import append_turn, _sync_message_to_backend
 from nova.tools import reset_conversation_search_count
+
+
+def _on_pg_sync_done(task: asyncio.Task, *, role: str, conversation_id: str, content_preview: str) -> None:
+    """Done-callback for fire-and-forget PG sync tasks in the voice pipeline.
+    Logs errors so lost turns are at least traceable in the journal.
+    """
+    exc = task.exception() if not task.cancelled() else None
+    if exc:
+        logger.error(
+            f"PG sync task failed (voice path) — turn may be lost. "
+            f"role={role} conv={conversation_id[:12]} preview={content_preview[:60]!r} err={exc}"
+        )
 
 
 class ConversationPersistence(FrameProcessor):
@@ -78,6 +91,7 @@ class ConversationPersistence(FrameProcessor):
         self._first_text_sent = False
         self._response_start_time: float = 0.0
         self._text_chunk_count: int = 0
+        self._has_tool_call_this_pass: bool = False
         # Throttle thinkingUpdate to avoid flooding the data channel
         self._last_thinking_send: float = 0.0
         self._thinking_send_interval: float = 0.15  # seconds between sends
@@ -89,11 +103,15 @@ class ConversationPersistence(FrameProcessor):
         if isinstance(frame, LLMFullResponseStartFrame):
             # LLM started generating — send "thinking" phase
             self._first_text_sent = False
+            self._has_tool_call_this_pass = False
             self._response_start_time = time.monotonic()
             self._text_chunk_count = 0
             self._pending_thinking_text = ""
             await self._persist_new_user_turns()
             await self._send_msg({"phase": "thinking"})
+
+        elif isinstance(frame, FunctionCallsStartedFrame):
+            self._has_tool_call_this_pass = True
 
         elif isinstance(frame, LLMTextFrame):
             self._assistant_buffer.append(frame.text)
@@ -110,8 +128,15 @@ class ConversationPersistence(FrameProcessor):
             # Final response text goes ONLY in validated message, not streamed here
 
         elif isinstance(frame, LLMFullResponseEndFrame):
-            # Per Zero-Wait Protocol: response text goes in validated only, not thinkingUpdate
-            
+            # Intermediate pass guard: if this LLM generation contained a tool call,
+            # the real response comes in the next pass (after the tool executes).
+            # Discard the buffer and skip persistence — don't treat planning text as final.
+            if self._has_tool_call_this_pass:
+                self._assistant_buffer.clear()
+                self._has_tool_call_this_pass = False
+                await self.push_frame(frame, direction)
+                return
+
             # Persist complete assistant turn
             full_text = ""
             if self._assistant_buffer:
@@ -120,9 +145,14 @@ class ConversationPersistence(FrameProcessor):
                 if full_text.strip():
                     # SQLite (local fast access)
                     await append_turn(self._session_id, "assistant", full_text)
-                    # PostgreSQL (source of truth) - fire and forget
-                    asyncio.create_task(_sync_message_to_backend(
+                    # PostgreSQL (source of truth) - tracked task with error callback
+                    _task = asyncio.create_task(_sync_message_to_backend(
                         self._conversation_id, self._user_id, "assistant", full_text
+                    ))
+                    _task.add_done_callback(lambda t: _on_pg_sync_done(
+                        t, role="assistant",
+                        conversation_id=self._conversation_id,
+                        content_preview=full_text,
                     ))
                     # Mirror: final assistant text for Tesla companion
                     await self._mirror_event("assistant_text", {"text": full_text, "isFinal": True})
@@ -286,9 +316,14 @@ class ConversationPersistence(FrameProcessor):
                     
                     # SQLite (local fast access)
                     await append_turn(self._session_id, "user", content)
-                    # PostgreSQL (source of truth) - fire and forget
-                    asyncio.create_task(_sync_message_to_backend(
+                    # PostgreSQL (source of truth) - tracked task with error callback
+                    _task = asyncio.create_task(_sync_message_to_backend(
                         self._conversation_id, self._user_id, "user", content
+                    ))
+                    _task.add_done_callback(lambda t: _on_pg_sync_done(
+                        t, role="user",
+                        conversation_id=self._conversation_id,
+                        content_preview=content,
                     ))
                     # Mirror: user transcript for Tesla companion (strip location prefix)
                     clean_text = content

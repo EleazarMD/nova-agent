@@ -22,8 +22,9 @@ from loguru import logger
 
 # User timezone (should come from user preferences)
 USER_TZ = ZoneInfo(os.environ.get("USER_TIMEZONE", "America/Chicago"))
-USER_LOCATION = os.environ.get("USER_LOCATION", "Dallas, TX")
+USER_LOCATION = os.environ.get("USER_LOCATION", "Humble, TX")
 USER_WORK_LOCATION = os.environ.get("USER_WORK_LOCATION", "")
+USER_HOME_LOCATION = os.environ.get("USER_HOME_LOCATION", USER_LOCATION)
 
 
 class WarmingSchedule:
@@ -532,7 +533,11 @@ async def prewarm_on_startup(dispatch_fn: Callable):
     startup_warms = [
         ("recall_memory", {"query": "user identity name roles"}),
         ("recall_memory", {"query": "preferences communication work health"}),
+        ("recall_memory", {"query": "home location work location commute directions weather preferences"}),
         ("get_weather", {"location": USER_LOCATION}),
+        ("check_studio", {"studio": "calendar", "action": "briefing"}),
+        ("check_studio", {"studio": "email", "action": "briefing"}),
+        ("check_studio", {"studio": "calendar", "action": "briefing", "query": "tomorrow"}),
         ("service_health_check", {"container": "all"}),
     ]
     

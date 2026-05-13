@@ -27,6 +27,10 @@ Citation Flow:
 
 import asyncio
 import aiohttp
+import os
+import re
+import sqlite3
+import time
 from typing import Optional, Callable
 from loguru import logger
 
@@ -35,15 +39,84 @@ AI_GATEWAY_URL = "http://127.0.0.1:8777/api/v1"
 AI_GATEWAY_API_KEY = "ai-gateway-api-key-2024"
 _server_msg_fn: Optional[Callable] = None
 _agent_mode: str = "fast"  # Default to fast mode
+_provider_cooldown_until: float = 0.0
+_CACHE_PATH = os.environ.get("NOVA_WEB_SEARCH_CACHE_PATH", "/home/eleazar/Projects/AIHomelab/services/nova-agent/data/web_search_cache.db")
+_CACHE_MAX_AGE_SECONDS = int(os.environ.get("NOVA_WEB_SEARCH_CACHE_MAX_AGE_SECONDS", "86400"))
+_COOLDOWN_SECONDS = int(os.environ.get("NOVA_WEB_SEARCH_COOLDOWN_SECONDS", "180"))
 
 
-async def handle_web_search(query: str, deep_mode: bool = False) -> str:
+def _normalize_query(query: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", (query or "").lower()))
+
+
+def _cache_init():
+    os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+    with sqlite3.connect(_CACHE_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS web_search_results (query_key TEXT PRIMARY KEY, query TEXT NOT NULL, content TEXT NOT NULL, citations_count INTEGER NOT NULL DEFAULT 0, model TEXT, created_at REAL NOT NULL)"
+        )
+
+
+def _cache_put(query: str, content: str, citations_count: int, model: str) -> None:
+    if not content or "temporarily rate-limited" in content.lower() or content.lower().startswith("search failed"):
+        return
+    try:
+        _cache_init()
+        with sqlite3.connect(_CACHE_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO web_search_results (query_key, query, content, citations_count, model, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (_normalize_query(query), query, content, int(citations_count or 0), model, time.time()),
+            )
+    except Exception as e:
+        logger.warning(f"Web search cache write failed: {e}")
+
+
+def _cache_get(query: str) -> str:
+    try:
+        _cache_init()
+        key = _normalize_query(query)
+        now = time.time()
+        with sqlite3.connect(_CACHE_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM web_search_results WHERE query_key = ? AND created_at >= ?",
+                (key, now - _CACHE_MAX_AGE_SECONDS),
+            ).fetchone()
+            if row is None:
+                terms = set(key.split())
+                candidates = conn.execute(
+                    "SELECT * FROM web_search_results WHERE created_at >= ? ORDER BY created_at DESC LIMIT 50",
+                    (now - _CACHE_MAX_AGE_SECONDS,),
+                ).fetchall()
+                best = None
+                best_score = 0
+                for candidate in candidates:
+                    candidate_terms = set(_normalize_query(candidate["query"]).split())
+                    score = len(terms & candidate_terms)
+                    if score > best_score:
+                        best = candidate
+                        best_score = score
+                row = best if best_score >= max(3, min(6, len(terms) // 2)) else None
+            if row is None:
+                return ""
+            age_minutes = int((now - float(row["created_at"])) / 60)
+            return (
+                f"Cached web search evidence from {age_minutes} minutes ago because the live search provider is temporarily unavailable.\n\n"
+                f"{row['content']}"
+            )
+    except Exception as e:
+        logger.warning(f"Web search cache read failed: {e}")
+        return ""
+
+
+async def handle_web_search(query: str, deep_mode: bool = False, bypass_cache: bool = False) -> str:
     """
     Search the web using Perplexity Sonar via AI Gateway.
     
     Args:
         query: Search query string
         deep_mode: If True, use sonar-pro for deeper research; if False, use sonar for fast results
+        bypass_cache: If True, bypass the local sqlite cache and fetch fresh data
         
     Returns:
         Search results with citation count appended
@@ -52,15 +125,25 @@ async def handle_web_search(query: str, deep_mode: bool = False) -> str:
         - Sends citation URLs to iOS via _server_msg_fn
         - Logs search metrics
     """
+    global _provider_cooldown_until
     # Select model based on agent mode
     # Use global _agent_mode if deep_mode not explicitly set
-    model = "sonar-pro" if (deep_mode or _agent_mode == "deep") else "sonar"
+    allow_pro = os.environ.get("NOVA_WEB_SEARCH_ALLOW_SONAR_PRO", "").lower() in {"1", "true", "yes"}
+    model = "sonar-pro" if allow_pro and deep_mode else "sonar"
+    if time.time() < _provider_cooldown_until:
+        cached = _cache_get(query)
+        if cached:
+            return cached
     
     url = f"{AI_GATEWAY_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {AI_GATEWAY_API_KEY}",
         "Content-Type": "application/json",
     }
+    
+    if bypass_cache:
+        headers["x-cache-strategy"] = "none"
+
     body = {
         "model": model,  # AI Gateway routes to Perplexity Sonar or Sonar Pro
         "messages": [
@@ -97,10 +180,13 @@ async def handle_web_search(query: str, deep_mode: bool = False) -> str:
                         await asyncio.sleep(2.0)
                         continue
                     if resp.status == 429:
+                        _provider_cooldown_until = time.time() + _COOLDOWN_SECONDS
+                        cached = _cache_get(query)
+                        if cached:
+                            return cached
                         return (
-                            "Perplexity rate-limited this search. Tell the user the search "
-                            "provider is temporarily throttled and to try again in a minute. "
-                            "Do NOT call web_search again this turn."
+                            "The web search provider is temporarily rate-limited. "
+                            "I could not retrieve current external evidence for this query right now."
                         )
                     if resp.status != 200:
                         text = await resp.text()
@@ -145,6 +231,7 @@ async def handle_web_search(query: str, deep_mode: bool = False) -> str:
             content += f"\n\n({len(citations)} sources available — the user's device will display them.)"
 
         logger.info(f"Web search OK ({model}): {len(content)} chars, {len(citations)} citations")
+        _cache_put(query, content, len(citations), model)
         return content
 
     except asyncio.TimeoutError:

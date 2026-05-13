@@ -12,20 +12,15 @@ from loguru import logger
 from nova.events import Event, event_bus
 
 # Standalone approval-service microservice (JIT Zero-Tolerance Infrastructure Approvals)
-APPROVAL_SERVICE_URL = os.environ.get(
-    "APPROVAL_SERVICE_URL",
-    os.environ.get("DASHBOARD_URL", "http://127.0.0.1:8407"),
-)
-# Matches INTERNAL_API_KEY on approval-service; kept name for backward-compat.
-DASHBOARD_API_KEY = os.environ.get("AI_GATEWAY_API_KEY", "ai-gateway-api-key-2024")
-
+APPROVAL_SERVICE_URL = os.environ.get("APPROVAL_SERVICE_URL", "http://127.0.0.1:8407").rstrip("/")
+APPROVAL_SERVICE_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
 
 async def send_push(user_id: str, title: str, body: str, data: dict | None = None):
     """Send a push notification via the approval-service APNs endpoint."""
     url = f"{APPROVAL_SERVICE_URL}/api/notifications/send"
     headers = {
         "Content-Type": "application/json",
-        "X-API-Key": DASHBOARD_API_KEY,
+        "X-API-Key": APPROVAL_SERVICE_API_KEY,
     }
 
     # Dashboard API uses camelCase field names

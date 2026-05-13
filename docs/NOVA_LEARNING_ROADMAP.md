@@ -1,5 +1,7 @@
 # Nova Zero-Wait Architecture & Neural Learning Roadmap
 
+Related product architecture: [`NOVA_AGENTIC_DESIGN_ROADMAP.md`](./NOVA_AGENTIC_DESIGN_ROADMAP.md) defines the broader Claude Design-inspired harness roadmap for grounding, structured task artifacts, iterative refinement, self-QA, variations, and handoff.
+
 ## Objective
 Enable Nova to learn from organic interactions and progressively bypass the LLM cloud deliberation latency by transforming historically successful multi-turn interactions into zero-wait deterministic paths.
 

@@ -120,7 +120,7 @@ class ToolResultCache:
     DEFAULT_TTLS = {
         "get_weather": 600,           # 10 min - weather changes slowly
         "get_time": 1,                # 1 sec - always fresh
-        "check_studio": 120,          # 2 min - email/calendar reasonably stable
+        "check_studio": 120,          # default 2 min; overridden per studio/action in _get_adaptive_ttl
         "recall_memory": 300,         # 5 min - PCG data stable
         "web_search": 3600,           # 1 hour - external data, expensive
         "service_status": 30,         # 30 sec - infra can change
@@ -138,8 +138,6 @@ class ToolResultCache:
         "tesla_control": 60,          # 1 min - vehicle state
         "get_reminders": 120,         # 2 min - reminders semi-stable
         "list_timers": 30,            # 30 sec - timers change
-        "check_studio": 120,          # 2 min - email/calendar
-        "recall_memory": 300,         # 5 min - PCG preferences stable
     }
     
     # TTL bounds for adaptive learning (min/max multipliers of base TTL)
@@ -397,13 +395,25 @@ class ToolResultCache:
     def _get_adaptive_ttl(self, tool_name: str, args: dict) -> float:
         """Get TTL, possibly adapted based on learned staleness rates."""
         base_ttl = self.DEFAULT_TTLS.get(tool_name, self._default_ttl)
+
+        # check_studio TTL depends on what's being fetched:
+        # calendar/briefing — events are stable for the day (1800s)
+        # email/* — emails arrive constantly, must stay fresh (120s)
+        if tool_name == "check_studio":
+            studio = str(args.get("studio", "email")).lower()
+            action = str(args.get("action", "briefing")).lower()
+            if studio == "calendar" or action == "briefing" and studio not in ("email", "inbox"):
+                base_ttl = 1800
+            else:
+                base_ttl = 120
+
         args_hash = self._get_args_hash(args)
         learning_key = f"{tool_name}:{args_hash}"
-        
+
         # Check if we have an adapted TTL
         if learning_key in self._adapted_ttls:
             return self._adapted_ttls[learning_key]
-        
+
         return base_ttl
     
     async def _record_query_pattern(self, tool_name: str, args: dict):
@@ -615,14 +625,23 @@ class ToolResultCache:
         
         for pattern in candidates[:5]:  # Warm up to 5 queries
             cache_key = f"{pattern.tool_name}:{pattern.args_hash}"
-            # Check if already cached
-            if any(k.startswith(cache_key) for k in self._cache):
+            # Check if already cached and not expired
+            existing = self._cache.get(cache_key)
+            if existing and not existing.is_expired:
                 continue
             
-            logger.info(f"[Warming] Would pre-fetch {pattern.tool_name} (seen {pattern.count}x at this time)")
-            # Note: Actual pre-fetching requires tool dispatch integration
-            # For now, we just log what would be warmed
-            warmed += 1
+            # Actually pre-fetch by dispatching the tool
+            logger.info(f"[Warming] Pre-fetching {pattern.tool_name} (seen {pattern.count}x at this time)")
+            try:
+                from nova.tools import dispatch_tool
+                args = json.loads(pattern.args_hash) if pattern.args_hash.startswith("{") else {}
+                result = await asyncio.wait_for(dispatch_tool(pattern.tool_name, args), timeout=15)
+                if result:
+                    await self.set(pattern.tool_name, args if args else {"_warm": True}, result)
+                    warmed += 1
+                    logger.info(f"[Warming] Pre-fetched {pattern.tool_name} OK ({len(str(result))} chars)")
+            except Exception as e:
+                logger.warning(f"[Warming] Pre-fetch {pattern.tool_name} failed: {e}")
         
         if warmed > 0:
             logger.info(f"[Warming] Identified {warmed} queries for pre-warming")

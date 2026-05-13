@@ -83,7 +83,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="productivity.schedule.today",
         domain=QueryDomain.PRODUCTIVITY,
         tool="check_studio",
-        tool_args={"query": "what's on my schedule today"},
+        tool_args={"studio": "calendar", "action": "today"},
         ttl_seconds=1800,  # 30 min
         triggers=["calendar_change", "morning_warmup"],
         # v2.0 enrichment
@@ -97,7 +97,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="productivity.schedule.tomorrow",
         domain=QueryDomain.PRODUCTIVITY,
         tool="check_studio",
-        tool_args={"query": "what's on my schedule tomorrow"},
+        tool_args={"studio": "calendar", "action": "tomorrow"},
         ttl_seconds=3600,  # 1 hour
         triggers=["calendar_change", "evening_warmup"],
         enrich_with_pic=True,
@@ -110,7 +110,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="productivity.email.triage",
         domain=QueryDomain.PRODUCTIVITY,
         tool="check_studio",
-        tool_args={"query": "emails needing response"},
+        tool_args={"studio": "email", "action": "recent", "query": "emails needing response"},
         ttl_seconds=600,  # 10 min
         triggers=["email_arrival", "periodic"],
         # EXAMPLE: Full enrichment with Filter Model
@@ -128,7 +128,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="productivity.email.unread",
         domain=QueryDomain.PRODUCTIVITY,
         tool="check_studio",
-        tool_args={"query": "any unread emails"},
+        tool_args={"studio": "email", "action": "recent", "query": "any unread emails"},
         ttl_seconds=900,  # 15 min
         triggers=["email_arrival", "periodic"],
         enrich_with_pic=True,
@@ -139,7 +139,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="tasks.pending",
         domain=QueryDomain.TASKS,
         tool="check_studio",
-        tool_args={"query": "what tasks do I have pending"},
+        tool_args={"studio": "workspace", "action": "recent"},
         ttl_seconds=600,  # 10 min
         triggers=["task_change", "periodic"],
         enrich_with_pic=True,
@@ -151,7 +151,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="productivity.schedule.next_meeting",
         domain=QueryDomain.PRODUCTIVITY,
         tool="check_studio",
-        tool_args={"query": "next meeting"},
+        tool_args={"studio": "calendar", "action": "today"},
         ttl_seconds=900,  # 15 min
         triggers=["calendar_change"],
         enrich_with_pic=True,
@@ -162,7 +162,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="productivity.schedule.week",
         domain=QueryDomain.PRODUCTIVITY,
         tool="check_studio",
-        tool_args={"query": "schedule for the week"},
+        tool_args={"studio": "calendar", "action": "this_week"},
         ttl_seconds=7200,  # 2 hours
         triggers=["calendar_change"],
         enrich_with_pic=True,
@@ -174,7 +174,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="productivity.email.important",
         domain=QueryDomain.PRODUCTIVITY,
         tool="check_studio",
-        tool_args={"query": "important emails"},
+        tool_args={"studio": "email", "action": "recent", "query": "important emails"},
         ttl_seconds=600,  # 10 min
         triggers=["email_arrival"],
         enrich_with_pic=True,
@@ -237,7 +237,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="homelab.services.recent_errors",
         domain=QueryDomain.GENERAL,
         tool="service_logs",
-        tool_args={"lines": 50, "filter": "ERROR"},
+        tool_args={"lines": 50},
         ttl_seconds=60,  # 1 min (ultra-fresh)
         triggers=["error_detected"],
         enrich_with_history=True,
@@ -248,7 +248,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="clinical.patient.next",
         domain=QueryDomain.GENERAL,
         tool="check_studio",
-        tool_args={"query": "next patient appointment"},
+        tool_args={"studio": "calendar", "action": "today"},
         ttl_seconds=900,  # 15 min
         triggers=["calendar_change"],
         enrich_with_pic=True,
@@ -264,7 +264,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="clinical.schedule.today",
         domain=QueryDomain.GENERAL,
         tool="check_studio",
-        tool_args={"query": "patient schedule today"},
+        tool_args={"studio": "calendar", "action": "today"},
         ttl_seconds=1800,  # 30 min
         triggers=["calendar_change"],
         enrich_with_pic=True,
@@ -288,7 +288,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="personal.health.sleep_last_night",
         domain=QueryDomain.GENERAL,
         tool="check_studio",
-        tool_args={"query": "sleep data last night"},
+        tool_args={"studio": "research", "action": "recent"},
         ttl_seconds=3600,  # 1 hour
         triggers=["morning_warmup"],
         enrich_with_pic=True,
@@ -299,7 +299,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="personal.health.steps_today",
         domain=QueryDomain.GENERAL,
         tool="check_studio",
-        tool_args={"query": "steps today"},
+        tool_args={"studio": "research", "action": "recent"},
         ttl_seconds=900,  # 15 min
         triggers=["periodic"],
         enrich_with_pic=True,
@@ -321,7 +321,7 @@ DEFAULT_CACHE_CONFIGS: list[CacheConfig] = [
         cache_key="knowledge.weather.forecast_3day",
         domain=QueryDomain.KNOWLEDGE,
         tool="get_weather",
-        tool_args={"forecast": "3day"},
+        tool_args={"query": "3-day forecast"},
         ttl_seconds=21600,  # 6 hours
         triggers=["morning_warmup"],
         enrich_with_pic=True,
@@ -618,97 +618,26 @@ class SpeculativeCache:
                 logger.warning(f"[Cache] Warming returned empty: {cache_key}")
                 return False
             
-            # 2. Enrich with context (parallel fetching for speed)
-            enrichment_tasks = []
+            # 2. Cache raw tool result only — enrichment disabled.
+            # Pre-baking enriched text at warm time causes stale enrichment
+            # hallucination (wrong frameworks, wrong peak-hours notes, wrong
+            # KG entities) that gets served verbatim with no LLM correction.
+            # The LLM enriches at response time with fresh context instead.
+            raw_text = str(base_result)
+            speech_text = self._speech_transform(raw_text)
             
-            if config.enrich_with_pic:
-                enrichment_tasks.append(self._fetch_pic_context(cache_key))
-            else:
-                enrichment_tasks.append(asyncio.sleep(0, result={}))
-            
-            if config.enrich_with_liam:
-                enrichment_tasks.append(
-                    self._fetch_liam_context(cache_key, config.applicable_frameworks)
-                )
-            else:
-                enrichment_tasks.append(asyncio.sleep(0, result={"frameworks": [], "active_dimensions": [], "linked_goals": []}))
-            
-            if config.enrich_with_kg:
-                enrichment_tasks.append(
-                    self._fetch_kg_entities(base_result, config.enrich_with_kg)
-                )
-            else:
-                enrichment_tasks.append(asyncio.sleep(0, result=[]))
-            
-            if config.enrich_with_history:
-                enrichment_tasks.append(self._fetch_recent_turns(limit=5))
-            else:
-                enrichment_tasks.append(asyncio.sleep(0, result=[]))
-            
-            # Fetch all context in parallel
-            pic_ctx, liam_ctx, kg_entities, recent_turns = await asyncio.gather(
-                *enrichment_tasks,
-                return_exceptions=True
-            )
-            
-            # Handle exceptions
-            if isinstance(pic_ctx, Exception):
-                logger.warning(f"[Cache] PIC enrichment failed: {pic_ctx}")
-                pic_ctx = {}
-            if isinstance(liam_ctx, Exception):
-                logger.warning(f"[Cache] LIAM enrichment failed: {liam_ctx}")
-                liam_ctx = {"frameworks": [], "active_dimensions": [], "linked_goals": []}
-            if isinstance(kg_entities, Exception):
-                logger.warning(f"[Cache] KG enrichment failed: {kg_entities}")
-                kg_entities = []
-            if isinstance(recent_turns, Exception):
-                logger.warning(f"[Cache] History enrichment failed: {recent_turns}")
-                recent_turns = []
-            
-            # 3. Generate enriched response text
-            enriched_text = await self._generate_enriched_response(
-                base_data=base_result,
-                pic_context=pic_ctx,
-                liam_context=liam_ctx,
-                kg_entities=kg_entities,
-                recent_turns=recent_turns,
-            )
-            
-            # 4. Transform for speech
-            speech_text = self._speech_transform(enriched_text)
-            
-            # 5. Create enriched cache entry
             entry = CacheEntry(
                 cache_key=cache_key,
-                display_text=enriched_text,
+                display_text=raw_text,
                 speech_text=speech_text,
                 domain=config.domain,
-                confidence=0.95,
+                confidence=0.85,  # Lower than 0.95 — this is raw data, not enriched
                 sources=[{"source": config.tool, "cached": True}],
                 ttl_seconds=config.ttl_seconds,
-                # Enriched context
-                pic_context=pic_ctx,
-                liam_frameworks=liam_ctx.get("frameworks", []),
-                kg_entities=kg_entities,
-                recent_turns=recent_turns,
             )
             
             self._cache[cache_key] = entry
-            
-            enrichment_summary = []
-            if pic_ctx:
-                enrichment_summary.append("PIC")
-            if liam_ctx.get("frameworks"):
-                enrichment_summary.append(f"LIAM({len(liam_ctx['frameworks'])})")
-            if kg_entities:
-                enrichment_summary.append(f"KG({len(kg_entities)})")
-            if recent_turns:
-                enrichment_summary.append(f"History({len(recent_turns)})")
-            
-            logger.info(
-                f"[Cache] Warmed: {cache_key} ({len(enriched_text)} chars) "
-                f"[{'+'.join(enrichment_summary) if enrichment_summary else 'base'}]"
-            )
+            logger.info(f"[Cache] Warmed (raw only): {cache_key} ({len(raw_text)} chars)")
             return True
             
         except Exception as e:

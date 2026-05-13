@@ -11,15 +11,23 @@ import os
 import json
 import time
 import asyncio
+from typing import Optional
 
 from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
+    ErrorFrame,
+    FunctionCallResultProperties,
+    FunctionCallsStartedFrame,
     InputTransportMessageFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMMessagesAppendFrame,
+    LLMMessagesUpdateFrame,
+    LLMRunFrame,
     LLMTextFrame,
     TranscriptionFrame,
 )
@@ -53,11 +61,22 @@ from nova.events import event_bus
 from nova.notify import create_event_handler
 from nova.prompt import build_system_prompt
 from nova.push import mark_user_active, mark_user_inactive, register_push_fallback
-from nova.store import init_db, get_or_create_session, append_turn, get_history, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn, get_session_metadata, update_session_metadata_key, append_learning_event
+from nova.store import init_db, get_or_create_session, append_turn, get_history, get_compacted_context, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn, get_session_metadata, update_session_metadata_key, append_learning_event, get_recent_active_conversation, get_active_action_ledger_entry
 from nova.pcg import build_context, record_observation, create_preference
-from nova.tools import TOOL_DEFINITIONS, dispatch_tool, set_progress_context
-from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan, turn_state_from_metadata, turn_state_to_metadata_value
+from nova.tools import TOOL_DEFINITIONS, dispatch_tool, reset_conversation_search_count, set_progress_context
 from nova.turn_policy import canonicalize_turn_text
+from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan_result, turn_state_from_metadata, turn_state_to_metadata_value
+from nova.turn_ownership import should_consume_llm_frame_after_orchestrator
+from nova.turn_tool_policy import CORE_TOOL_NAMES, select_tool_budget
+from nova.turn_context import (
+    TurnContext,
+    derive_goal,
+    derive_evidence_budget,
+    augment_tool_result,
+    finalize_and_persist,
+)
+from nova.semantic_turn_resolver import resolve_semantic_turn
+from nova.voice_turn_runtime import VoiceTurnRuntime
 from nova.learning import consolidate_session_learning
 
 # ---------------------------------------------------------------------------
@@ -76,12 +95,22 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "minimax-m2.7")
 from nova.user_resolver import canonical_user_id as _resolve_user_id  # noqa: E402
 
 # Tool names for prompt builder
-TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS if "function" in t]
+ALL_TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS if "function" in t]
+TOOL_DEFINITIONS_BY_NAME = {
+    td["function"]["name"]: td
+    for td in TOOL_DEFINITIONS
+    if "function" in td and "name" in td["function"]
+}
+TOOL_NAMES = [name for name in ALL_TOOL_NAMES if name in CORE_TOOL_NAMES]
 
 # Convert OpenAI-format tool defs to Pipecat FunctionSchema/ToolsSchema
-def _build_tools_schema() -> ToolsSchema:
+def _build_tools_schema(tool_names: set[str] | list[str] | None = None) -> ToolsSchema:
     schemas = []
-    for td in TOOL_DEFINITIONS:
+    selected = list(tool_names) if tool_names else ALL_TOOL_NAMES
+    for name in selected:
+        td = TOOL_DEFINITIONS_BY_NAME.get(name)
+        if not td:
+            continue
         func = td.get("function", {})
         params = func.get("parameters", {})
         schemas.append(FunctionSchema(
@@ -92,10 +121,343 @@ def _build_tools_schema() -> ToolsSchema:
         ))
     return ToolsSchema(standard_tools=schemas)
 
-PIPECAT_TOOLS = _build_tools_schema()
+
+def _first_string(*values) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _compact_metadata_value(value, max_len: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        text = str(value)
+    else:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    text = " ".join(text.split())
+    if len(text) > max_len:
+        return text[: max_len - 1] + "…"
+    return text
+
+
+def _extract_image_context(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    candidates = []
+    for key in (
+        "imageContext",
+        "image_context",
+        "contextualImageMetadata",
+        "contextual_image_metadata",
+        "imageMetadata",
+        "image_metadata",
+        "image",
+        "attachment",
+    ):
+        value = data.get(key)
+        if value:
+            candidates.append(value)
+
+    for attachment in data.get("attachments") or []:
+        if isinstance(attachment, dict):
+            mime_type = _first_string(attachment.get("mimeType"), attachment.get("mime_type"), attachment.get("type"))
+            if "image" in mime_type.lower() or attachment.get("imageUrl") or attachment.get("image_url") or attachment.get("url"):
+                candidates.append(attachment)
+
+    if not candidates:
+        return ""
+
+    merged: dict[str, object] = {}
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            merged.update(candidate)
+        else:
+            merged.setdefault("metadata", candidate)
+
+    image_url = _first_string(
+        merged.get("imageUrl"),
+        merged.get("image_url"),
+        merged.get("url"),
+        merged.get("sourceUrl"),
+        merged.get("source_url"),
+    )
+
+    lines = ["[CONTEXTUAL IMAGE INPUT]"]
+    if image_url:
+        lines.append(f"Image URL: {image_url}")
+
+    location_obj = None
+    for location_key in ("location", "geoLocation", "geolocation", "gps", "GPS", "coordinates"):
+        value = merged.get(location_key)
+        if isinstance(value, dict):
+            location_obj = value
+            break
+
+    if location_obj:
+        lat = location_obj.get("latitude", location_obj.get("lat"))
+        lon = location_obj.get("longitude", location_obj.get("lon", location_obj.get("lng")))
+        if lat not in (None, "") and lon not in (None, ""):
+            lines.append(f"image_geolocation: latitude={lat}, longitude={lon}")
+        for key in ("accuracy", "altitude", "timestamp", "capturedAt", "captured_at", "placeName", "place_name", "address"):
+            if key in location_obj and location_obj.get(key) not in (None, ""):
+                lines.append(f"image_geolocation_{key}: {_compact_metadata_value(location_obj.get(key))}")
+
+    for key in (
+        "id",
+        "fileName",
+        "filename",
+        "mimeType",
+        "mime_type",
+        "width",
+        "height",
+        "createdAt",
+        "created_at",
+        "capturedAt",
+        "captured_at",
+        "caption",
+        "altText",
+        "alt_text",
+        "source",
+        "latitude",
+        "lat",
+        "longitude",
+        "lon",
+        "lng",
+        "location",
+        "geoLocation",
+        "geolocation",
+        "gps",
+        "GPS",
+        "coordinates",
+        "placeName",
+        "place_name",
+        "address",
+        "exif",
+        "EXIF",
+        "metadata",
+    ):
+        if key in merged and merged.get(key) not in (None, ""):
+            lines.append(f"{key}: {_compact_metadata_value(merged.get(key))}")
+    lines.append("Instruction: Treat this as image context for the current user turn. If an Image URL is present and the user asks about the image, call analyze_image with that URL and use the metadata, including image geolocation when present, to guide the prompt.")
+    lines.append("[/CONTEXTUAL IMAGE INPUT]")
+    return "\n".join(lines)
+
+
+def _enrich_send_text_with_image_context(message: dict) -> str:
+    if not isinstance(message, dict) or message.get("type") != "send-text":
+        return ""
+    data = message.get("data", {})
+    if not isinstance(data, dict):
+        return ""
+    content = data.get("content", "")
+    if not isinstance(content, str):
+        return ""
+    if "[CONTEXTUAL IMAGE INPUT]" in content:
+        return content
+    image_context = _extract_image_context(data)
+    if image_context:
+        data["content"] = f"{content.rstrip()}\n\n{image_context}" if content.strip() else image_context
+        return data["content"]
+    return content
+
+
+IMAGE_CONTEXT_METADATA_KEY = "latest_image_context"
+_IMAGE_REFERENCE_TERMS = ("image", "photo", "picture", "screenshot", "attachment", "attached")
+
+
+def _extract_contextual_image_block(text: str) -> str:
+    if not text or "[CONTEXTUAL IMAGE INPUT]" not in text:
+        return ""
+    start = text.find("[CONTEXTUAL IMAGE INPUT]")
+    end_marker = "[/CONTEXTUAL IMAGE INPUT]"
+    end = text.find(end_marker, start)
+    if end == -1:
+        return text[start:].strip()
+    return text[start:end + len(end_marker)].strip()
+
+
+def _looks_like_image_followup(text: str) -> bool:
+    normalized = " ".join((text or "").lower().split())
+    return any(term in normalized for term in _IMAGE_REFERENCE_TERMS)
+
+
+PIPECAT_TOOLS = _build_tools_schema(TOOL_NAMES)
 
 # Max conversation turns to restore from DB
-MAX_HISTORY_TURNS = 40
+MAX_HISTORY_TURNS = int(os.environ.get("NOVA_VOICE_HISTORY_TURNS", "8"))
+MAX_LLM_MESSAGE_CHARS = int(os.environ.get("NOVA_MAX_LLM_MESSAGE_CHARS", "1800"))
+MAX_TOOL_RESULT_CHARS = int(os.environ.get("NOVA_MAX_TOOL_RESULT_CHARS", "2500"))
+NOVA_VAD_CONFIDENCE = float(os.environ.get("NOVA_VAD_CONFIDENCE", "0.65"))
+NOVA_VAD_START_SECS = float(os.environ.get("NOVA_VAD_START_SECS", "0.15"))
+NOVA_VAD_STOP_SECS = float(os.environ.get("NOVA_VAD_STOP_SECS", "0.9"))
+NOVA_VAD_MIN_VOLUME = float(os.environ.get("NOVA_VAD_MIN_VOLUME", "0.35"))
+
+
+def _estimate_tokens(messages: list[dict]) -> int:
+    return sum(len(str(msg.get("content") or "")) for msg in messages) // 4
+
+
+def _trim_message_content(content: str, limit: int = MAX_LLM_MESSAGE_CHARS) -> str:
+    text = str(content or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n[...trimmed for prompt budget...]"
+
+
+def _is_interim_send_text_message(message: dict) -> bool:
+    if not isinstance(message, dict) or message.get("type") != "send-text":
+        return False
+    data = message.get("data", {})
+    if not isinstance(data, dict):
+        return False
+    for key in ("is_final", "final", "isFinal"):
+        if key in data:
+            return data.get(key) is False
+    status = str(data.get("status") or data.get("transcript_status") or data.get("transcriptStatus") or "").lower()
+    return status in {"partial", "interim", "tentative", "recognizing"}
+
+
+def _first_nonempty_string(*values: object) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _extract_continuity_payload(message: dict) -> dict:
+    if not isinstance(message, dict):
+        return {}
+    data = message.get("data", {})
+    continuity = {}
+    if isinstance(data, dict) and isinstance(data.get("continuity"), dict):
+        continuity.update(data.get("continuity") or {})
+    if isinstance(message.get("continuity"), dict):
+        continuity.update(message.get("continuity") or {})
+    for source in (data if isinstance(data, dict) else {}, message):
+        for key in (
+            "userId", "user_id", "conversationId", "conversation_id", "clientTurnId", "client_turn_id",
+            "lastClientTurnId", "last_client_turn_id", "lastServerTurnId", "last_server_turn_id",
+            "lastTurnId", "last_turn_id", "lastIntent", "last_intent", "lastTool", "last_tool",
+            "lastTaskArtifactId", "last_task_artifact_id", "lastCardKind", "last_card_kind",
+            "lastErrorCode", "last_error_code", "activeTaskArtifactId", "active_task_artifact_id",
+            "activeGoal", "active_goal", "activeAgentRunId", "active_agent_run_id",
+            "lastKnownPhase", "last_known_phase", "retry",
+        ):
+            if key in source and key not in continuity:
+                continuity[key] = source.get(key)
+    return continuity
+
+
+def _apply_continuity_to_turn_state(state: TurnState, continuity: dict) -> bool:
+    if not isinstance(continuity, dict) or not continuity:
+        return False
+    changed = False
+    active_goal = _first_nonempty_string(continuity.get("activeGoal"), continuity.get("active_goal"))
+    if active_goal and active_goal != state.active_goal:
+        state.active_goal = active_goal
+        changed = True
+    artifact_id = _first_nonempty_string(
+        continuity.get("activeTaskArtifactId"),
+        continuity.get("active_task_artifact_id"),
+        continuity.get("lastTaskArtifactId"),
+        continuity.get("last_task_artifact_id"),
+    )
+    if artifact_id and artifact_id != state.active_task_artifact_id:
+        state.active_task_artifact_id = artifact_id
+        changed = True
+    agent_run_id = _first_nonempty_string(continuity.get("activeAgentRunId"), continuity.get("active_agent_run_id"))
+    if agent_run_id and agent_run_id != state.active_workflow_run_id:
+        state.active_workflow_run_id = agent_run_id
+        changed = True
+    last_intent = _first_nonempty_string(continuity.get("lastIntent"), continuity.get("last_intent"))
+    if last_intent and last_intent != state.last_intent:
+        state.last_intent = last_intent
+        changed = True
+    return changed
+
+
+def _trim_context_messages(messages: list[dict], max_recent: int = MAX_HISTORY_TURNS) -> list[dict]:
+    if not messages:
+        return []
+    trimmed: list[dict] = []
+    for msg in messages[-max_recent:]:
+        role = msg.get("role")
+        content = _trim_message_content(str(msg.get("content") or ""))
+        if role in ("user", "assistant") and content.strip():
+            trimmed.append({"role": role, "content": content})
+    return trimmed
+
+
+def _trim_tool_result_for_llm(tool_name: str, result: object) -> str:
+    text = str(result) if result is not None else ""
+    
+    # Deep data tools need larger limits to function correctly
+    # 64,000 characters allows us to safely ingest ~10,000+ word research documents
+    if tool_name in {
+        "query_frameworks", "query_cig", "search_past_conversations", "web_search", 
+        "query_context", "kg_query", "manage_workspace", "check_studio", "homelab_operations",
+        "service_logs"
+    }:
+        limit = 64000
+    else:
+        limit = MAX_TOOL_RESULT_CHARS
+
+    if len(text) <= limit:
+        trimmed = text
+    else:
+        trimmed_content = text[:limit].rstrip() + f"\n[trimmed {tool_name} result for voice latency; use this summary and answer now]"
+        
+        # If the original text was valid JSON, ensure we return valid JSON
+        # so we don't crash strict LLM API parsers like MiniMax
+        is_json = False
+        if text.strip().startswith("{") or text.strip().startswith("["):
+            try:
+                import json
+                json.loads(text)
+                is_json = True
+            except Exception:
+                pass
+                
+        if is_json:
+            import json
+            trimmed = json.dumps({
+                "_meta": f"Result truncated to {limit} chars for latency.",
+                "partial_data": trimmed_content
+            })
+        else:
+            trimmed = trimmed_content
+
+    if tool_name == "web_search":
+        return (
+            "WEB SEARCH EVIDENCE:\n"
+            f"{trimmed}\n\n"
+            "ANSWER REQUIREMENTS: Answer only from the evidence above. Include source names or citations in the display text. "
+            "For investment, valuation, revenue, IPO, partnership, or legal claims, use cautious wording like 'reported' or "
+            "'according to' unless the evidence is from an official company or regulator source. If evidence is weak, aggregated, "
+            "or only from analysis/social/video sources, say that confidence is limited."
+        )
+    return trimmed
+
+
+def _compact_system_prompt_for_voice(prompt: str) -> str:
+    if os.environ.get("NOVA_COMPACT_SYSTEM_PROMPT", "1").lower() in {"0", "false", "no"}:
+        return prompt
+    marker = "\n\n## Who You Are\n"
+    if marker not in prompt:
+        return prompt
+    _, rest = prompt.split(marker, 1)
+    compact_identity = (
+        "You are Nova, a personal AI voice assistant and companion running on the user's iPhone. "
+        "Speak naturally and concisely through iOS text-to-speech. Use deterministic orchestrators "
+        "and direct tools for specific/current/personal data. Answer from trained knowledge only for "
+        "general facts, and use zero-wait behavior: do not stall or promise action without calling the "
+        "tool in the same response. PCG is long-term memory, CIG is email/calendar/contact intelligence, "
+        "Pi Agent Hub delegates specialist work, and AI Gateway routes LLM/search/vision."
+    )
+    return compact_identity + marker + rest
 
 
 # ---------------------------------------------------------------------------
@@ -132,25 +494,54 @@ async def run_bot(
             prior_turns = [
                 Turn(
                     role=msg["role"],
-                    content=msg["content"],
+                    content=_trim_message_content(msg["content"]),
                     timestamp=msg.get("timestamp", ""),
                     tool_calls=None,
                 )
-                for msg in backend_conv["messages"]
+                for msg in backend_conv["messages"][-MAX_HISTORY_TURNS:]
                 if msg["role"] in ("user", "assistant")
             ]
             # Sync to local SQLite for faster access
             for turn in prior_turns:
                 await append_turn(session.session_id, turn.role, turn.content)
     
+    if audio_mode == "native" and len(prior_turns) < 2 and conversation_id not in {"default", ""}:
+        recent = await get_recent_active_conversation(
+            user_id,
+            exclude_conversation_id=conversation_id,
+            max_age_secs=int(os.environ.get("NOVA_NATIVE_CONTEXT_CONTINUITY_SECS", "1800")),
+            min_turns=2,
+        )
+        if recent:
+            continuity_turns = await get_history(recent["session_id"], limit=MAX_HISTORY_TURNS)
+            if continuity_turns:
+                prior_turns = continuity_turns
+                logger.warning(
+                    f"NOVA_CONTEXT_CONTINUITY | new_conv={conversation_id} restored_from={recent['conversation_id']} "
+                    f"turns={len(prior_turns)} age_secs={int(time.time() - float(recent['last_active']))}"
+                )
+
     logger.info(f"Session {session.session_id}: restored {len(prior_turns)} turns")
 
     # Ensure conversation exists in PostgreSQL backend for search/retrieval
     await ensure_backend_conversation(conversation_id, user_id)
 
+    session_metadata = await get_session_metadata(session.session_id)
+    _turn_state = turn_state_from_metadata(session_metadata)
+    latest_image_context = session_metadata.get(IMAGE_CONTEXT_METADATA_KEY) if isinstance(session_metadata, dict) else None
+    if not latest_image_context:
+        for turn in reversed(prior_turns):
+            if turn.role == "user":
+                latest_image_context = _extract_contextual_image_block(turn.content)
+                if latest_image_context:
+                    break
+    _latest_image_context: list[str] = [latest_image_context if isinstance(latest_image_context, str) else ""]
+
     # ── PCG context (identity, preferences, goals) ──────────────────
     pcg_ctx = await build_context(user_id)
     logger.info(f"PCG context: {len(pcg_ctx.get('memory_snippets', []))} memory items")
+    # Inject daily snapshot (non-persisted) so calendar lookup can use it without tool calls
+    _turn_state.daily_snapshot = pcg_ctx.get("daily_snapshot") or {}
 
     # ── Dynamic system prompt (shaped by PCG preferences) ────────────────
     system_prompt = build_system_prompt(
@@ -161,7 +552,14 @@ async def run_bot(
         preferences_by_category=pcg_ctx.get("preferences_by_category"),
         identity=pcg_ctx.get("identity"),
         daily_snapshot=pcg_ctx.get("daily_snapshot"),
+        recent_insights=pcg_ctx.get("recent_insights"),
+        recent_session_digest=pcg_ctx.get("recent_session_digest"),
+        dream_insights=pcg_ctx.get("dream_insights"),
+        active_goals=pcg_ctx.get("active_goals"),
+        active_task_plans=pcg_ctx.get("active_task_plans"),
+        recent_turn_outcomes=pcg_ctx.get("recent_turn_outcomes"),
     )
+    system_prompt = _compact_system_prompt_for_voice(system_prompt)
 
     # ── Transport ────────────────────────────────────────────────────────
     # NOTE: Even in native mode, we enable audio to ensure Pipecat's
@@ -189,6 +587,9 @@ async def run_bot(
     # Default/medium = medium thinking (reasoning on, 8K tokens)
     # Deep/Verified = high thinking (reasoning on, 16K tokens, deep analysis)
     _thinking_level = "medium"  # default
+    _llm_response_started_at: list[float | None] = [None]
+    _llm_first_text_at: list[float | None] = [None]
+    _llm_text_chars_this_response: list[int] = [0]
 
     class MiniMaxLLMService(_MiniMaxLLM):
         """Extends MiniMaxLLMService with frame logging for voice agent."""
@@ -198,9 +599,30 @@ async def run_bot(
             from pipecat.frames.frames import LLMFullResponseStartFrame, LLMFullResponseEndFrame, LLMTextFrame
             
             # Log outgoing frames
-            if isinstance(frame, (LLMFullResponseStartFrame, LLMFullResponseEndFrame)):
+            if isinstance(frame, LLMFullResponseStartFrame):
+                _llm_response_started_at[0] = time.monotonic()
+                _llm_first_text_at[0] = None
+                _llm_text_chars_this_response[0] = 0
                 logger.info(f"🚀 MiniMaxLLMService.push_frame: {type(frame).__name__} → {direction}")
+                logger.info(f"NOVA_LLM_TIMING | event=response_start | model={LLM_MODEL}")
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                total_ms = 0
+                first_text_ms = 0
+                if _llm_response_started_at[0] is not None:
+                    total_ms = int((time.monotonic() - _llm_response_started_at[0]) * 1000)
+                if _llm_response_started_at[0] is not None and _llm_first_text_at[0] is not None:
+                    first_text_ms = int((_llm_first_text_at[0] - _llm_response_started_at[0]) * 1000)
+                logger.info(f"🚀 MiniMaxLLMService.push_frame: {type(frame).__name__} → {direction}")
+                logger.info(
+                    f"NOVA_LLM_TIMING | event=response_end | model={LLM_MODEL} | "
+                    f"duration_ms={total_ms} | first_text_ms={first_text_ms} | text_chars={_llm_text_chars_this_response[0]}"
+                )
             elif isinstance(frame, LLMTextFrame):
+                if _llm_response_started_at[0] is not None and _llm_first_text_at[0] is None:
+                    _llm_first_text_at[0] = time.monotonic()
+                    first_text_ms = int((_llm_first_text_at[0] - _llm_response_started_at[0]) * 1000)
+                    logger.info(f"NOVA_LLM_TIMING | event=first_text | model={LLM_MODEL} | first_text_ms={first_text_ms}")
+                _llm_text_chars_this_response[0] += len(frame.text or "")
                 logger.info(f"📝 MiniMaxLLMService.push_frame: LLMTextFrame ({len(frame.text)} chars)")
             
             # Call parent to actually push
@@ -226,23 +648,119 @@ async def run_bot(
 
     # Mutable ref — populated after PipelineTask is created
     _rtvi_ref: list = [None]
+    _server_msg_backlog: list[dict] = []
+    _current_turn_id: list[str] = [""]
+    _llm_watchdog_task: list[asyncio.Task | None] = [None]
+    _active_voice_turn: list[VoiceTurnRuntime | None] = [None]
+    _orchestrator_consumed_turn_id: list[str] = [""]
 
     async def _send_server_msg(msg: dict):
         """Send a custom server message to iOS via RTVI protocol."""
         rtvi = _rtvi_ref[0]
         if rtvi is None:
-            logger.warning(f"RTVI not ready, dropping server msg: {msg}")
+            if len(_server_msg_backlog) >= 100:
+                _server_msg_backlog.pop(0)
+            _server_msg_backlog.append(dict(msg))
+            logger.warning(f"RTVI not ready, queued server msg: {msg}")
             return
         try:
             await rtvi.send_server_message(msg)
             logger.debug(f"Sent server msg: {msg}")
         except Exception as e:
             logger.warning(f"Could not send server message: {e}")
+            if msg.get("type") in {"validated", "turn_complete", "turn_status", "validationStep"}:
+                if len(_server_msg_backlog) >= 100:
+                    _server_msg_backlog.pop(0)
+                _server_msg_backlog.append(dict(msg))
+
+    async def _flush_server_msg_backlog():
+        if not _server_msg_backlog or _rtvi_ref[0] is None:
+            return
+        pending = list(_server_msg_backlog)
+        _server_msg_backlog.clear()
+        for msg in pending:
+            await _send_server_msg(msg)
+
+    def _new_turn_id() -> str:
+        return f"turn-{int(time.time() * 1000)}"
+
+    def _ensure_voice_turn_runtime(turn_id: str | None = None) -> VoiceTurnRuntime:
+        if _active_voice_turn[0] is not None:
+            return _active_voice_turn[0]
+
+        active_turn_id = turn_id or _current_turn_id[0] or _new_turn_id()
+        _current_turn_id[0] = active_turn_id
+
+        async def _voice_persist(role: str, content: str):
+            await append_turn(session.session_id, role, content)
+
+        _active_voice_turn[0] = VoiceTurnRuntime(
+            turn_id=active_turn_id,
+            conversation_id=conversation_id,
+            session_id=session.session_id,
+            user_id=user_id,
+            send_server_msg=_send_server_msg,
+            persist_turn=_voice_persist,
+            sync_backend=_sync_message_to_backend,
+            model=LLM_MODEL,
+        )
+        return _active_voice_turn[0]
+
+    async def _complete_orphaned_tool_failure(tool_name: str, failure_notice: str) -> None:
+        runtime = _ensure_voice_turn_runtime()
+        await runtime.tool_failed(tool_name, failure_notice)
+        await runtime.complete_with_error(failure_notice)
+
+    async def _emit_turn_status(phase: str, message: str = "", tool: str = "", severity: str = "info"):
+        if _active_voice_turn[0] is not None:
+            await _active_voice_turn[0].emit_status(phase, message, tool=tool, severity=severity)
+            return
+        payload = {
+            "type": "turn_status",
+            "turn_id": _current_turn_id[0],
+            "phase": phase,
+            "message": message,
+            "severity": severity,
+        }
+        if tool:
+            payload["tool"] = tool
+        await _send_server_msg(payload)
+
+    def _cancel_llm_watchdog():
+        if _active_voice_turn[0] is not None:
+            _active_voice_turn[0].cancel_watchdog()
+        task = _llm_watchdog_task[0]
+        if task and not task.done():
+            task.cancel()
+        _llm_watchdog_task[0] = None
+
+    def _start_llm_watchdog():
+        if _active_voice_turn[0] is not None:
+            _active_voice_turn[0].start_watchdog()
+            return
+        _cancel_llm_watchdog()
+        turn_id = _current_turn_id[0]
+
+        async def _watch():
+            try:
+                await asyncio.sleep(3)
+                if _current_turn_id[0] == turn_id:
+                    await _emit_turn_status("waiting_for_model", "I heard you. I’m waiting on the model to start responding.")
+                await asyncio.sleep(5)
+                if _current_turn_id[0] == turn_id:
+                    await _emit_turn_status("model_slow", "This is taking longer than normal. I’m still working on it.", severity="warning")
+                await asyncio.sleep(12)
+                if _current_turn_id[0] == turn_id:
+                    await _emit_turn_status("model_stalled", "The model is still delayed. I’ll keep the connection alive and finish when it returns.", severity="warning")
+            except asyncio.CancelledError:
+                pass
+
+        _llm_watchdog_task[0] = asyncio.create_task(_watch())
 
     # ── Dual-path response: fast spoken ack + background tool + LLM result ──
     # Only truly slow tools get a spoken ack. check_studio is fast (<2s) and
     # the LLM often chains multiple calls, so acking each one spams the user.
-    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations", "analyze_spreadsheet"}
+    _SLOW_TOOLS = {"hub_delegate", "web_search", "query_cig", "query_frameworks", "tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation", "service_status", "homelab_diagnostics", "manage_workspace", "staar_tutor", "compact_conversations", "analyze_spreadsheet", "analyze_image"}
     # Per-turn dedup: only one spoken ack per user message to prevent feedback
     # loops where the mic picks up the TTS and re-sends it as a new utterance.
     _ack_sent_this_turn: list[bool] = [False]
@@ -256,7 +774,7 @@ async def run_bot(
     _PER_TOOL_LIMITS: dict[str, int] = {
         # ── Cloud / paid APIs ──────────────────────────────────────────────
         "web_search": 3,            # Perplexity Sonar — paid per call; allow 1 natural LLM retry
-        "get_weather": 2,           # OpenWeatherMap — paid API
+        "get_weather": 2,           # Perplexity Sonar — paid per call
         "hub_delegate": 2,          # Hub RPC — approval-gated
         "tesla_control": 3,         # Local relay → Tesla cloud
         "tesla_wake": 2,            # Local relay → Tesla cloud
@@ -264,8 +782,8 @@ async def run_bot(
         "tesla_stream_monitor": 3,  # Local relay → Tesla cloud
         "tesla_location_refresh": 3,# Local relay → Tesla cloud
         # ── Local / homelab ───────────────────────────────────────────────
-        "query_cig": 15,            # CIG analytics
-        "check_studio": 10,         # Local CIG/Hermes
+        "query_cig": 3,             # CIG analytics — 3 is enough; loop guard
+        "check_studio": 3,          # Local CIG/Hermes — 3 is enough; loop guard
         "query_frameworks": 10,     # Local LIAM/PCG
         "recall_memory": 10,        # Local PCG
         "save_memory": 5,           # Local PCG
@@ -273,9 +791,14 @@ async def run_bot(
         "service_status": 6,        # Local Docker API
         "homelab_diagnostics": 4,   # Local Docker API
         "homelab_operations": 4,    # Local Docker API
+        "manage_workspace": 6,      # Pi Workspace API — enough for read+create flows; blocks get_page loops
+        "manage_task_plan": 8,      # Local SQLite — enough for full create protocol
     }
     _per_tool_call_counts: dict[str, int] = {}
     _last_tool_call: dict[str, object] = {"name": None, "args": None, "result": None}
+    _consecutive_dedup_counts: dict[str, int] = {}  # per-tool consecutive duplicate hit counter
+    # Reasoning scaffold — anchors the LLM on the turn's goal across long tool chains
+    _active_turn_context: list[Optional[TurnContext]] = [None]
     # Track recent tool calls to detect duplicates
     # Note: hub_delegate is excluded from dedup because each delegation
     # is a unique long-running task — even if args look similar, the context
@@ -285,10 +808,9 @@ async def run_bot(
     _last_recorded_user_turn_key: list[str] = [""]
     _tool_call_count_this_turn: list[int] = [0]
     _search_tools_exhausted: list[bool] = [False]
-    _structured_final_response_this_turn: list[bool] = [False]
     _PROVIDER_CLASS: dict[str, str] = {
         "web_search": "cloud:perplexity",
-        "get_weather": "cloud:openweathermap",
+        "get_weather": "cloud:perplexity",
         "query_cig": "local:cig",
         "hub_delegate": "local:pi-hub",
         "check_studio": "local:cig",
@@ -344,6 +866,50 @@ async def run_bot(
                 "capture": "ensure_user_turn_learning_event",
             },
         )
+
+    async def _active_action_binding_context_text(user_text: str) -> str:
+        stripped = str(user_text or "").strip().lower().strip(" .!?")
+        confirmations = {"yes", "yes please", "go ahead", "send it", "send it now", "please do", "do it", "confirm"}
+        if stripped not in confirmations:
+            return ""
+        try:
+            entry = await get_active_action_ledger_entry(
+                user_id=user_id,
+                session_id=session.session_id,
+                conversation_id=conversation_id,
+            )
+        except Exception as e:
+            logger.warning(f"Active action binding context lookup failed: {e}")
+            return ""
+        if not entry or str(entry.get("status") or "") != "awaiting_confirmation":
+            return ""
+        target = entry.get("target") if isinstance(entry.get("target"), dict) else {}
+        intent = str(entry.get("intent") or "")
+        if intent != "tesla_navigation_plan":
+            return ""
+        destination = str(target.get("destination") or "").strip()
+        vehicle_hint = str(target.get("vehicle_hint") or "").strip()
+        vin = str(target.get("vin") or "").strip()
+        action_id = str(entry.get("action_id") or "").strip()
+        lines = [
+            "",
+            "",
+            "[ACTIVE ACTION BINDING CONTEXT]",
+            "There is a durable pending action awaiting confirmation.",
+            f"action_id: {action_id}",
+            "intent: tesla_navigation_plan",
+            "status: awaiting_confirmation",
+            f"destination: {destination}",
+            f"vehicle_hint: {vehicle_hint}",
+            f"vin: {vin}",
+            "If the user confirmation means proceed, act on this pending action.",
+            "For Tesla navigation, call tesla_navigation with the recorded destination and vin if present.",
+            "If a vehicle_hint exists but vin is missing, call tesla_control with action=vehicles first and resolve the exact vehicle; do not guess.",
+            "Do not call query_cig, check_studio, search_past_conversations, web_search, or memory tools for this confirmation.",
+            "Do not claim completion unless tesla_navigation returns successful evidence.",
+            "[/ACTIVE ACTION BINDING CONTEXT]",
+        ]
+        return "\n".join(lines)
 
     def _build_spoken_ack(tool_name: str, args: dict) -> str | None:
         """Generate a contextual spoken acknowledgment from tool name + args.
@@ -441,11 +1007,23 @@ async def run_bot(
                 _last_tool_call["name"] == tool_name and 
                 _last_tool_call["args"] == args_str and
                 _last_tool_call["result"] is not None):
-                logger.warning(f"🔥 Duplicate tool call detected: {tool_name}, forcing response")
-                await params.result_callback(
-                    f"SYSTEM: Duplicate {tool_name} call blocked. Do not call this tool again with the same arguments. "
-                    "Use the prior result already in context and respond to the user now."
-                )
+                dedup_count = _consecutive_dedup_counts.get(tool_name, 0) + 1
+                _consecutive_dedup_counts[tool_name] = dedup_count
+                logger.warning(f"🔥 Duplicate tool call detected: {tool_name} (consecutive #{dedup_count}), forcing response")
+                if dedup_count >= 2:
+                    # LLM is stuck in a loop — soft messages aren't working.
+                    # Inject a terminal message and force the turn to end.
+                    logger.error(f"NOVA_DEDUP_HARD_STOP | tool={tool_name} | consecutive_dupes={dedup_count} | forcing turn end")
+                    await params.result_callback(
+                        f"SYSTEM HARD STOP: {tool_name} has been called with identical arguments {dedup_count} times in a row. "
+                        "The tool loop is broken. You MUST stop calling tools immediately and speak your response now. "
+                        "Tell the user what you found and what you need from them. Do NOT call any tool."
+                    )
+                else:
+                    await params.result_callback(
+                        f"SYSTEM: Duplicate {tool_name} call blocked. Do not call this tool again with the same arguments. "
+                        "Use the prior result already in context and respond to the user now."
+                    )
                 logger.info(f"🔥 Duplicate callback completed for {tool_name}")
                 return
 
@@ -458,6 +1036,15 @@ async def run_bot(
             call_num = _tool_calls_this_turn[0]
             provider_class = _PROVIDER_CLASS.get(tool_name, "local:unknown")
             logger.info(f"🔥 Tool call #{call_num}: {tool_name} [{provider_class}] args={str(args)[:100]}")
+            if _active_voice_turn[0] is not None:
+                if tool_name == "search_past_conversations":
+                    await _active_voice_turn[0].emit_status(
+                        "grounding_context",
+                        "Searching prior conversations and excluding the active thread.",
+                        tool=tool_name,
+                    )
+                await _active_voice_turn[0].tool_started(tool_name, f"Using {tool_name}.")
+            await _emit_turn_status("tool_selected", f"Using {tool_name}.", tool=tool_name)
 
             # ── Hard limit: pure runaway-loop guard (not a quality throttle) ──
             if call_num > _MAX_TOOL_CALLS_HARD_LIMIT:
@@ -506,12 +1093,16 @@ async def run_bot(
                     "type": "thinking",
                     "text": thinking_text,
                 })
+                await _emit_turn_status("tool_running", thinking_text, tool=tool_name)
                 
             # Emit granular validationStep for UI
+            _provider_phase = "querying" if provider_class.startswith("local:") else "fetching"
             await _send_server_msg({
                 "type": "validationStep",
                 "tool": tool_name,
                 "status": "running",
+                "phase": _provider_phase,
+                "turn_id": _current_turn_id[0],
             })
             
             from nova.hypothesis import get_hypothesis_validator
@@ -581,15 +1172,28 @@ async def run_bot(
                     or "no past conversations found" in lower_result
                 ):
                     _search_tools_exhausted[0] = True
+                # Calendar-specific: after a CALENDAR_LOOKUP turn completes its
+                # check_studio call, prevent re-fetch within the same turn only.
+                # Do NOT fire on email/contacts results — "meeting" appears in
+                # email subjects constantly and would block legitimate email searches.
+                if tool_name == "check_studio" and isinstance(_turn_state, object):
+                    from nova.turn_orchestrator import TurnIntent
+                    if getattr(_turn_state, "last_intent", "") == TurnIntent.CALENDAR_LOOKUP.value:
+                        _search_tools_exhausted[0] = True
             except asyncio.TimeoutError:
                 _latency_ms = int((time.monotonic() - _t_start) * 1000)
                 logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=timeout")
                 result = f"Tool {tool_name} timed out after {tool_timeout:.0f}s. The operation took too long to complete."
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].tool_failed(tool_name, f"{tool_name} timed out.")
+                await _emit_turn_status("tool_failed", f"{tool_name} timed out.", tool=tool_name, severity="error")
                 await _send_server_msg({
                     "type": "validationStep",
                     "tool": tool_name,
                     "status": "failed",
                     "result": "Timed out",
+                    "latency_ms": _latency_ms,
+                    "turn_id": _current_turn_id[0],
                 })
                 if validator and validator.active:
                     validator.current_session.fail_tool(tool_name, "Timed out")
@@ -597,11 +1201,16 @@ async def run_bot(
                 _latency_ms = int((time.monotonic() - _t_start) * 1000)
                 logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=error | err={e}")
                 result = f"Tool execution error: {str(e)}"
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].tool_failed(tool_name, f"{tool_name} failed.")
+                await _emit_turn_status("tool_failed", f"{tool_name} failed.", tool=tool_name, severity="error")
                 await _send_server_msg({
                     "type": "validationStep",
                     "tool": tool_name,
                     "status": "failed",
                     "result": "Error occurred",
+                    "latency_ms": _latency_ms,
+                    "turn_id": _current_turn_id[0],
                 })
                 if validator and validator.active:
                     validator.current_session.fail_tool(tool_name, str(e))
@@ -613,10 +1222,17 @@ async def run_bot(
             # in which case we forward the card to iOS as a server message and
             # only feed the speakable text back to the LLM. Falls through to
             # normal string handling for every other tool.
-            if isinstance(result, dict) and result.get("display") and result.get("speech"):
-                display_text = str(result.get("display") or "")
-                speech_text = str(result.get("speech") or result.get("speakable") or display_text)
-                card_payload = result.get("card") or {}
+            parsed_result = result
+            if isinstance(result, str):
+                try:
+                    parsed_result = json.loads(result)
+                except Exception:
+                    parsed_result = result
+
+            if isinstance(parsed_result, dict) and parsed_result.get("display") and parsed_result.get("speech"):
+                display_text = str(parsed_result.get("display") or "")
+                speech_text = str(parsed_result.get("speech") or parsed_result.get("speakable") or display_text)
+                card_payload = parsed_result.get("card") or {}
                 if card_payload:
                     try:
                         await _send_server_msg({
@@ -630,23 +1246,33 @@ async def run_bot(
                         logger.error(f"Failed to emit card for {tool_name}: {e}")
                 from nova.text_utils import strip_markdown_for_speech
                 speech_text = strip_markdown_for_speech(speech_text)
-                await _send_server_msg({
-                    "type": "validated",
-                    "text": display_text,
-                    "speechText": speech_text,
-                    "result": tool_name,
-                    "suppressSpeech": False,
-                })
-                if display_text.strip():
-                    await append_turn(session.session_id, "assistant", display_text)
-                    asyncio.create_task(_sync_message_to_backend(
-                        conversation_id, user_id, "assistant", display_text,
-                        model=LLM_MODEL,
-                    ))
-                _structured_final_response_this_turn[0] = True
-                result = f"{tool_name} completed. A structured visual response and separate speech summary have already been sent to the user. Do not add another answer."
-            elif isinstance(result, dict) and "card" in result and "speakable" in result:
-                card_payload = result.get("card") or {}
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].complete_with_structured_response(
+                        display_text,
+                        speech_text,
+                        result=tool_name,
+                    )
+                else:
+                    await _send_server_msg({
+                        "type": "validated",
+                        "result": tool_name,
+                        "text": display_text,
+                        "speechText": speech_text,
+                        "suppressSpeech": True,
+                    })
+                    await _send_server_msg({"type": "turn_complete"})
+                logger.info(f"🔥 HANDLER COMPLETE for {tool_name} after structured response")
+                
+                # We MUST call the Pipecat callback even when short-circuiting,
+                # otherwise the LLM pipeline task hangs forever waiting for the tool result.
+                try:
+                    await params.result_callback("SYSTEM: Handled directly via structured UI response. Do not respond further. End this turn now.")
+                except Exception as e:
+                    logger.warning(f"Failed to send short-circuit callback for {tool_name}: {e}")
+                    
+                return
+            elif isinstance(parsed_result, dict) and "card" in parsed_result and "speakable" in parsed_result:
+                card_payload = parsed_result.get("card") or {}
                 try:
                     await _send_server_msg({
                         "type": "card",
@@ -657,7 +1283,9 @@ async def run_bot(
                     logger.info(f"Emitted card ({card_payload.get('kind')}) for tool {tool_name}")
                 except Exception as e:
                     logger.error(f"Failed to emit card for {tool_name}: {e}")
-                result = str(result.get("speakable") or "")
+                result = str(parsed_result.get("speakable") or "")
+            elif isinstance(parsed_result, (dict, list)):
+                result = json.dumps(parsed_result, indent=2)
 
             # Validate result is not empty
             result_str = str(result) if result is not None else ""
@@ -669,6 +1297,8 @@ async def run_bot(
                     "tool": tool_name,
                     "status": "failed",
                     "result": "No data returned",
+                    "latency_ms": locals().get("_latency_ms", 0),
+                    "turn_id": _current_turn_id[0],
                 })
                 if validator and validator.active:
                     validator.current_session.fail_tool(tool_name, "No data returned")
@@ -681,11 +1311,18 @@ async def run_bot(
                 if not result_str.startswith("Tool execution error:") and not result_str.startswith(f"Tool {tool_name} timed out"):
                     # Extract a snippet for the UI
                     snippet = result_str[:100]
+                    if _active_voice_turn[0] is not None:
+                        await _active_voice_turn[0].tool_completed(tool_name, f"{tool_name} completed.")
+                    await _emit_turn_status("tool_completed", f"{tool_name} completed.", tool=tool_name)
+                    _result_preview = result_str[:200].strip()
                     await _send_server_msg({
                         "type": "validationStep",
                         "tool": tool_name,
                         "status": "completed",
                         "result": snippet,
+                        "result_preview": _result_preview,
+                        "latency_ms": locals().get("_latency_ms", 0),
+                        "turn_id": _current_turn_id[0],
                     })
                     if validator and validator.active:
                         validator.current_session.complete_tool(tool_name, snippet)
@@ -700,7 +1337,13 @@ async def run_bot(
                 "returned http 404",
                 "returned http 500",
                 "tool execution error:",
-                "no past conversations found",
+                "tool error:",
+                "search failed",
+                "search error",
+                "temporarily rate-limited",
+                "daily budget limit",
+                "daily_budget_exceeded",
+                "could not retrieve current external evidence",
                 "no emails found",
                 "thread lookup failed",
                 "thread not found",
@@ -708,6 +1351,17 @@ async def run_bot(
                 "pi agent timed out",
             )
             tool_success = bool(final_result_str.strip()) and not any(marker in final_result_str.lower() for marker in failure_markers)
+            if not tool_success:
+                failure_notice = (
+                    f"I tried to use {tool_name}, but it failed: "
+                    f"{final_result_str[:240].strip() or 'no usable result was returned'}"
+                )
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].tool_failed(tool_name, failure_notice)
+                    await _active_voice_turn[0].complete_with_error(failure_notice)
+                else:
+                    logger.warning(f"NOVA_TOOL_ERROR_FINAL_WITHOUT_RUNTIME | tool={tool_name}")
+                    await _complete_orphaned_tool_failure(tool_name, failure_notice)
             await _record_learning_event(
                 event_type="tool_call_completed",
                 source_layer="llm_tool_loop",
@@ -727,37 +1381,79 @@ async def run_bot(
                     "promotion_candidate": tool_success and tool_name in {"save_memory", "recall_memory", "search_past_conversations", "query_cig", "web_search", "hub_delegate", "tesla_control", "get_weather"},
                 },
             )
+            if not tool_success:
+                # CRITICAL: still close out the function call in Pipecat's aggregator.
+                # If we skip result_callback, the tool_call_id stays in
+                # `_function_calls_in_progress` forever and blocks ALL subsequent
+                # LLM re-invocations after tool calls (Issue A). We pass run_llm=False
+                # because the voice runtime already surfaced the error via
+                # `complete_with_error` above — we don't want a duplicate LLM response.
+                try:
+                    await params.result_callback(
+                        failure_notice,
+                        properties=FunctionCallResultProperties(run_llm=False),
+                    )
+                except Exception as cb_exc:
+                    logger.warning(
+                        f"NOVA_SURFACED_FAILURE_CALLBACK_FAILED | tool={tool_name} err={cb_exc}"
+                    )
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].complete_turn()
+                logger.info(f"🔥 HANDLER COMPLETE for {tool_name} after surfaced failure")
+                return
 
             if tool_name == "analyze_image":
-                ack_text = "Got it — I'm analyzing that image now and will tell you what I find when the vision model finishes."
-                await _send_server_msg({
-                    "type": "validated",
-                    "text": ack_text,
-                    "speechText": ack_text,
-                    "result": "direct",
-                    "suppressSpeech": False,
-                })
-                await _send_server_msg({"phase": "done"})
+                image_question = str(args.get("prompt") or "").strip()
+                result = (
+                    "VISION ANALYSIS RESULT:\n"
+                    f"{str(result).strip()}\n\n"
+                    "SYSTEM: When answering the user about this image, do not return one dense paragraph. "
+                    "Format the visual answer for the app display with short Markdown sections: "
+                    "`### Summary`, `### Notable details`, and, when useful, `### Answer to your question`. "
+                    "Use concise bullets under details. Keep speech natural and avoid dumping raw metadata. "
+                    f"User image question: {image_question}"
+                )
                 _last_tool_call["name"] = tool_name
                 _last_tool_call["args"] = json.dumps(args, sort_keys=True, default=str)
                 _last_tool_call["result"] = result
-                return
 
-            # ── Result path: feed back to LLM for comprehensive spoken response ──
+            result = _trim_tool_result_for_llm(tool_name, result)
+
+            # ── Reasoning scaffold: unified injection (shared with text_chat.py) ──
+            tc = _active_turn_context[0]
+            if tc is not None:
+                try:
+                    args_preview = json.dumps(args, default=str)[:80]
+                    result_str_in = str(result) if result is not None else ""
+                    augmented = augment_tool_result(tc, tool_name, args_preview, result_str_in)
+                    if augmented != result_str_in:
+                        result = augmented
+                        logger.info(
+                            f"NOVA_TURN_ANCHOR_INJECTED | tool={tool_name} "
+                            f"posture={tc.posture} calls={len(tc.tool_history)} evidence={len(tc.evidence_log)}"
+                        )
+                except Exception as e:
+                    logger.warning(f"TurnContext update/render failed (non-fatal): {e}")
+
             logger.info(f"🔥 Calling result_callback for {tool_name} with {len(str(result))} chars: {str(result)[:150]}")
             try:
                 await params.result_callback(result)
                 logger.info(f"🔥 result_callback completed for {tool_name}")
-                # Cache the result for deduplication
+                # Cache the result for deduplication; clear consecutive-dedup counter on success
                 _last_tool_call["name"] = tool_name
                 _last_tool_call["args"] = json.dumps(args, sort_keys=True, default=str)
                 _last_tool_call["result"] = result
+                _consecutive_dedup_counts.pop(tool_name, None)
                 logger.info(f"🔥 Cached result for {tool_name}")
                 # Small delay to ensure Pipecat processes the result before handler returns
                 await asyncio.sleep(0.1)
                 logger.info(f"🔥 HANDLER COMPLETE for {tool_name}")
             except Exception as e:
                 logger.error(f"🔥 result_callback failed for {tool_name}: {e}", exc_info=True)
+                if _active_voice_turn[0] is not None and not _active_voice_turn[0].snapshot.final_response_sent:
+                    await _active_voice_turn[0].complete_with_error(
+                        f"I used {tool_name}, but the model pipeline failed while processing the tool result. Please try again."
+                    )
         return handler
 
     # Native casual tools
@@ -833,23 +1529,31 @@ async def run_bot(
     llm.register_function("youtube", make_tool_handler("youtube"))
     llm.register_function("homelab_operations", make_tool_handler("homelab_operations"))
     llm.register_function("homelab_diagnostics", make_tool_handler("homelab_diagnostics"))
+    llm.register_function("set_active_goal", make_tool_handler("set_active_goal"))
+    llm.register_function("complete_active_goal", make_tool_handler("complete_active_goal"))
+    llm.register_function("manage_task_plan", make_tool_handler("manage_task_plan"))
+    llm.register_function("search_framework_catalog", make_tool_handler("search_framework_catalog"))
 
-    # ── Context with history restoration ─────────────────────────────────
+    compacted_messages = await get_compacted_context(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        max_recent_turns=MAX_HISTORY_TURNS,
+    )
+    restored_context_messages = _trim_context_messages(compacted_messages or [
+        {"role": turn.role, "content": turn.content}
+        for turn in prior_turns[-MAX_HISTORY_TURNS:]
+    ])
+    _semantic_recent_messages: list[dict] = list(restored_context_messages)
+
     messages = [{"role": "system", "content": system_prompt}]
-
-    # Restore prior conversation turns from DB
-    for turn in prior_turns:
-        msg = {"role": turn.role, "content": turn.content}
-        if turn.tool_calls:
-            import json as _json
-            try:
-                msg["tool_calls"] = _json.loads(turn.tool_calls)
-            except Exception:
-                pass
+    for msg in restored_context_messages:
         messages.append(msg)
 
-    if prior_turns:
-        logger.info(f"Restored {len(prior_turns)} turns into LLM context")
+    logger.info(
+        f"NOVA_PROMPT_BUDGET | restored_context={len(restored_context_messages)} "
+        f"messages={len(messages)} approx_tokens={_estimate_tokens(messages)} "
+        f"system_chars={len(system_prompt)}"
+    )
 
     context = LLMContext(messages=messages)
     # Register tools with context
@@ -868,8 +1572,8 @@ async def run_bot(
     # never fires.  This lightweight processor intercepts those frames BEFORE
     # they are consumed.
     _pi_buffer: list[str] = []
-    _pi_thinking_sent: list[bool] = [False]
     _pi_first_text: list[bool] = [False]
+    _pi_has_tool_call: list[bool] = [False]
 
     class PersistenceInterceptor(FrameProcessor):
         async def process_frame(self, frame, direction):
@@ -877,52 +1581,68 @@ async def run_bot(
 
             if isinstance(frame, LLMFullResponseStartFrame):
                 _pi_first_text[0] = False
-                if not _structured_final_response_this_turn[0]:
-                    _pi_thinking_sent[0] = True
-                    await _send_server_msg({"phase": "thinking"})
-                    await ctx_watcher.check_and_persist()
+                _pi_has_tool_call[0] = False
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].llm_started()
+                await _send_server_msg({"phase": "thinking"})
+                await ctx_watcher.check_and_persist()
+
+            elif isinstance(frame, FunctionCallsStartedFrame):
+                _pi_has_tool_call[0] = True
 
             elif isinstance(frame, LLMTextFrame):
-                if _structured_final_response_this_turn[0]:
+                if _active_voice_turn[0] is not None and _active_voice_turn[0].snapshot.turn_complete_sent:
                     return
                 _pi_buffer.append(frame.text)
                 if not _pi_first_text[0]:
                     _pi_first_text[0] = True
+                    if _active_voice_turn[0] is not None:
+                        await _active_voice_turn[0].append_llm_text(frame.text)
                     await _send_server_msg({"phase": "responding"})
+                elif _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].append_llm_text(frame.text)
 
             elif isinstance(frame, LLMFullResponseEndFrame):
-                if _structured_final_response_this_turn[0]:
+                if _active_voice_turn[0] is not None and _active_voice_turn[0].snapshot.turn_complete_sent:
                     _pi_buffer.clear()
-                    _structured_final_response_this_turn[0] = False
+                    return
+                if _pi_has_tool_call[0]:
+                    # Intermediate LLM pass — this generation contained a tool call.
+                    # The real final response comes after the tool executes and the
+                    # LLM runs again. Discard buffered text and let the next pass
+                    # produce the actual response.
+                    _pi_buffer.clear()
+                    _pi_has_tool_call[0] = False
+                    logger.debug(f"NOVA_LLM_INTERMEDIATE_PASS_SKIPPED | turn_id={_current_turn_id[0]}")
                 elif _pi_buffer:
                     full_text = "".join(_pi_buffer)
                     _pi_buffer.clear()
                     if full_text.strip():
-                        await append_turn(session.session_id, "assistant", full_text)
-                        asyncio.create_task(_sync_message_to_backend(
-                            conversation_id, user_id, "assistant", full_text,
-                            model=LLM_MODEL,
-                        ))
                         logger.info(f"Persisted assistant turn ({len(full_text)} chars)")
                         from nova.text_utils import strip_markdown_for_speech
                         speech_text = strip_markdown_for_speech(full_text)
-                        await _send_server_msg({
-                            "type": "validated",
-                            "text": full_text,
-                            "speechText": speech_text,
-                            "result": "direct",
-                            # RTVI already streams each LLMTextFrame to iOS as bot-llm-text
-                            # (which iOS speaks natively). suppressSpeech=True prevents the
-                            # validated event from triggering a second TTS pass.
-                            "suppressSpeech": True,
-                        })
-                await _send_server_msg({"type": "turn_complete"})
-                if _pi_thinking_sent[0]:
-                    await _send_server_msg({"phase": "done"})
-                    _pi_thinking_sent[0] = False
+                        if _active_voice_turn[0] is not None:
+                            await _active_voice_turn[0].complete_with_text(
+                                full_text,
+                                speech_text=speech_text,
+                                result="direct",
+                                suppress_speech=True,
+                            )
+                elif _active_voice_turn[0] is not None:
+                    if _active_voice_turn[0].snapshot.llm_error:
+                        await _active_voice_turn[0].complete_with_error("I heard you, but the model service failed before it returned a response. Please try that again.")
+                    elif _active_voice_turn[0].snapshot.llm_started:
+                        logger.warning(
+                            f"NOVA_EMPTY_LLM_RESPONSE_SUPPRESSED | "
+                            f"turn_id={_current_turn_id[0]} tools_started={_active_voice_turn[0].snapshot.tools_started}"
+                        )
                 
                 # Async background learning consolidation
                 asyncio.create_task(consolidate_session_learning(session.session_id))
+
+            elif isinstance(frame, ErrorFrame):
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].llm_failed(str(getattr(frame, "error", "") or "Pipeline error"))
 
             await self.push_frame(frame, direction)
 
@@ -930,66 +1650,266 @@ async def run_bot(
         async def process_frame(self, frame, direction):
             await super().process_frame(frame, direction)
 
+            if isinstance(frame, ErrorFrame):
+                if _active_voice_turn[0] is not None:
+                    await _active_voice_turn[0].llm_failed(str(getattr(frame, "error", "") or "Pipeline error"))
+                await self.push_frame(frame, direction)
+                return
+
+            if isinstance(frame, (LLMRunFrame, LLMMessagesAppendFrame, LLMMessagesUpdateFrame)) and should_consume_llm_frame_after_orchestrator(
+                frame,
+                _active_voice_turn[0],
+                _orchestrator_consumed_turn_id[0],
+            ):
+                logger.warning(
+                    f"NOVA_ORCHESTRATOR_CONSUMED_LLM_RUN_SUPPRESSED | "
+                    f"turn_id={_active_voice_turn[0].snapshot.turn_id} frame={type(frame).__name__}"
+                )
+                return
+
             text = ""
+            turn_continuity = {}
             if isinstance(frame, InputTransportMessageFrame):
                 msg = frame.message
+                if isinstance(msg, dict) and msg.get("type") == "session-resume":
+                    continuity = _extract_continuity_payload(msg)
+                    changed = _apply_continuity_to_turn_state(_turn_state, continuity)
+                    if changed:
+                        try:
+                            await update_session_metadata_key(
+                                session.session_id,
+                                STATE_METADATA_KEY,
+                                turn_state_to_metadata_value(_turn_state),
+                            )
+                        except Exception as e:
+                            logger.warning(f"Session resume state persist failed: {e}")
+                    logger.info(
+                        f"NOVA_SESSION_RESUME | conv={conversation_id} changed={changed} "
+                        f"client_turn={continuity.get('lastClientTurnId') or continuity.get('last_client_turn_id') or ''} "
+                        f"server_turn={continuity.get('lastServerTurnId') or continuity.get('last_server_turn_id') or ''} "
+                        f"artifact={_turn_state.active_task_artifact_id}"
+                    )
+                    await _send_server_msg({
+                        "type": "session_resumed",
+                        "conversationId": conversation_id,
+                        "activeTaskArtifactId": _turn_state.active_task_artifact_id,
+                        "activeGoal": _turn_state.active_goal,
+                        "activeAgentRunId": _turn_state.active_workflow_run_id,
+                    })
+                    return
                 if isinstance(msg, dict) and msg.get("type") == "send-text":
-                    data = msg.get("data", {})
-                    text = data.get("content", "") if isinstance(data, dict) else ""
+                    if _is_interim_send_text_message(msg):
+                        logger.info("NOVA_STT_INTERIM_IGNORED | transport=turn_orchestrator")
+                        return
+                    turn_continuity = _extract_continuity_payload(msg)
+                    if turn_continuity and _apply_continuity_to_turn_state(_turn_state, turn_continuity):
+                        try:
+                            await update_session_metadata_key(
+                                session.session_id,
+                                STATE_METADATA_KEY,
+                                turn_state_to_metadata_value(_turn_state),
+                            )
+                        except Exception as e:
+                            logger.warning(f"Turn continuity state persist failed: {e}")
+                    text = _enrich_send_text_with_image_context(msg)
+                    image_block = _extract_contextual_image_block(text)
+                    if image_block:
+                        _latest_image_context[0] = image_block
+                        try:
+                            await update_session_metadata_key(
+                                session.session_id,
+                                IMAGE_CONTEXT_METADATA_KEY,
+                                image_block,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Image context metadata persist failed: {e}")
+                    elif _latest_image_context[0] and _looks_like_image_followup(text):
+                        data = msg.get("data", {})
+                        if isinstance(data, dict):
+                            text = f"{text.rstrip()}\n\n{_latest_image_context[0]}"
+                            data["content"] = text
             elif isinstance(frame, TranscriptionFrame):
                 if getattr(frame, "user_id", "") != "system":
                     text = getattr(frame, "text", "") or ""
 
             if text:
-                canonical = canonicalize_turn_text(text)
-                _latest_user_event.clear()
-                _latest_user_event.update(canonical.to_dict())
-                plan = await decide_turn(text, _turn_state)
-                await _record_learning_event(
-                    event_type="user_turn_received",
-                    source_layer="transport",
-                    raw_text=canonical.raw_text,
-                    canonical_text=canonical.canonical_text,
-                    location=canonical.location,
-                    mode_policy=canonical.mode_policy,
-                    outcome="received" if canonical.canonical_text else "blank_after_canonicalization",
-                    payload={
-                        "audio_mode": audio_mode,
-                        "frame_type": type(frame).__name__,
-                    },
-                )
-                await _record_learning_event(
-                    event_type="orchestrator_decision",
-                    source_layer="native_turn_orchestrator",
-                    raw_text=canonical.raw_text,
-                    canonical_text=canonical.canonical_text,
-                    location=canonical.location,
-                    mode_policy=canonical.mode_policy,
-                    outcome=plan.intent.value,
-                    payload={
-                        "intent": plan.intent.value,
-                        "goal": plan.goal,
-                        "allowed_tools": plan.allowed_tools,
-                        "evidence_budget": plan.evidence_budget,
-                        "stop_conditions": plan.stop_conditions,
-                    },
-                )
+                _current_turn_id[0] = _new_turn_id()
+                _orchestrator_consumed_turn_id[0] = ""
+                _ack_sent_this_turn[0] = False
+                _tool_calls_this_turn[0] = 0
+                _per_tool_call_counts.clear()
+                _consecutive_dedup_counts.clear()
+                _last_tool_call.clear()
+                _last_tool_call.update({"name": None, "args": None, "result": None})
+                _search_tools_exhausted[0] = False
+                from nova.hypothesis import get_hypothesis_validator as _get_hv
+                _hv = _get_hv()
+                if _hv is not None:
+                    _hv.set_turn_id(_current_turn_id[0])
+                # Persist previous turn summary before resetting — cross-turn memory layer
+                asyncio.create_task(finalize_and_persist(_active_turn_context[0], user_id, conversation_id))
+                _active_turn_context[0] = None  # will be created after decide_turn
+                runtime = _ensure_voice_turn_runtime(_current_turn_id[0])
+                try:
+                    canonical = canonicalize_turn_text(text)
+                    live_location = (canonical.location or "").strip()
+                    reset_conversation_search_count(user_id)
+                    _latest_user_event.clear()
+                    _latest_user_event.update(canonical.to_dict())
+                    set_progress_context(
+                        on_hub_progress,
+                        user_id,
+                        {"location": live_location} if live_location else None,
+                        conversation_id=conversation_id,
+                    )
+                    await runtime.heard_user(
+                        raw_text=canonical.raw_text,
+                        canonical_text=canonical.canonical_text,
+                        location=canonical.location,
+                        mode_policy=canonical.mode_policy,
+                    )
+                    semantic_started = time.monotonic()
+                    semantic_resolution = await resolve_semantic_turn(
+                        current_text=canonical.canonical_text or text,
+                        recent_messages=_semantic_recent_messages,
+                        model=LLM_MODEL,
+                        ai_gateway_url=AI_GATEWAY_URL,
+                        api_key=AI_GATEWAY_API_KEY,
+                        timeout_secs=4.0,
+                    )
+                    logger.info(
+                        f"NOVA_SEMANTIC_RESOLVER_TIMING | duration_ms={int((time.monotonic() - semantic_started) * 1000)} "
+                        f"resolved={semantic_resolution is not None}"
+                    )
+                    llm_text = text
+                    if not _turn_state.active_action_id:
+                        active_action_context = await _active_action_binding_context_text(canonical.canonical_text or text)
+                        if active_action_context:
+                            llm_text = f"{text.rstrip()}{active_action_context}"
+                            logger.info("NOVA_ACTIVE_ACTION_BINDING_CONTEXT_INJECTED | source=durable_ledger intent=tesla_navigation_plan")
+                    plan = await decide_turn(text, _turn_state, semantic_resolution=semantic_resolution)
+                    tool_budget = select_tool_budget(
+                        llm_text,
+                        ALL_TOOL_NAMES,
+                        plan.intent.value,
+                        learned_candidate=plan.learned_candidate,
+                    )
+                    # Initialize the reasoning scaffold for this turn — anchors goal across tool chains
+                    _active_turn_context[0] = TurnContext(
+                        turn_id=_current_turn_id[0],
+                        user_text=canonical.canonical_text or text,
+                        goal=derive_goal(canonical.canonical_text or text, getattr(plan, "goal", "") or "", plan.intent.value),
+                        intent=plan.intent.value,
+                        evidence_budget=derive_evidence_budget(getattr(plan, "evidence_budget", 0) or 0, plan.intent.value),
+                    )
+                    logger.info(
+                        f"NOVA_TURN_CONTEXT_INIT | turn_id={_current_turn_id[0]} "
+                        f"intent={plan.intent.value} goal={_active_turn_context[0].goal[:80]!r} "
+                        f"evidence_budget={_active_turn_context[0].evidence_budget}"
+                    )
+                    context.set_tools(_build_tools_schema(tool_budget.names))
+                    await runtime.routed(plan.intent.value, len(tool_budget.names))
+                    logger.info(
+                        f"NOVA_TOOL_BUDGET | intent={plan.intent.value} reason={tool_budget.reason} "
+                        f"selected_tools={len(tool_budget.names)} groups={','.join(tool_budget.groups)} "
+                        f"nudge_level={tool_budget.nudge_level} activation={tool_budget.activation:.3f} "
+                        f"confidence={tool_budget.confidence:.3f} learning_rate={tool_budget.learning_rate:.3f} "
+                        f"candidate_id={tool_budget.candidate_id} optimizer={tool_budget.optimizer} "
+                        f"names={','.join(tool_budget.names)}"
+                    )
+                    await _record_learning_event(
+                        event_type="user_turn_received",
+                        source_layer="transport",
+                        raw_text=canonical.raw_text,
+                        canonical_text=canonical.canonical_text,
+                        location=canonical.location,
+                        mode_policy=canonical.mode_policy,
+                        outcome="received" if canonical.canonical_text else "blank_after_canonicalization",
+                        payload={
+                            "audio_mode": audio_mode,
+                            "frame_type": type(frame).__name__,
+                            "tool_budget": {
+                                "reason": tool_budget.reason,
+                                "names": tool_budget.names,
+                                "groups": tool_budget.groups,
+                                "nudge_level": tool_budget.nudge_level,
+                                "activation": tool_budget.activation,
+                                "confidence": tool_budget.confidence,
+                                "learning_rate": tool_budget.learning_rate,
+                                "optimizer": tool_budget.optimizer,
+                                "candidate_id": tool_budget.candidate_id,
+                                "candidate_intent": tool_budget.candidate_intent,
+                                "suggested_tools": tool_budget.suggested_tools,
+                                "gradient_hint": tool_budget.gradient_hint,
+                            },
+                        },
+                    )
+                    await _record_learning_event(
+                        event_type="orchestrator_decision",
+                        source_layer="native_turn_orchestrator",
+                        raw_text=canonical.raw_text,
+                        canonical_text=canonical.canonical_text,
+                        location=canonical.location,
+                        mode_policy=canonical.mode_policy,
+                        outcome=plan.intent.value,
+                        payload={
+                            "intent": plan.intent.value,
+                            "goal": plan.goal,
+                            "allowed_tools": plan.allowed_tools,
+                            "evidence_budget": plan.evidence_budget,
+                            "stop_conditions": plan.stop_conditions,
+                        },
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"NOVA_TURN_INGRESS_RECOVERED | turn_id={_current_turn_id[0]} frame={type(frame).__name__}"
+                    )
+                    await runtime.complete_with_error(
+                        "I hit an internal turn-routing error before I could process that. Please try again."
+                    )
+                    return
 
                 async def _persist(role: str, content: str):
                     await append_turn(session.session_id, role, content)
+                    if role in {"user", "assistant"} and str(content or "").strip():
+                        _semantic_recent_messages.append({"role": role, "content": str(content)})
+                        del _semantic_recent_messages[:-MAX_HISTORY_TURNS]
                     asyncio.create_task(_sync_message_to_backend(
                         conversation_id, user_id, role, content,
                         model=LLM_MODEL if role == "assistant" else None,
                     ))
 
-                handled = await execute_turn_plan(
-                    plan,
-                    _turn_state,
-                    dispatch_tool,
-                    _send_server_msg,
-                    _persist,
-                )
+                try:
+                    orchestrator_result = await execute_turn_plan_result(
+                        plan,
+                        _turn_state,
+                        dispatch_tool,
+                        _send_server_msg,
+                        _persist,
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                        session_id=session.session_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"NOVA_TURN_ORCHESTRATOR_EXECUTION_RECOVERED | "
+                        f"turn_id={_current_turn_id[0]} intent={getattr(plan.intent, 'value', plan.intent)}"
+                    )
+                    await runtime.complete_with_error(
+                        "I hit an internal routing error while processing that. Please try again."
+                    )
+                    return
+                handled = orchestrator_result.handled
                 if handled:
+                    _orchestrator_consumed_turn_id[0] = _current_turn_id[0]
+                    if _active_voice_turn[0] is not None:
+                        await _active_voice_turn[0].emit_final_from_orchestrator(
+                            display_text=orchestrator_result.display_text or orchestrator_result.response,
+                            speech_text=orchestrator_result.speech_text or orchestrator_result.response,
+                            result_label=orchestrator_result.result_label or "turn_orchestrator",
+                            suppress_speech=False,
+                            card=orchestrator_result.card,
+                        )
                     try:
                         await update_session_metadata_key(
                             session.session_id,
@@ -1022,13 +1942,60 @@ async def run_bot(
                             frame.text += instruction
                         logger.info(f"NOVA_LEARNING_ROUTING | Injected assistive routing for {tool_name}")
 
+                if llm_text != text:
+                    if isinstance(frame, InputTransportMessageFrame):
+                        if isinstance(frame.message, dict) and frame.message.get("type") == "send-text":
+                            data = frame.message.get("data")
+                            if isinstance(data, dict):
+                                data["content"] = llm_text
+                    elif isinstance(frame, TranscriptionFrame):
+                        frame.text = llm_text
+
+                if _active_voice_turn[0] is not None:
+                    _active_voice_turn[0].start_watchdog()
+
             await self.push_frame(frame, direction)
 
     turn_orchestrator = TurnOrchestratorFrameProcessor()
 
+    # ── Speculative Cache: pre-fetch layer only ────────────────────────
+    # Warms the dispatch_tool cache so tool calls return instantly.
+    # Does NOT intercept user frames — the LLM always sees every query.
+    # This avoids stale-data-as-truth, enrichment hallucination, and
+    # pattern misrouting that a hard-gate CacheResponseProcessor causes.
+    from nova.speculative_cache import init_speculative_cache, get_speculative_cache
+    _spec_cache = init_speculative_cache(
+        tool_dispatcher=lambda tool_name, tool_args: dispatch_tool(tool_name, tool_args),
+    )
+    # Warm critical entries immediately (calendar, weather) in background
+    async def _initial_cache_warm():
+        try:
+            await asyncio.sleep(3)  # Let session settle first
+            result = await _spec_cache.warm_all()
+            warmed = [k for k, v in result.items() if v]
+            if warmed:
+                logger.info(f"NOVA_SPEC_CACHE | initial warm succeeded: {warmed}")
+        except Exception as e:
+            logger.warning(f"NOVA_SPEC_CACHE | initial warm failed: {e}")
+    asyncio.create_task(_initial_cache_warm())
+    # Start periodic warming (every 10 min)
+    _spec_cache.start_scheduled_warming(interval_seconds=600)
+    logger.info("NOVA_SPEC_CACHE | initialized as pre-fetch layer (no hard gate)")
+
     # Build pipeline based on audio mode
     if use_server_audio:
         # Server-side STT/TTS mode using local Whisper + Qwen TTS
+        vad_params = VADParams(
+            confidence=NOVA_VAD_CONFIDENCE,
+            start_secs=NOVA_VAD_START_SECS,
+            stop_secs=NOVA_VAD_STOP_SECS,
+            min_volume=NOVA_VAD_MIN_VOLUME,
+        )
+        logger.info(
+            f"NOVA_VAD_CONFIG | confidence={NOVA_VAD_CONFIDENCE} "
+            f"start_secs={NOVA_VAD_START_SECS} stop_secs={NOVA_VAD_STOP_SECS} "
+            f"min_volume={NOVA_VAD_MIN_VOLUME}"
+        )
         stt = WhisperSTTService(
             model="Systran/faster-whisper-medium",
             device="cuda",
@@ -1040,7 +2007,7 @@ async def run_bot(
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
             user_params=LLMUserAggregatorParams(
-                vad_analyzer=SileroVADAnalyzer(),
+                vad_analyzer=SileroVADAnalyzer(params=vad_params),
             ),
         )
         pipeline = Pipeline([
@@ -1122,6 +2089,9 @@ async def run_bot(
                 if isinstance(frame, InputTransportMessageFrame):
                     msg = frame.message
                     if isinstance(msg, dict) and msg.get("type") == "send-text":
+                        if _is_interim_send_text_message(msg):
+                            logger.info("NOVA_STT_INTERIM_IGNORED | transport=native_text_bridge")
+                            return
                         data = msg.get("data", {})
                         text = data.get("content", "") if isinstance(data, dict) else ""
                         if text:
@@ -1213,6 +2183,7 @@ async def run_bot(
     )
     # Wire up RTVI ref now that task exists
     _rtvi_ref[0] = task._rtvi
+    await _flush_server_msg_backlog()
 
     # Let tools.py send server messages (e.g. citations from web_search)
     from nova.tools import set_server_msg_fn, set_web_search_agent_mode
@@ -1227,6 +2198,16 @@ async def run_bot(
         def __init__(self):
             self._last_len = len(_original_context_messages)
 
+        def prune_context(self):
+            system = context.messages[:1]
+            recent = _trim_context_messages(context.messages[1:], MAX_HISTORY_TURNS)
+            context.messages[:] = system + recent
+            self._last_len = min(self._last_len, len(context.messages))
+            logger.info(
+                f"NOVA_PROMPT_BUDGET | pruned_live_context messages={len(context.messages)} "
+                f"approx_tokens={_estimate_tokens(context.messages)}"
+            )
+
         async def check_and_persist(self):
             msgs = context.messages
             if len(msgs) > self._last_len:
@@ -1238,16 +2219,20 @@ async def run_bot(
                         _ack_sent_this_turn[0] = False
                         _tool_calls_this_turn[0] = 0
                         _per_tool_call_counts.clear()
+                        _consecutive_dedup_counts.clear()
                         _last_tool_call.clear()
                         _last_tool_call.update({"name": None, "args": None, "result": None})
-                        _structured_final_response_this_turn[0] = False
                         _search_tools_exhausted[0] = False
+                        # Persist previous turn summary before resetting — cross-turn memory layer
+                        asyncio.create_task(finalize_and_persist(_active_turn_context[0], user_id, conversation_id))
+                        _active_turn_context[0] = None
                         await append_turn(session.session_id, "user", content)
                         await _sync_message_to_backend(
                             conversation_id, user_id, "user", content
                         )
                         logger.debug(f"Persisted user turn ({len(content)} chars)")
                 self._last_len = len(msgs)
+                self.prune_context()
 
     ctx_watcher = _ContextWatcher()
 
@@ -1291,7 +2276,7 @@ async def run_bot(
         logger.info(f"Client connected (user={user_id}), session={session.session_id}")
         mark_user_active(user_id)
         event_bus.subscribe_user(user_id, event_handler)
-        set_progress_context(on_hub_progress, user_id)
+        set_progress_context(on_hub_progress, user_id, conversation_id=conversation_id)
         # Start keepalive to prevent iOS from closing idle connections
         _keepalive_task[0] = asyncio.create_task(_keepalive_loop())
         # Skip LLM-generated greeting (MiniMax calls tools unprompted on

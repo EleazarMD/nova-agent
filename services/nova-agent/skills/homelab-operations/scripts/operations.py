@@ -209,7 +209,7 @@ async def handle_service_status(container: str = "") -> str:
     return f"{len(lines)} containers/services:\n" + "\n".join(sorted(lines))
 
 
-async def handle_service_logs(container: str, lines: int = 50) -> str:
+async def handle_service_logs(container: str, lines: int = 50, **kwargs) -> str:
     """Get recent logs from a container. No approval needed (read-only)."""
     if container in PROTECTED_CONTAINERS:
         return f"{container} is a protected system container."

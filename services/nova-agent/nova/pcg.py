@@ -616,9 +616,12 @@ async def upsert_communication_style(
 
 
 async def get_recent_insights(limit: int = 10) -> list[dict]:
-    """Fetch recent daily-consolidation insights (Phase C1 output). Used by
-    the Nova skill `pcg_insights` (Phase C3) to answer 'what did PCG learn
-    about me yesterday?'."""
+    """Fetch recent insights for session startup context.
+
+    Primary: PCG daily-consolidation table (/api/pcg/insights/recent).
+    Fallback: dream_insight preferences written by nova-dream cycle.
+    """
+    insights: list[dict] = []
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -626,16 +629,40 @@ async def get_recent_insights(limit: int = 10) -> list[dict]:
                 headers=_read_headers(),
                 timeout=_TIMEOUT,
             ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                return data.get("insights", [])
+                if resp.status == 200:
+                    data = await resp.json()
+                    insights = data.get("insights", [])
     except Exception as e:  # noqa: BLE001
         logger.warning(f"PCG insights unavailable: {e}")
-        return []
+
+    # Supplement with dream_insight preferences (written by nova-dream) if table is sparse
+    if len(insights) < limit:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{PCG_URL}/api/pic/preferences?category=dream_insight",
+                    headers=_read_headers(),
+                    timeout=_TIMEOUT,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        dream_prefs = data.get("preferences", [])
+                        # Sort by key (date-prefixed) descending → most recent first
+                        dream_prefs.sort(key=lambda p: p.get("key", ""), reverse=True)
+                        for p in dream_prefs[: limit - len(insights)]:
+                            insights.append({
+                                "insight": p.get("value", ""),
+                                "category": "dream",
+                                "date": p.get("key", "")[:10],
+                                "source": "nova-dream",
+                            })
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Dream insights fallback unavailable: {e}")
+
+    return insights[:limit]
 
 
-async def build_daily_snapshot(home_address: str = "", user_tz: str = "America/Chicago") -> dict[str, Any]:
+async def build_daily_snapshot(home_address: str = "", user_tz: str = "America/Chicago", user_id: str = "default") -> dict[str, Any]:
     """Fetch real-time context for the Daily Snapshot block in the system prompt.
 
     Runs all fetches concurrently with tight timeouts so session start is not
@@ -662,6 +689,7 @@ async def build_daily_snapshot(home_address: str = "", user_tz: str = "America/C
         "current_day": weekday,
         "current_date": date_str,
         "current_time": now_local.strftime("%H:%M"),
+        "user_timezone": user_tz,
     }
 
     # ── Family schedule (static, but day-dependent) ───────────────────────
@@ -691,11 +719,11 @@ async def build_daily_snapshot(home_address: str = "", user_tz: str = "America/C
         try:
             from nova.tools import handle_check_studio
             result = await asyncio.wait_for(
-                handle_check_studio(studio="calendar", action="briefing", query=date_str),
+                handle_check_studio(studio="calendar", action="briefing", user_tz=user_tz),
                 timeout=10,
             )
             if result and "error" not in str(result).lower()[:30]:
-                snapshot["calendar_briefing"] = str(result)[:600]
+                snapshot["calendar_briefing"] = str(result)[:1500]
         except Exception as e:
             logger.debug(f"Daily snapshot calendar fetch failed: {e}")
 
@@ -703,7 +731,7 @@ async def build_daily_snapshot(home_address: str = "", user_tz: str = "America/C
         try:
             from nova.tools import handle_tesla_control
             result = await asyncio.wait_for(
-                handle_tesla_control(action="state"),
+                handle_tesla_control(user_id=user_id, action="status"),
                 timeout=8,
             )
             if isinstance(result, dict):
@@ -735,6 +763,41 @@ async def build_daily_snapshot(home_address: str = "", user_tz: str = "America/C
     return snapshot
 
 
+async def _load_active_goals(user_id: str) -> list[dict]:
+    """Load in-progress action ledger entries for session context injection."""
+    import aiosqlite
+    import time as _time
+    try:
+        from nova.store import DB_PATH
+        cutoff = _time.time() - 7 * 86400
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT action_id, intent, active_goal, status, updated_at, user_visible_status, metadata_json
+                FROM nova_action_ledger
+                WHERE (user_id = ? OR user_id = '')
+                  AND status NOT IN ('completed', 'cancelled')
+                  AND updated_at > ?
+                ORDER BY updated_at DESC LIMIT 5
+                """,
+                (user_id, cutoff),
+            )
+            import json as _json
+            results = []
+            for r in rows:
+                entry = dict(r)
+                try:
+                    entry["metadata"] = _json.loads(entry.pop("metadata_json") or "{}")
+                except Exception:
+                    entry["metadata"] = {}
+                results.append(entry)
+            return results
+    except Exception as e:
+        logger.warning(f"_load_active_goals failed: {e}")
+        return []
+
+
 async def build_context(user_id: str) -> dict[str, Any]:
     """Fetch PCG data and structure it for Nova's system prompt.
 
@@ -743,12 +806,15 @@ async def build_context(user_id: str) -> dict[str, Any]:
       - preferences_by_category: dict[str, list[dict]] (for personality shaping)
       - memory_snippets: list[str] (for ## Memory section)
       - identity: raw identity dict
+      - recent_insights: list[dict] from PCG daily consolidation (yesterday's learnings)
+      - recent_session_digest: list[dict] from compacted conversation summaries
+      - active_goals: list[dict] from nova_action_ledger (in-progress multi-session work)
     """
     import asyncio as _asyncio
 
     _cache.invalidate()  # fresh start for new session
 
-    # Run cache warm + daily snapshot concurrently to minimise session-start latency
+    # Run cache warm + insights + session digest concurrently
     await _ensure_cache()
 
     identity_data = _cache.identity
@@ -762,6 +828,9 @@ async def build_context(user_id: str) -> dict[str, Any]:
         "preferences_by_category": {},
         "memory_snippets": [],
         "daily_snapshot": {},
+        "recent_insights": [],
+        "dream_insights": [],
+        "recent_session_digest": [],
     }
 
     # Identity — PIC /api/pic/identity returns fields at the TOP LEVEL
@@ -795,21 +864,85 @@ async def build_context(user_id: str) -> dict[str, Any]:
         if full_name:
             result["memory_snippets"].append(f"User full name: {full_name}")
 
-    # Daily snapshot — runs after identity so we have home_address + timezone
+    # Daily snapshot + PCG insights + session digest — all concurrent
+    async def _load_insights():
+        try:
+            return await _asyncio.wait_for(get_recent_insights(limit=5), timeout=5)
+        except Exception as _e:
+            logger.debug(f"PCG insights skipped: {_e}")
+            return []
+
+    async def _load_session_digest():
+        try:
+            from nova.store import get_recent_session_digest
+            return await _asyncio.wait_for(
+                get_recent_session_digest(user_id, max_conversations=3, max_age_days=7),
+                timeout=5,
+            )
+        except Exception as _e:
+            logger.debug(f"Session digest skipped: {_e}")
+            return []
+
+    async def _load_snapshot():
+        try:
+            return await _asyncio.wait_for(
+                build_daily_snapshot(home_address=home_address, user_tz=user_tz, user_id=user_id),
+                timeout=12,
+            )
+        except Exception as _e:
+            logger.warning(f"Daily snapshot timed out or failed: {_e}")
+            return {}
+
+    async def _load_dreams():
+        try:
+            from nova.context_layer import _load_dream_insights
+            return await _asyncio.wait_for(
+                _load_dream_insights(limit=5, max_age_days=3),
+                timeout=5,
+            )
+        except Exception as _e:
+            logger.debug(f"Dream insights skipped: {_e}")
+            return []
+
+    snapshot, insights, session_digest, dream_insights = await _asyncio.gather(
+        _load_snapshot(),
+        _load_insights(),
+        _load_session_digest(),
+        _load_dreams(),
+    )
+    result["daily_snapshot"] = snapshot
+    result["recent_insights"] = insights
+    result["recent_session_digest"] = session_digest
+    result["dream_insights"] = dream_insights
+
+    # Active multi-session goals from action ledger
+    result["active_goals"] = await _load_active_goals(user_id)
+
+    # Active task plans — structured cross-session work plans
     try:
-        snapshot = await _asyncio.wait_for(
-            build_daily_snapshot(home_address=home_address, user_tz=user_tz),
-            timeout=12,
-        )
-        result["daily_snapshot"] = snapshot
+        from nova.task_plan import load_active_plans_for_context
+        result["active_task_plans"] = await load_active_plans_for_context(user_id)
     except Exception as _e:
-        logger.warning(f"Daily snapshot timed out or failed: {_e}")
+        logger.warning(f"_load_active_task_plans failed: {_e}")
+        result["active_task_plans"] = []
+
+    # Recent turn outcomes — cross-turn memory layer for vertical reasoning
+    # Tells Nova what she tried in recent turns so she can resume with awareness
+    try:
+        from nova.turn_log import load_recent_turn_summaries
+        result["recent_turn_outcomes"] = await load_recent_turn_summaries(user_id, limit=3)
+    except Exception as _e:
+        logger.warning(f"load_recent_turn_summaries failed: {_e}")
+        result["recent_turn_outcomes"] = []
 
     # Preferences — indexed by category for prompt builder to use
+    # dream_insight prefs are surfaced via recent_insights, not raw snippets
     by_cat: dict[str, list[dict]] = {}
     for p in prefs:
         cat = p.get("category", "other")
         by_cat.setdefault(cat, []).append(p)
+        if cat == "dream_insight":
+            continue
         val = p.get("value", "")
         key = p.get("key", "")
         if val:
@@ -827,9 +960,9 @@ async def build_context(user_id: str) -> dict[str, Any]:
             result["memory_snippets"].append(snippet)
 
     logger.info(
-        f"PCG context for {user_id}: {len(prefs)} prefs, "
-        f"{len(goals)} goals, {len(result['memory_snippets'])} snippets, "
-        f"snapshot_keys={list(result['daily_snapshot'].keys())}"
+        f"PCG context for {user_id}: {len(prefs)} prefs, {len(goals)} goals, "
+        f"{len(result['memory_snippets'])} snippets, {len(insights)} insights, "
+        f"{len(session_digest)} digest entries, snapshot_keys={list(snapshot.keys())}"
     )
     return result
 
