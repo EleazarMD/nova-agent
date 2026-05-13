@@ -224,18 +224,190 @@ def build_skill_index() -> str:
     return "\n".join(lines)
 
 
-def load_skill_bodies_for_tools(tool_names: list[str]) -> str:
-    """Return the full markdown body for every skill whose tool_name is in
-    *tool_names*.  Used to lazily inject behavioral protocol only for tools
-    that are actually available in the current turn.
+# ---------------------------------------------------------------------------
+# Skill body tiering (Phase 1a context optimization)
+# ---------------------------------------------------------------------------
+# Without tiering, every active tool's full SKILL.md is inlined into the
+# system prompt every turn. workspace-manager alone is ~27KB / ~6.8K tokens.
+# Empirically the model only needs the *triggers, routing rules, and a handful
+# of canonical examples* — the full Failure Recovery / Technical Details /
+# verbose Examples sections rarely change behavior but cost thousands of tokens
+# per turn.
+#
+# Strategy (all overridable via env vars for rollback):
+#   - Small skill body  (≤ NOVA_SKILL_INLINE_FULL_CHARS, default 2000):
+#         inline verbatim.
+#   - Medium / large body:
+#         inline a compacted "essentials" view (description + When to Invoke /
+#         Triggers + first one or two Examples + Routing rules), capped at
+#         NOVA_SKILL_ESSENTIALS_MAX_CHARS (default 1800).
+#   - Doc-only skill (no tool_name, no parameters):
+#         SKIPPED by default. Set `always_inline: true` in the frontmatter to
+#         keep one in the prompt, or call `discover_skills(name=...)` on demand.
+#
+# Hard kill switch: NOVA_SKILL_TIERING=0 reverts to the legacy "full body always".
 
-    Returns a combined markdown string ready to append to the system prompt,
-    or an empty string if nothing matched.
+import os
+import re
+
+_TIERING_ENABLED = os.environ.get("NOVA_SKILL_TIERING", "1").lower() not in {"0", "false", "no"}
+_INLINE_FULL_CHARS = int(os.environ.get("NOVA_SKILL_INLINE_FULL_CHARS", "2000"))
+_ESSENTIALS_MAX_CHARS = int(os.environ.get("NOVA_SKILL_ESSENTIALS_MAX_CHARS", "1800"))
+_INCLUDE_DOC_SKILLS = os.environ.get("NOVA_SKILL_INCLUDE_DOC_ONLY", "0").lower() in {"1", "true", "yes"}
+
+# Section headers we consider "essential" — keep these verbatim (within budget).
+# Ordered from highest to lowest priority.
+_ESSENTIAL_HEADERS = (
+    "When to Invoke",
+    "When to Use",
+    "Triggers",
+    "Routing",
+    "Instructions",
+    "Critical Rules",
+    "Session Protocol",
+    "Decision rule",
+    "Anti-retry rules",
+    "Examples",
+    "Categories",
+    "Tools",
+    "Actions",
+)
+
+# Headers we explicitly drop in essentials mode — they're useful for human
+# documentation but don't change LLM behavior.
+_NOISE_HEADERS = (
+    "Technical Details",
+    "References",
+    "Architecture",
+    "Failure Recovery",
+    "Failure Recovery Examples",
+    "Error Handling",
+    "Search Tips",
+    "Status",
+    "Features",
+    "Caching Strategy",
+    "Source Tracking",
+    "Templates",
+    "Advanced Canvas Page Composition",
+    "Nova Authorship Metadata",
+    "Response Format",
+    "Model Selection",
+    "Preference Categories",
+    "Read Operations",
+    "Write Operations",
+)
+
+
+def _split_markdown_sections(body: str) -> list[tuple[str, str]]:
+    """Split a markdown body into (heading, content) tuples.
+
+    Top-level sections are detected by ``^## `` or ``^### ``. Content before
+    the first heading is returned with heading == "" (the lead paragraph).
     """
-    if not tool_names or not SKILLS_DIR.is_dir():
+    parts: list[tuple[str, str]] = []
+    current_heading = ""
+    current_buf: list[str] = []
+    for line in body.splitlines():
+        m = re.match(r"^(#{2,3}) +(.+?)\s*$", line)
+        if m:
+            if current_buf or current_heading:
+                parts.append((current_heading, "\n".join(current_buf).strip()))
+            current_heading = m.group(2).strip()
+            current_buf = []
+        else:
+            current_buf.append(line)
+    if current_buf or current_heading:
+        parts.append((current_heading, "\n".join(current_buf).strip()))
+    return parts
+
+
+def _extract_skill_essentials(body: str, max_chars: int = _ESSENTIALS_MAX_CHARS) -> str:
+    """Produce a compact "essentials" view of a skill body.
+
+    Keeps the lead paragraph and any sections whose heading matches
+    ``_ESSENTIAL_HEADERS``. Drops sections whose heading matches
+    ``_NOISE_HEADERS``. Truncates examples sections aggressively.
+    Caller is responsible for the surrounding ``### Skill: <name>`` wrapper.
+    """
+    if not body:
         return ""
-    name_set = set(tool_names)
+    sections = _split_markdown_sections(body)
+
+    def is_noise(heading: str) -> bool:
+        h = heading.lower()
+        return any(noise.lower() in h for noise in _NOISE_HEADERS)
+
+    def is_essential(heading: str) -> bool:
+        h = heading.lower()
+        return any(ess.lower() in h for ess in _ESSENTIAL_HEADERS)
+
+    out: list[str] = []
+    used = 0
+
+    # Always keep the lead paragraph (before any heading) if present.
+    for heading, content in sections:
+        if heading:
+            continue
+        if not content.strip():
+            continue
+        snippet = content.strip()
+        if len(snippet) > 600:
+            snippet = snippet[:600].rstrip() + "…"
+        out.append(snippet)
+        used += len(snippet)
+        break
+
+    # Pass 1: essential headers in priority order.
+    seen: set[str] = set()
+    for priority in _ESSENTIAL_HEADERS:
+        if used >= max_chars:
+            break
+        for heading, content in sections:
+            if not heading or heading in seen:
+                continue
+            if priority.lower() not in heading.lower():
+                continue
+            if is_noise(heading):
+                continue
+            seen.add(heading)
+            body_text = content.strip()
+            if not body_text:
+                continue
+            # Examples sections: keep only the first ~400 chars to avoid
+            # multi-screen example tables eating the budget.
+            if "example" in heading.lower() and len(body_text) > 400:
+                body_text = body_text[:400].rstrip() + "\n…"
+            budget = max_chars - used - len(heading) - 8
+            if budget <= 80:
+                break
+            if len(body_text) > budget:
+                body_text = body_text[:budget].rstrip() + "\n…"
+            section = f"### {heading}\n{body_text}"
+            out.append(section)
+            used += len(section) + 2
+
+    return "\n\n".join(out).strip()
+
+
+def load_skill_bodies_for_tools(tool_names: list[str]) -> str:
+    """Return inlinable skill documentation for the active tools this turn.
+
+    Tiering (Phase 1a):
+      - tool body ≤ ``NOVA_SKILL_INLINE_FULL_CHARS`` → full body
+      - tool body > threshold                       → essentials only
+      - doc-only skill (no tool_name)               → SKIPPED unless
+                                                       ``always_inline: true``
+                                                       in frontmatter, or
+                                                       NOVA_SKILL_INCLUDE_DOC_ONLY=1
+
+    The legacy behaviour (full bodies, all doc skills) is restored by setting
+    ``NOVA_SKILL_TIERING=0``.
+    """
+    if not SKILLS_DIR.is_dir():
+        return ""
+    name_set = set(tool_names or [])
     sections: list[str] = []
+
     for skill_dir in sorted(SKILLS_DIR.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -247,13 +419,37 @@ def load_skill_bodies_for_tools(tool_names: list[str]) -> str:
             continue
         tool_name = fm.get("tool_name") or ""
         skill_name = fm.get("name") or skill_dir.name
-        # Include if tool is active OR if skill is doc-only (no tool_name)
-        is_active_tool = tool_name and tool_name in name_set
+        is_active_tool = bool(tool_name and tool_name in name_set)
         is_doc_skill = not tool_name and not fm.get("parameters")
+        always_inline = bool(fm.get("always_inline"))
+
         if not is_active_tool and not is_doc_skill:
             continue
-        if body:
+        if is_doc_skill and not always_inline and not _INCLUDE_DOC_SKILLS:
+            # Skipped — available on demand via discover_skills().
+            continue
+        if not body:
+            continue
+
+        if not _TIERING_ENABLED or len(body) <= _INLINE_FULL_CHARS or always_inline:
             sections.append(f"### Skill: {skill_name}\n{body}")
+        else:
+            essentials = _extract_skill_essentials(body)
+            if essentials:
+                sections.append(
+                    f"### Skill: {skill_name} (essentials — call "
+                    f"`discover_skills(name='{skill_name}')` for the full protocol)\n"
+                    f"{essentials}"
+                )
+            else:
+                # Fall back to a short header so the model at least knows the
+                # skill exists; bodies that failed essentials extraction are
+                # almost certainly malformed.
+                desc = str(fm.get("description") or "").strip()
+                sections.append(
+                    f"### Skill: {skill_name} (on-demand)\n{desc[:300]}"
+                )
+
     return "\n\n".join(sections)
 
 

@@ -63,6 +63,13 @@ from nova.prompt import build_system_prompt
 from nova.push import mark_user_active, mark_user_inactive, register_push_fallback
 from nova.store import init_db, get_or_create_session, append_turn, get_history, get_compacted_context, _sync_message_to_backend, ensure_backend_conversation, get_backend_conversation, Turn, get_session_metadata, update_session_metadata_key, append_learning_event, get_recent_active_conversation, get_active_action_ledger_entry
 from nova.pcg import build_context, record_observation, create_preference
+from nova.context_budget import check_overflow_risk
+from nova.context_compactor import (
+    compact_if_over_latency_threshold,
+    trim_tool_result_for_history,
+    LATENCY_THRESHOLD_TOKENS,
+    HISTORY_TOOL_RESULT_CAP,
+)
 from nova.tools import TOOL_DEFINITIONS, dispatch_tool, reset_conversation_search_count, set_progress_context
 from nova.turn_policy import canonicalize_turn_text
 from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan_result, turn_state_from_metadata, turn_state_to_metadata_value
@@ -1472,6 +1479,9 @@ async def run_bot(
     # Delegated (actions requiring browser/email/calendar/shell)
     # Hub Agent delegation (Pi Agent Hub background agents)
     llm.register_function("hub_delegate", make_tool_handler("hub_delegate"))
+    # Non-blocking background delegation (long research / writing tasks)
+    llm.register_function("delegate_background", make_tool_handler("delegate_background"))
+    llm.register_function("background_task_status", make_tool_handler("background_task_status"))
     # CIG analytics (Communication Intelligence Graph)
     llm.register_function("query_cig", make_tool_handler("query_cig"))
     # Studio quick-reads (direct dashboard API)
@@ -1549,10 +1559,16 @@ async def run_bot(
     for msg in restored_context_messages:
         messages.append(msg)
 
+    _approx = _estimate_tokens(messages)
     logger.info(
         f"NOVA_PROMPT_BUDGET | restored_context={len(restored_context_messages)} "
-        f"messages={len(messages)} approx_tokens={_estimate_tokens(messages)} "
+        f"messages={len(messages)} approx_tokens={_approx} "
         f"system_chars={len(system_prompt)}"
+    )
+    check_overflow_risk(
+        _approx, path="voice_init",
+        message_count=len(messages),
+        extra={"restored": len(restored_context_messages)},
     )
 
     context = LLMContext(messages=messages)
@@ -2200,12 +2216,31 @@ async def run_bot(
 
         def prune_context(self):
             system = context.messages[:1]
-            recent = _trim_context_messages(context.messages[1:], MAX_HISTORY_TURNS)
+            # Step 1 — latency-aware tool-result clearing on the live history
+            # (the body that's about to ride along into the next user turn).
+            # _trim_context_messages already strips tool_call/tool roles, but
+            # when this is invoked mid-pipeline the in-flight tool_results are
+            # still present. We stub the old ones here so the next turn's
+            # prompt is small even if the previous turn had a 64K-char tool.
+            live_body = list(context.messages[1:])
+            compact_if_over_latency_threshold(
+                live_body,
+                threshold_tokens=LATENCY_THRESHOLD_TOKENS,
+                path="voice_prune",
+            )
+            # Step 2 — sliding window + per-message char cap as before.
+            recent = _trim_context_messages(live_body, MAX_HISTORY_TURNS)
             context.messages[:] = system + recent
             self._last_len = min(self._last_len, len(context.messages))
+            _approx = _estimate_tokens(context.messages)
             logger.info(
                 f"NOVA_PROMPT_BUDGET | pruned_live_context messages={len(context.messages)} "
-                f"approx_tokens={_estimate_tokens(context.messages)}"
+                f"approx_tokens={_approx}"
+            )
+            check_overflow_risk(
+                _approx, path="voice_live",
+                message_count=len(context.messages),
+                extra={"after_prune": True},
             )
 
         async def check_and_persist(self):

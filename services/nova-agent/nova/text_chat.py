@@ -31,6 +31,8 @@ from pydantic import BaseModel
 from nova.store import init_db, get_or_create_session, append_turn, get_history, get_compacted_context, _sync_message_to_backend, ensure_backend_conversation, get_session_metadata, update_session_metadata_key, get_turn_policy_metrics
 from nova.prompt import build_system_prompt
 from nova.pcg import build_context as _build_pcg_context
+from nova.context_budget import check_overflow_risk
+from nova.context_compactor import compact_if_over_latency_threshold, LATENCY_THRESHOLD_TOKENS
 from nova.tools import TOOL_DEFINITIONS, dispatch_tool, reset_conversation_search_count, set_progress_context
 from nova.turn_orchestrator import STATE_METADATA_KEY, TurnState, decide_turn, execute_turn_plan_result, get_orchestrator_metrics, turn_state_from_metadata, turn_state_to_metadata_value
 from nova.turn_tool_policy import CORE_TOOL_NAMES, select_tool_budget
@@ -151,6 +153,7 @@ class ChatResponse(BaseModel):
     tool_calls: Optional[list] = None
     citations: Optional[list] = None
     cards: Optional[list] = None
+    workspace_page_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -481,11 +484,18 @@ async def chat_completions(request: Request):
             f"intent={plan_preview.intent.value} goal={turn_context.goal[:80]!r} "
             f"evidence_budget={turn_context.evidence_budget}"
         )
+        _approx = _estimate_tokens(full_messages)
         logger.info(
             f"NOVA_PROMPT_BUDGET | text_chat messages={len(full_messages)} "
-            f"history={len(history_messages)} approx_tokens={_estimate_tokens(full_messages)} "
+            f"history={len(history_messages)} approx_tokens={_approx} "
             f"system_chars={len(system_prompt)} tools={len(tool_budget.names)} "
             f"intent={plan_preview.intent.value} tool_reason={tool_budget.reason}"
+        )
+        check_overflow_risk(
+            _approx, path="text_chat",
+            message_count=len(full_messages),
+            tools_in_turn=len(tool_budget.names),
+            intent=plan_preview.intent.value,
         )
         
         # Save user turn (SQLite + PostgreSQL)
@@ -534,6 +544,16 @@ async def chat_completions(request: Request):
                     "content": tool_content,
                 })
             
+            # Latency-aware compaction: if multiple tools fired and pushed
+            # the prompt over the threshold, stub the older tool_results
+            # before the follow-up LLM call. The model still has the most
+            # recent few results verbatim (per nova.context_compactor).
+            compact_if_over_latency_threshold(
+                full_messages,
+                threshold_tokens=LATENCY_THRESHOLD_TOKENS,
+                path="text_chat_post_tools",
+            )
+
             # Get final response after tool execution
             response_text, _, usage = await _call_llm(full_messages, stream=False)
             if not response_text and tool_results:
@@ -667,11 +687,18 @@ async def simple_chat(req: ChatRequest):
             f"intent={plan.intent.value} goal={turn_context.goal[:80]!r} "
             f"evidence_budget={turn_context.evidence_budget}"
         )
+        _approx = _estimate_tokens(messages)
         logger.info(
             f"NOVA_PROMPT_BUDGET | simple_chat messages={len(messages)} "
-            f"history={len(history_messages)} approx_tokens={_estimate_tokens(messages)} "
+            f"history={len(history_messages)} approx_tokens={_approx} "
             f"system_chars={len(system_prompt)} tools={len(tool_budget.names)} "
             f"intent={plan.intent.value} tool_reason={tool_budget.reason}"
+        )
+        check_overflow_risk(
+            _approx, path="simple_chat",
+            message_count=len(messages),
+            tools_in_turn=len(tool_budget.names),
+            intent=plan.intent.value,
         )
         orchestrated_response: list[str] = []
 
@@ -708,6 +735,7 @@ async def simple_chat(req: ChatRequest):
                 model=LLM_MODEL,
                 usage=None,
                 tool_calls=orchestration_result.tools_used or None,
+                workspace_page_id=orchestration_result.workspace_page_id or None,
             )
         
         # Save user turn (SQLite + PostgreSQL)
