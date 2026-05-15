@@ -102,6 +102,7 @@ def build_system_prompt(
     active_goals: Optional[list[dict]] = None,
     active_task_plans: Optional[list[dict]] = None,
     recent_turn_outcomes: Optional[list[dict]] = None,
+    active_plan_anchor: Optional[dict] = None,
 ) -> str:
     """Build a concise voice-optimized system prompt.
 
@@ -110,6 +111,29 @@ def build_system_prompt(
     """
     prefs_by_cat = preferences_by_category or {}
     identity = identity or {}
+
+    # ── Active session plan anchor (injected first, before all else) ────────
+    # Pinned at the top so stream truncation, tool loops, and context window
+    # pressure cannot wipe out the primary goal for this session.
+    _plan_anchor_block = ""
+    if active_plan_anchor and active_plan_anchor.get("plan_id"):
+        _pa = active_plan_anchor
+        _pa_lines = [
+            "## 🗺 Current Session Plan (DO NOT ABANDON)",
+            f"Plan: {_pa.get('topic', 'Unnamed plan')}  (plan_id: {_pa.get('plan_id', '')[:16]}...)",
+        ]
+        if _pa.get("description"):
+            _pa_lines.append(f"Goal: {_pa['description'][:200]}")
+        if _pa.get("workspace_page_id"):
+            _pa_lines.append(f"Workspace page: {_pa['workspace_page_id']}")
+        _steps = _pa.get("steps") or []
+        _pending = [s for s in _steps if s.get("status") not in ("done", "skipped")]
+        if _pending:
+            _pa_lines.append("Next steps:")
+            for _s in _pending[:4]:
+                _pa_lines.append(f"  ☐ {_s.get('title', '')}")
+        _pa_lines.append("If interrupted, resume this plan. Use manage_task_plan(action=get) to reload full detail.")
+        _plan_anchor_block = "\n".join(_pa_lines) + "\n\n"
 
     try:
         tz = ZoneInfo(user_timezone) if user_timezone else timezone.utc
@@ -121,6 +145,10 @@ def build_system_prompt(
     time_str = now_local.strftime(f"%A, %B %d, %Y at %I:%M %p ({tz_label})")
 
     sections = []
+
+    # Session plan anchor — injected before identity so it survives context pressure
+    if _plan_anchor_block:
+        sections.append(_plan_anchor_block)
 
     # Identity — first and prominent
     sections.append(
@@ -286,24 +314,27 @@ def build_system_prompt(
         "- Never dump lists unprompted — say 'I found 3 options, want me to list them?'\n"
         "- Keep responses under 3 sentences unless the user asks for more\n"
         "- Never say 'I don't have context' — check recall_memory or conversation history first\n\n"
-        "## TTS Formatting Rules (CRITICAL — your output is read aloud by text-to-speech)\n"
-        "You speak through iOS text-to-speech. Raw markdown syntax is read verbatim and sounds terrible.\n\n"
-        "**NEVER output in spoken text**:\n"
-        "- Markdown tables with pipes: | Battery | 52% | → TTS reads 'pipe Battery pipe 52 percent pipe'\n"
-        "- Separator rows: |------|-------| → TTS reads 'dash dash dash dash'\n"
-        "- Bullet markers (- or •) as list prefixes → TTS reads 'dash' or 'bullet'\n"
-        "- Raw symbols: °F → say 'degrees Fahrenheit', % → say 'percent', mph → say 'miles per hour'\n\n"
-        "**INSTEAD, speak structured data as natural sentences**:\n"
-        "- Tool returns a table of stats → Speak as: 'Battery is 52 percent with 138 miles of range. "
-        "Interior is 81 degrees Fahrenheit. Climate is off. Locked, sentry mode off.'\n"
-        "- Tool returns a list → Speak as: 'I found 3 items: first, ... second, ... third, ...'\n"
-        "- Tool returns key-value pairs → Speak as: 'The battery is 52 percent. Range is 138 miles.'\n\n"
-        "**Rule**: If you wouldn't say it naturally in conversation, don't write it. "
-        "Tables are fine for visual display but you are a VOICE assistant — speak, don't format.\n\n"
+        "## Display Formatting (text shown in the iOS conversation UI)\n"
+        "Your text output is displayed in the iOS conversation UI AND spoken via TTS. "
+        "The speech pipeline automatically strips markdown for audio — so use markdown freely for visual structure.\n\n"
+        "**Use markdown for display clarity**:\n"
+        "- Line breaks between distinct pieces of information\n"
+        "- **Bold** for key values (names, addresses, times)\n"
+        "- Short bullet lists (2–4 items) when enumerating concrete items\n"
+        "- `# Heading` for multi-section responses the user asked to expand\n\n"
+        "**Example — navigation confirmation (good)**:\n"
+        "Navigation sent to **Houston Methodist Primary Care Group, Mont Belvieu**.\n\nYou're on from 8:00 AM to 4:30 PM today.\n\n"
+        "**Example — vehicle status (good)**:\n"
+        "**Black Panther** is at **96% battery** (249 miles range).\nClimate is on, interior 70°F. Locked.\n\n"
+        "## TTS Speech Rules (spoken aloud — pipeline auto-strips markdown)\n"
+        "The spoken version is auto-generated from your text. Keep the natural language conversational:\n\n"
+        "**Avoid in spoken content** (pipeline won't catch these correctly):\n"
+        "- Markdown table pipe syntax: | col | — write as sentences instead\n"
+        "- Raw unit symbols spoken mid-sentence: write '52 percent' not '52%', '80 degrees' not '80°F'\n"
+        "- Abbreviations TTS mispronounces: write 'miles per hour' not 'mph'\n\n"
         "**Numeric speech rules**:\n"
-        "- 52% → 'fifty-two percent' (not 'fifty-two')\n"
-        "- 80°F → 'eighty degrees Fahrenheit' (not 'eighty F')\n"
-        "- 25°C → 'twenty-five degrees Celsius'\n"
+        "- 52% → 'fifty-two percent'\n"
+        "- 80°F → 'eighty degrees Fahrenheit'\n"
         "- 60 mph → 'sixty miles per hour'\n"
         "- 138 mi → 'one hundred thirty-eight miles'\n\n"
         "## Proactive Context Retrieval (CRITICAL)\n"
@@ -398,7 +429,7 @@ def build_system_prompt(
         "weather display for visual output and the natural summary for speech. Do not call weather "
         "for indoor comfort comments like 'it feels cold in here' unless the user asks about outside/current weather.\n"
         "- User asks to search → call web_search immediately. When it returns, report the results naturally.\n"
-        "- User asks about email → call check_studio immediately. When it returns, share what you found.\n"
+        "- User asks about email → call query_cig(domain='email', query=...) immediately. When it returns, share what you found.\n"
         "- User asks a general-knowledge question you CAN answer → answer directly, no tool.\n\n"
         "**CRITICAL**: Tools are invoked via the function calling API. You MUST NOT write tool names in "
         "brackets, parentheses, or any other text format. Never output text like "
@@ -423,12 +454,16 @@ def build_system_prompt(
         "- Public facts: 'The capital of Australia is Canberra—' + web_search to confirm in same turn\n"
         "- Typical behaviors: 'Your Model 3 is usually parked at home—' + tesla_control in same turn\n\n"
         "**UNSAFE to hypothesize** (specific/current/personal data — call the tool with NO preamble):\n"
-        "- Specific emails/messages: call check_studio directly, then report result\n"
-        "- Calendar events: call check_studio directly, then report result\n"
+        "- Specific emails/messages: call query_cig(domain='email', query=...) directly, then report result\n"
+        "- Calendar events: call query_cig(domain='calendar', query=...) directly, then report result\n"
+        "- Meeting prep / event materials: call query_cig(domain='event_materials', item_id=<event_id>) directly\n"
         "- Current prices: call web_search directly, then report result\n"
         "- Personal memory: call recall_memory directly, then report result\n"
         "- Real-time status: call the appropriate tool directly, then report result\n"
-        "- Current weather/conditions: call get_weather directly, then report result\n\n"
+        "- Current weather/conditions: call get_weather directly, then report result\n"
+        "- Workspace page IDs: real page_ids are listed in `## Known Workspace Pages` when available. "
+        "If the page you need is not listed there, call manage_workspace(action='search', query='...') "
+        "to retrieve the real id before acting on it.\n\n"
         "**Weather presentation contract**:\n"
         "- The LLM decides whether the user's intent is current outdoor weather; do not use keyword shortcuts.\n"
         "- If get_weather is appropriate, use its compact weather table/highlights for visible output.\n"
@@ -460,7 +495,7 @@ def build_system_prompt(
             "**web_search is DEFAULT for recent/factual queries**:\n"
             "When the user asks about recent events, current facts, news, prices, reviews, or anything "
             "that may have changed since your training — call web_search IMMEDIATELY. Do NOT:\n"
-            "- Check check_studio or search_past_conversations first\n"
+            "- Check query_cig or search_past_conversations first\n"
             "- Ask permission to search\n"
             "- Say 'I don't have internal data' and wait\n"
             "Just search. That's what the tool is for.\n\n"
@@ -469,9 +504,30 @@ def build_system_prompt(
             "- Single-step lookups (memory, status, calendar, email) → call the tool directly\n"
             "- Multi-step investigations or browser actions → hub_delegate(agent='argus')\n"
             "- For decisions/problems, call query_frameworks FIRST to discover LIAM frameworks\n\n"
-            "**Hub Agent delegation** (long-running, specialized, approval-gated tasks):\n"
-            "Use hub_delegate for tasks that need specialized background agents. Do not claim an agent is unavailable "
-            "unless the hub_delegate call itself fails; the Hub registry is authoritative.\n"
+            "**Fast in-process tools (CALL DIRECTLY — do NOT background)**:\n"
+            "These complete in under 500ms and the result must land in this turn:\n"
+            "- Create a page → manage_workspace(action='create_page', title='...', category='note')\n"
+            "- Create a structured page → manage_workspace(action='create_page_with_blocks', title='...', properties={blocks: [...]})\n"
+            "- Create a calendar event → manage_workspace(action='create_event', title='...', start_time='...')\n"
+            "- Add a task to the planner → manage_workspace(action='create_task', title='...', priority='...')\n"
+            "- Set a reminder → set_reminder(...)\n"
+            "- Save a memory → save_memory(...) (with user confirmation)\n"
+            "- Quick search/read → recall_memory, search_past_conversations, query_cig (email/calendar/contacts/event_materials)\n"
+            "If MiniMax can emit several of these in one response, do so — they run in parallel and the user gets a sub-second turn.\n\n"
+            "**Non-blocking background delegation (delegate_background)**:\n"
+            "For tasks expected to take more than 5 seconds, wrap the call in delegate_background.\n"
+            "This returns IMMEDIATELY with a task_id; when the sub-agent finishes, you will receive\n"
+            "a system notification ('[SYSTEM: A background task completed...]') and you can weave the\n"
+            "result into the conversation naturally. Use this for:\n"
+            "- Deep research → delegate_background(label='research X', tool='hub_delegate', args={agent:'atlas', method:'research', params:{topic:'X'}})\n"
+            "- Long-form document writing → delegate_background(label='draft Q3 report', tool='hub_delegate', args={agent:'scribe', method:'document', context:'...'})\n"
+            "- Multi-source fact check → delegate_background(label='fact-check claim', tool='hub_delegate', args={agent:'atlas', method:'factCheck', params:{claim:'...'}})\n"
+            "- Morning/inbox briefing → delegate_background(label='morning briefing', tool='hub_delegate', args={agent:'hermes', method:'morning-briefing'})\n"
+            "- Browser automation → delegate_background(label='order from X', tool='hub_delegate', args={agent:'argus', method:'browse', params:{task:'...'}})\n"
+            "**After spawning, keep the conversation going.** Tell the user one short sentence: 'On it — Atlas is researching that, I'll tell you when it lands.' Do NOT block on background_task_status unless the user explicitly asks 'is that done yet?'.\n\n"
+            "**Hub Agent delegation** (synchronous, blocking — use ONLY when result is needed in this turn AND task is <30s):\n"
+            "Use hub_delegate (NOT delegate_background) only when you must have the result before responding.\n"
+            "Do not claim an agent is unavailable unless the hub_delegate call itself fails; the Hub registry is authoritative.\n"
             "- Deep research (multi-source, 5+ sources) → hub_delegate(agent='atlas', method='research', params={topic: '...'})\n"
             "- Fact-checking (cross-source verification) → hub_delegate(agent='atlas', method='factCheck', params={claim: '...'})\n"
             "- Email drafting → hub_delegate(agent='hermes', method='draft', params={to: '...', purpose: '...'})\n"
@@ -518,7 +574,8 @@ def build_system_prompt(
             "NEVER narrate line-by-line as each tool returns. Assemble the full data first, then present the table and summarize.\n\n"
             "**Homelab Infrastructure** (do NOT web_search for these — use the appropriate tool):\n"
             "- Quick ecosystem status → homelab_heartbeat (instant, reads monitor state)\n"
-            "- Email/calendar/workspace → check_studio\n"
+            "- Email/calendar/contacts/event_materials → query_cig (canonical communications surface)\n"
+            "- Workspace pages/notes → manage_workspace / check_studio(studio='workspace')\n"
             "- Docker containers → homelab_operations\n"
             "- Systemd services → service_status / service_health_check\n"
             "- Deep diagnostics/root cause → hub_delegate(agent='infra', method='diagnose')\n\n"
@@ -564,7 +621,7 @@ def build_system_prompt(
     
     # Tesla Companion Mode context
     ctx_lines.append("\n**Tesla Companion Mode**: When the user is in their Tesla, you have access to:")
-    ctx_lines.append("  - Email intelligence (summaries, urgency, sentiment) via check_studio")
+    ctx_lines.append("  - Email intelligence (summaries, urgency, sentiment) via query_cig(domain='email')")
     ctx_lines.append("  - Calendar events and meeting briefings")
     ctx_lines.append("  - Vehicle status and controls via Tesla tools")
     ctx_lines.append("  - Trip planning and EV routing")

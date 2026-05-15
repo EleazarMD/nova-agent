@@ -83,6 +83,7 @@ class TurnExecutionResult:
     result_label: str = "turn_orchestrator"
     is_structured: bool = False
     card: dict[str, Any] | None = None
+    workspace_page_id: str = ""
 
 
 @dataclass
@@ -460,6 +461,13 @@ class TurnState:
     last_intent: str = ""
     last_recall_query: str = ""
     turns_handled: int = 0
+    # Session planner — persists across turns so the spine survives tool failures
+    active_plan_id: str = ""
+    active_plan_topic: str = ""
+    active_plan_page_id: str = ""
+    # Running page dictionary — real page_ids seen this session, seeded into context
+    # so M2.7 never needs to guess a UUID. Each entry: {page_id, title, project_key}
+    known_workspace_pages: list[dict] = field(default_factory=list)
     # Non-persisted: rebuilt from PCG at session start
     daily_snapshot: dict[str, Any] = field(default_factory=dict)
 
@@ -478,6 +486,10 @@ class TurnState:
             "last_intent": self.last_intent,
             "last_recall_query": self.last_recall_query,
             "turns_handled": self.turns_handled,
+            "active_plan_id": self.active_plan_id,
+            "active_plan_topic": self.active_plan_topic,
+            "active_plan_page_id": self.active_plan_page_id,
+            "known_workspace_pages": self.known_workspace_pages[-20:],
         }
 
     @classmethod
@@ -496,6 +508,13 @@ class TurnState:
             last_intent=str(data.get("last_intent") or ""),
             last_recall_query=str(data.get("last_recall_query") or ""),
             turns_handled=int(data.get("turns_handled") or 0),
+            active_plan_id=str(data.get("active_plan_id") or ""),
+            active_plan_topic=str(data.get("active_plan_topic") or ""),
+            active_plan_page_id=str(data.get("active_plan_page_id") or ""),
+            known_workspace_pages=[
+                p for p in (data.get("known_workspace_pages") or [])
+                if isinstance(p, dict) and p.get("page_id")
+            ],
         )
 
 
@@ -541,13 +560,29 @@ class TurnRuntime:
     conversation_id: str = ""
     session_id: str = ""
 
-    async def finish(self, response: str, stop_reason: str) -> TurnExecutionResult:
+    async def finish(self, response: str, stop_reason: str, workspace_page_id: str = "") -> TurnExecutionResult:
         self.telemetry.stop_reason = stop_reason
         self.telemetry.latency_ms = int((time.monotonic() - self.started) * 1000)
         self.state.last_intent = self.plan.intent.value
         self.state.turns_handled += 1
         await self.persist_turn("assistant", response)
         logger.info(f"NOVA_TURN_ORCHESTRATOR | {self.telemetry.to_log_fields()}")
+        # If caller didn't supply a page ID, try to pull it from the active artifact.
+        if not workspace_page_id and self.state.active_task_artifact_id:
+            try:
+                from nova.task_artifacts import get_task_artifact
+                _art = await get_task_artifact(self.state.active_task_artifact_id)
+                if isinstance(_art, dict):
+                    workspace_page_id = (
+                        _art.get("execution", {}).get("workspace_page_id", "")
+                        or next(
+                            (lnk["value"] for lnk in (_art.get("handoff", {}).get("links") or [])
+                             if lnk.get("kind") == "workspace_page_id"),
+                            "",
+                        )
+                    )
+            except Exception:
+                pass
         return TurnExecutionResult(
             handled=True,
             response=response,
@@ -559,6 +594,7 @@ class TurnRuntime:
             result_label="turn_orchestrator",
             is_structured=False,
             card=None,
+            workspace_page_id=workspace_page_id,
         )
 
     async def finish_structured(
@@ -1332,6 +1368,58 @@ async def decide_turn(text: str, state: TurnState, semantic_resolution: Any | No
             stop_conditions=["use the active task artifact", "do not claim completion without Scribe evidence"],
             context={"action": artifact_action, "task_id": state.active_task_artifact_id},
         ))
+
+    # ── P3a: Workspace continuation routing ─────────────────────────────────
+    # If the session has an active workspace page (planner spine) and the user
+    # is using continuation verbs (expand/add/update/show/open/include/etc),
+    # route to WORKSPACE_CONTEXT_CONTINUATION so M2.7 gets a focused tool
+    # budget instead of all 53 tools. This catches the common pattern observed
+    # in the 8 PM CEO meeting session where every turn fell through to
+    # pass_through despite obvious workspace continuation intent.
+    if state.active_plan_page_id or state.active_plan_id:
+        _ws_continuation_verbs = (
+            "expand", "add to", "add a", "add the", "update", "revise",
+            "edit", "include", "append", "extend", "open the", "open it",
+            "show me the", "show the", "show what", "pull up", "pull it up",
+            "review the", "review what", "what's on", "what is on",
+            "what do we have", "what have we", "build out", "build on",
+            "flesh out", "fill in", "elaborate", "add more", "section",
+            "agenda", "talking point", "briefing", "the page", "the doc",
+            "the document", "this page", "that page", "our page", "our doc",
+            "keep working", "continue working", "let's work", "lets work",
+            "work on", "tomorrow's agenda",
+        )
+        if _contains_any(lower, _ws_continuation_verbs):
+            log_policy_observation(
+                features=features,
+                deterministic_intent=TurnIntent.WORKSPACE_CONTEXT_CONTINUATION.value,
+                shadow_candidate=shadow_candidate,
+            )
+            logger.info(
+                f"NOVA_DETERMINISTIC_ROUTE | intent=workspace_context_continuation "
+                f"plan_id={state.active_plan_id!r} page_id={state.active_plan_page_id!r}"
+            )
+            return _with_skill_binding(TurnPlan(
+                intent=TurnIntent.WORKSPACE_CONTEXT_CONTINUATION,
+                goal=state.active_goal or state.active_plan_topic or "Continue the active workspace page.",
+                user_text=user_text,
+                evidence_budget={"manage_workspace": 6, "manage_task_plan": 2},
+                allowed_tools=[
+                    "manage_workspace", "manage_task_plan",
+                    "search_past_conversations", "query_cig",
+                    "recall_memory", "save_memory", "web_search",
+                ],
+                stop_conditions=[
+                    "use the active workspace page",
+                    "do not create a new plan; this work has an active plan_id",
+                    "fan out independent reads/writes as parallel tool_calls",
+                ],
+                context={
+                    "active_plan_id": state.active_plan_id,
+                    "active_plan_page_id": state.active_plan_page_id,
+                    "active_plan_topic": state.active_plan_topic,
+                },
+            ))
 
     learned_candidate = None
     learned_route_candidate = None

@@ -11,6 +11,8 @@ CORE_TOOL_NAMES = {
     "search_past_conversations",
     "web_search",
     "hub_delegate",
+    "delegate_background",
+    "background_task_status",
     "set_active_goal",
     "complete_active_goal",
     "manage_task_plan",
@@ -18,7 +20,7 @@ CORE_TOOL_NAMES = {
 }
 
 TOOL_GROUPS = {
-    "communications": {"query_cig", "check_studio", "search_past_conversations"},
+    "communications": {"query_cig", "search_past_conversations"},
     "workspace": {"manage_workspace", "manage_notes", "query_workspace", "hub_delegate"},
     "homelab": {"service_status", "service_logs", "service_health_check", "homelab_diagnostics", "homelab_operations"},
     "tesla": {"tesla_control", "tesla_stream_monitor", "tesla_location_refresh", "tesla_wake", "tesla_navigation"},
@@ -32,8 +34,8 @@ INTENT_TOOL_NAMES = {
     "auto_action": CORE_TOOL_NAMES,
     "clarification": set(),
     "weather_lookup": {"get_weather"},
-    "calendar_lookup": {"check_studio"},
-    "email_lookup": {"query_cig", "check_studio"},
+    "calendar_lookup": {"query_cig", "check_studio"},
+    "email_lookup": {"query_cig"},
     "conversation_recall": {"search_past_conversations"},
     "personal_memory_recall": {"recall_memory"},
     "current_events_lookup": {"web_search"},
@@ -169,6 +171,32 @@ def _learned_activation(confidence: float, params: LearnedNudgeParams) -> float:
     return max(0.0, confidence - params.confidence_floor)
 
 
+_CONTINUATION_PHRASES = frozenset({
+    "keep going", "continue", "proceed", "go ahead", "go on", "carry on",
+    "ok continue", "okay continue", "yes continue", "yes proceed",
+    "yes go ahead", "sure go ahead", "ok go on", "move on", "next step",
+    "what happened", "what next", "and then what", "then what", "ok proceed",
+    "alright continue", "alright proceed", "please continue", "please proceed",
+    "keep working", "keep it going", "finish it", "finish that", "go finish",
+})
+
+
+def _is_continuation_phrase(text: str) -> bool:
+    """Return True if the text is a bare continuation prompt with no new intent.
+
+    Bare continuations like 'Okay, keep going' or 'Yes, proceed' should never
+    be quarantined by the nudge system — they inherit whatever workspace context
+    the previous turn established and need the full tool set.
+    """
+    normalized = " ".join((text or "").lower().split()).rstrip(".,!?")
+    if normalized in _CONTINUATION_PHRASES:
+        return True
+    for phrase in _CONTINUATION_PHRASES:
+        if normalized.startswith(phrase) or normalized.endswith(phrase):
+            return True
+    return False
+
+
 def _text_supports_learned_intent(text: str, intent: str) -> bool:
     normalized = " ".join((text or "").lower().split())
     if not normalized:
@@ -210,6 +238,16 @@ def select_tool_budget(
 
     if intent != "pass_through":
         return ToolBudget([name for name in all_tool_names if name in selected], f"intent:{intent}", groups)
+
+    # Bare continuation phrases ("keep going", "proceed", etc.) inherit the
+    # prior turn's workspace context. Never quarantine them — always return the
+    # full pass_through tool set so the LLM can call whatever it needs.
+    if _is_continuation_phrase(text):
+        return ToolBudget(
+            [name for name in all_tool_names if name in selected],
+            "continuation:full_pass_through",
+            [],
+        )
 
     confidence = _float_candidate_value(learned_candidate, "confidence")
     activation = _learned_activation(confidence, nudge_params)

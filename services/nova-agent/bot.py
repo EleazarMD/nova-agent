@@ -85,6 +85,7 @@ from nova.turn_context import (
 from nova.semantic_turn_resolver import resolve_semantic_turn
 from nova.voice_turn_runtime import VoiceTurnRuntime
 from nova.learning import consolidate_session_learning
+from nova.session_planner import ensure_active_plan_for_turn, auto_link_workspace_page, emit_plan_state, fetch_project_pages
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -635,17 +636,30 @@ async def run_bot(
             # Call parent to actually push
             await super().push_frame(frame, direction)
 
+    # Initial thinking level: "low" by default for fast voice responses.
+    # NativeTextBridge swaps this per turn via llm.set_thinking() based on the
+    # MODE POLICY prefix iOS injects. Gateway translates body.thinking →
+    # reasoning_budget for llama-server (low → 0 / medium → 2048 / high → -1).
+    # NB: passing extra_body=... directly to InputParams is a no-op — Pydantic
+    # silently drops unknown kwargs. The `thinking=` constructor arg below is
+    # the supported path; MiniMaxLLMService.__init__ writes it into
+    # _settings.extra["extra_body"]["thinking"] so OpenAI SDK forwards it.
     llm = MiniMaxLLMService(
-        thinking=_thinking_level,
+        thinking="low",
         api_key=AI_GATEWAY_API_KEY,
         base_url=AI_GATEWAY_URL,
         model=LLM_MODEL,
         params=OpenAILLMService.InputParams(
-            temperature=0.1,
-            max_tokens=8192,
-            # Thinking level: low (fast initial responses), high for complex tool chains
-            # Gateway maps: low=no thinking (~85 tok/s), high=extended thinking (16K tokens)
-            extra_body={"thinking": "low"},  # Default to fast responses
+            # MiniMax M2.7 official sampling per the model card / Unsloth notes:
+            # temperature=1.0, top_p=0.95, top_k=40. We previously ran at 0.1
+            # which mode-collapsed the reasoning trajectory and produced
+            # repeated "I'll just call hermes-email" hallucinations on tool
+            # turns. 1.0 + top_p 0.95 restores the diversity the model was
+            # trained for; reproducibility for tools comes from the chat
+            # template + tool schema, not from low temp.
+            temperature=1.0,
+            top_p=0.95,
+            max_tokens=16384,
         ),
         function_call_timeout_secs=600.0,  # Hub delegation tasks can take minutes
     )
@@ -660,6 +674,66 @@ async def run_bot(
     _llm_watchdog_task: list[asyncio.Task | None] = [None]
     _active_voice_turn: list[VoiceTurnRuntime | None] = [None]
     _orchestrator_consumed_turn_id: list[str] = [""]
+
+    async def _auto_add_session_for_plan(
+        plan_id: str,
+        tc,  # TurnContext
+        conversation_id: str,
+    ) -> None:
+        """P2b: Persist a session entry to the active plan when a turn ends.
+
+        Writes a compact summary to nova_task_plan_sessions so tomorrow's
+        session can call manage_task_plan(action=get) and see exactly what
+        was accomplished. Only writes if the turn actually used tools or
+        produced evidence — avoids creating empty session noise.
+        """
+        try:
+            if not plan_id or tc is None:
+                return
+            # Skip turns that did no real work
+            if not tc.tool_history and not tc.evidence_log:
+                return
+            # Build summary
+            tools_used = list(dict.fromkeys(tc.tool_history))[:8]
+            evidence = [ev.summary for ev in (tc.evidence_log or [])][:4]
+            failures = list(dict.fromkeys(tc.failures or []))[:4]
+            posture = getattr(tc, "posture", "")
+            goal = getattr(tc, "goal", "") or ""
+
+            summary_parts: list[str] = []
+            if goal:
+                summary_parts.append(f"Goal: {goal[:140]}")
+            if tools_used:
+                summary_parts.append(f"Tools: {', '.join(tools_used)}")
+            if posture:
+                summary_parts.append(f"Posture at close: {posture}")
+            summary = " | ".join(summary_parts) or "Turn produced evidence"
+
+            content_parts: list[str] = []
+            if evidence:
+                content_parts.append("Evidence collected:")
+                for i, ev in enumerate(evidence, 1):
+                    content_parts.append(f"  {i}. {ev[:200]}")
+            if failures:
+                content_parts.append(f"Failures: {', '.join(failures)}")
+            content = "\n".join(content_parts)
+
+            from nova.task_plan import add_session_entry as _add_session_entry
+            await _add_session_entry(
+                plan_id,
+                conversation_id=conversation_id,
+                summary=summary,
+                content=content,
+                sources=tools_used,
+                next_steps=[],
+            )
+            logger.info(
+                f"NOVA_PLANNER | auto_session_added | plan_id={plan_id} "
+                f"tools={len(tools_used)} evidence={len(evidence)} "
+                f"failures={len(failures)}"
+            )
+        except Exception as e:
+            logger.warning(f"NOVA_PLANNER_AUTO_SESSION_FAILED | plan_id={plan_id} err={e}")
 
     async def _send_server_msg(msg: dict):
         """Send a custom server message to iOS via RTVI protocol."""
@@ -758,7 +832,12 @@ async def run_bot(
                     await _emit_turn_status("model_slow", "This is taking longer than normal. I’m still working on it.", severity="warning")
                 await asyncio.sleep(12)
                 if _current_turn_id[0] == turn_id:
-                    await _emit_turn_status("model_stalled", "The model is still delayed. I’ll keep the connection alive and finish when it returns.", severity="warning")
+                    await _emit_turn_status("model_stalled", "The model is still delayed. I'll keep the connection alive and finish when it returns.", severity="warning")
+                # Keep sending heartbeats every 30s so iOS doesn't fire stale (180s threshold)
+                while _current_turn_id[0] == turn_id:
+                    await asyncio.sleep(30)
+                    if _current_turn_id[0] == turn_id:
+                        await _send_server_msg({"type": "heartbeat", "text": "Still processing…"})
             except asyncio.CancelledError:
                 pass
 
@@ -774,7 +853,46 @@ async def run_bot(
     # Tool iteration tracking — runaway loop guard only (not a quality throttle)
     _tool_calls_this_turn: list[int] = [0]
     _MAX_TOOL_CALLS_BEFORE_HEARTBEAT = 4
+    # M2.7 alignment: soft synthesis nudge before hard limit. MiniMax M2.7 is
+    # designed to fan-out parallel tool calls in 2–3 LLM passes and then
+    # synthesize — not to chain deep sequential lookups. After this many
+    # individual tool calls within a turn, inject a SYSTEM hint asking the
+    # model to synthesize with the data it already has.
+    # 10 (was 6): research/meeting-prep turns legitimately need 8-10 evidence
+    # calls across CIG, search, recall, and workspace tools before synthesis.
+    _SOFT_SYNTHESIS_NUDGE_AT = 10
     _MAX_TOOL_CALLS_HARD_LIMIT = 20  # Pure infinite-loop guard
+    _soft_synthesis_nudged_this_turn: list[bool] = [False]
+    # Agentic recovery: track per-turn tool failures so M2.7 can self-recover
+    # up to _MAX_AGENTIC_RECOVERIES times before the turn is surfaced as error.
+    _tool_failures_this_turn: list[int] = [0]
+    _MAX_AGENTIC_RECOVERIES = 2
+    # P1b: Per-turn read-cache for idempotent tools. Eliminates the
+    # "fetched the same page 7 times in 54s" pattern observed in 8 PM logs.
+    # Keyed by (tool_name, json.dumps(args, sort_keys=True)) → str result.
+    _tool_read_cache_this_turn: dict[tuple[str, str], str] = {}
+    _CACHEABLE_READ_TOOLS = {
+        "manage_workspace",        # only when action in (get_page, search, list_pages, etc.)
+        "manage_task_plan",        # only when action in (get, list)
+        "search_past_conversations",
+        "query_cig",
+        "query_context",
+        "recall_memory",
+        "knowledge_query",
+        "kg_query",
+        "get_enriched_context",
+        "discover_skills",
+        "service_status",
+        "service_logs",
+        "get_workstation_status",
+        "check_studio",
+        "background_task_status",
+    }
+    _CACHEABLE_ACTIONS_BY_TOOL = {
+        "manage_workspace": {"get_page", "search", "list_pages", "list_databases",
+                             "list_database_rows", "get_database_row", "list"},
+        "manage_task_plan": {"get", "list"},
+    }
     # Per-tool-per-turn rate limits — differentiated by provider cost/risk
     # Cloud APIs (paid, rate-limited externally): tight limits
     # Local/homelab APIs (free, internal): generous limits
@@ -798,7 +916,7 @@ async def run_bot(
         "service_status": 6,        # Local Docker API
         "homelab_diagnostics": 4,   # Local Docker API
         "homelab_operations": 4,    # Local Docker API
-        "manage_workspace": 6,      # Pi Workspace API — enough for read+create flows; blocks get_page loops
+        "manage_workspace": 12,     # Pi Workspace API — search(3)+list(1)+create(1)+blocks(3)+verify(1)+update(2)+spare(1)
         "manage_task_plan": 8,      # Local SQLite — enough for full create protocol
     }
     _per_tool_call_counts: dict[str, int] = {}
@@ -997,6 +1115,12 @@ async def run_bot(
                 "Do not search again. Summarize what you found and continue the user's task. "
                 "If document construction is requested, delegate to Scribe now."
             )
+        if tool_name == "manage_workspace":
+            return (
+                "SYSTEM: manage_workspace has been called the maximum number of times this turn. "
+                "If every search returned no results, the page does not exist yet — stop searching and CREATE it now using create_page_with_blocks or create_page. "
+                "Do not search again. Either create the requested content or tell the user exactly what you found and ask for the missing details."
+            )
         return (
             "SYSTEM: You have already checked the local context enough for this turn. "
             "Do not call more search/read tools. Answer, ask one focused clarification, or delegate to the right agent now."
@@ -1062,6 +1186,19 @@ async def run_bot(
                 )
                 return
 
+            # ── M2.7 soft synthesis nudge ────────────────────────────────────
+            # MiniMax M2.7 is designed to fan-out parallel tool calls in 2-3
+            # LLM passes and then synthesize. After ~6 individual calls without
+            # a synthesized response, gently push the model toward responding.
+            # Unlike the hard limit, this does NOT block the call — it lets it
+            # proceed but marks that the next pass should prefer text.
+            if call_num == _SOFT_SYNTHESIS_NUDGE_AT and not _soft_synthesis_nudged_this_turn[0]:
+                _soft_synthesis_nudged_this_turn[0] = True
+                logger.info(
+                    f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | "
+                    f"status=soft_synthesis_nudge | total_calls={call_num}"
+                )
+
             # ── Per-tool rate limit (cloud=tight, local=generous) ──
             tool_count = _per_tool_call_counts.get(tool_name, 0) + 1
             _per_tool_call_counts[tool_name] = tool_count
@@ -1081,7 +1218,13 @@ async def run_bot(
             # ── Auto-heartbeat after sustained tool chains ──
             if call_num == _MAX_TOOL_CALLS_BEFORE_HEARTBEAT and not _ack_sent_this_turn[0]:
                 _ack_sent_this_turn[0] = True
-                await _send_server_msg({"type": "heartbeat", "text": "Still working on it..."})
+                # speakable: iOS may TTS this to fill dead-air mid-turn while
+                # the model is suppressing its own transitional filler text.
+                await _send_server_msg({
+                    "type": "heartbeat",
+                    "text": "Still working on it...",
+                    "speakable": True,
+                })
                 logger.info(f"Auto-heartbeat at tool call #{call_num}")
 
             # ── Fast path: instant spoken acknowledgment (once per turn) ──
@@ -1089,7 +1232,14 @@ async def run_bot(
                 ack = _build_spoken_ack(tool_name, args)
                 if ack:
                     _ack_sent_this_turn[0] = True
-                    await _send_server_msg({"type": "heartbeat", "text": ack})
+                    # speakable: lets iOS play a brief audible "searching..."
+                    # so the user hears progress while LLM transitional text
+                    # is being suppressed.
+                    await _send_server_msg({
+                        "type": "heartbeat",
+                        "text": ack,
+                        "speakable": True,
+                    })
                     logger.info(f"Dual-path ack: '{ack}'")
 
             # For slow tools, populate the ThinkingCard with progress
@@ -1112,13 +1262,6 @@ async def run_bot(
                 "turn_id": _current_turn_id[0],
             })
             
-            from nova.hypothesis import get_hypothesis_validator
-            validator = get_hypothesis_validator()
-            if validator and validator.active:
-                # We skip sending the message again since we just sent it, 
-                # but we need to record it in the session
-                validator.current_session.start_tool(tool_name)
-
             await _ensure_user_turn_learning_event()
             await _record_learning_event(
                 event_type="tool_call_started",
@@ -1137,7 +1280,54 @@ async def run_bot(
 
             # ── Background path: tool executes ──
             _t_start = time.monotonic()
-            
+
+            # ── P1b: Per-turn read cache ────────────────────────────────────
+            # If this exact (tool_name, args) combo was already executed this
+            # turn for an idempotent read tool, return the cached result and
+            # nudge M2.7 to use the data already in context.
+            def _is_cacheable_call(_tn: str, _a: dict) -> bool:
+                if _tn not in _CACHEABLE_READ_TOOLS:
+                    return False
+                _action = (_a.get("action") or "").lower()
+                _allowed = _CACHEABLE_ACTIONS_BY_TOOL.get(_tn)
+                if _allowed is None:
+                    # Tool is fully cacheable (no action sub-routing)
+                    return True
+                # Tool has action-based dispatch: only cache safe actions
+                return _action in _allowed
+
+            _cache_key: tuple[str, str] | None = None
+            if _is_cacheable_call(tool_name, args):
+                # Strip volatile fields before keying
+                _key_args = {k: v for k, v in args.items() if k != "_internal_user_id"}
+                _cache_key = (tool_name, json.dumps(_key_args, sort_keys=True, default=str))
+                if _cache_key in _tool_read_cache_this_turn:
+                    cached = _tool_read_cache_this_turn[_cache_key]
+                    logger.info(
+                        f"NOVA_TOOL_CACHE_HIT | tool={tool_name} "
+                        f"action={args.get('action','-')} | bytes={len(cached)}"
+                    )
+                    if _active_voice_turn[0] is not None:
+                        try:
+                            await _active_voice_turn[0].emit_status(
+                                "tool_cache_hit",
+                                f"Reusing cached {tool_name} result from earlier this turn.",
+                                tool=tool_name,
+                            )
+                        except Exception:
+                            pass
+                    cached_with_hint = (
+                        f"{cached}\n\n"
+                        f"SYSTEM: This is a CACHED result from earlier this turn. "
+                        f"You already have this data — use it directly instead of "
+                        f"calling {tool_name} again with the same arguments."
+                    )
+                    try:
+                        await params.result_callback(cached_with_hint)
+                    except Exception as cb_exc:
+                        logger.warning(f"NOVA_TOOL_CACHE_CALLBACK_FAILED | {cb_exc}")
+                    return
+
             # Inject internal user id for tools that need to spawn background tasks
             args["_internal_user_id"] = user_id
             
@@ -1202,8 +1392,6 @@ async def run_bot(
                     "latency_ms": _latency_ms,
                     "turn_id": _current_turn_id[0],
                 })
-                if validator and validator.active:
-                    validator.current_session.fail_tool(tool_name, "Timed out")
             except Exception as e:
                 _latency_ms = int((time.monotonic() - _t_start) * 1000)
                 logger.error(f"NOVA_TRAFFIC | tool={tool_name} | provider={provider_class} | latency={_latency_ms}ms | bytes_out=0 | status=error | err={e}")
@@ -1219,8 +1407,6 @@ async def run_bot(
                     "latency_ms": _latency_ms,
                     "turn_id": _current_turn_id[0],
                 })
-                if validator and validator.active:
-                    validator.current_session.fail_tool(tool_name, str(e))
             finally:
                 heartbeat_task.cancel()
             
@@ -1307,8 +1493,6 @@ async def run_bot(
                     "latency_ms": locals().get("_latency_ms", 0),
                     "turn_id": _current_turn_id[0],
                 })
-                if validator and validator.active:
-                    validator.current_session.fail_tool(tool_name, "No data returned")
             else:
                 result = result_str
                 # Only emit completed if it wasn't already emitted as failed in the except blocks
@@ -1331,9 +1515,6 @@ async def run_bot(
                         "latency_ms": locals().get("_latency_ms", 0),
                         "turn_id": _current_turn_id[0],
                     })
-                    if validator and validator.active:
-                        validator.current_session.complete_tool(tool_name, snippet)
-
             # Clear ThinkingCard phase so the LLM's next response is spoken, not swallowed
             if tool_name in _SLOW_TOOLS:
                 await _send_server_msg({"phase": "done"})
@@ -1357,18 +1538,217 @@ async def run_bot(
                 "calendar search api returned http 404",
                 "pi agent timed out",
             )
-            tool_success = bool(final_result_str.strip()) and not any(marker in final_result_str.lower() for marker in failure_markers)
+            # Only scan the header/status portion of the result (first 350 chars).
+            # Scanning the full result causes false positives when embedded data
+            # payloads (conversation excerpts, email bodies, web search snippets)
+            # happen to contain error phrases from prior Nova failures.
+            _result_header = final_result_str[:350].lower()
+            tool_success = bool(final_result_str.strip()) and not any(marker in _result_header for marker in failure_markers)
+
+            # ── P1b: write result to per-turn cache (success only) ───────────
+            if tool_success and _cache_key is not None:
+                _tool_read_cache_this_turn[_cache_key] = final_result_str
+                logger.info(
+                    f"NOVA_TOOL_CACHE_STORE | tool={tool_name} "
+                    f"action={args.get('action','-')} | bytes={len(final_result_str)} "
+                    f"| keys_in_cache={len(_tool_read_cache_this_turn)}"
+                )
+
+            # ── Auto-link workspace page to active plan ───────────────────────
+            # When manage_workspace creates a page successfully, wire it to the
+            # active session plan so the spine has a permanent workspace anchor.
+            if tool_success and tool_name == "manage_workspace":
+                _ws_action = (args or {}).get("action", "")
+                if _ws_action in ("create_page", "create_page_with_blocks"):
+                    import re as _re
+                    _m = _re.search(r"page_id:\s*([0-9a-f-]{8,})", final_result_str, _re.IGNORECASE)
+                    if not _m:
+                        _m = _re.search(r"\(([0-9a-f]{8}-[0-9a-f-]{4,36})\)", final_result_str)
+                    _created_page_id = _m.group(1).strip() if _m else ""
+                    if _created_page_id:
+                        async def _link_page_hook(
+                            _pid=_created_page_id,
+                            _title=(args or {}).get("title", ""),
+                            _uid=user_id,
+                            _plan_id=_turn_state.active_plan_id,
+                            _user_text=_latest_user_event.get("canonical_text", ""),
+                            _goal=_turn_state.active_goal,
+                        ):
+                            try:
+                                linked = await auto_link_workspace_page(
+                                    user_id=_uid,
+                                    plan_id=_plan_id or None,
+                                    page_id=_pid,
+                                    page_title=_title,
+                                    text=_user_text,
+                                    plan_goal=_goal,
+                                    conversation_id=conversation_id,
+                                )
+                                if linked:
+                                    _turn_state.active_plan_id = linked.get("plan_id", _turn_state.active_plan_id)
+                                    _turn_state.active_plan_topic = linked.get("topic", _turn_state.active_plan_topic)
+                                    _turn_state.active_plan_page_id = _pid
+                                    # Seed the page into the session dictionary so the next
+                                    # planner_hook can include it in ## Known Workspace Pages
+                                    _kp_existing = {p["page_id"] for p in _turn_state.known_workspace_pages}
+                                    if _pid not in _kp_existing:
+                                        _turn_state.known_workspace_pages.append({
+                                            "page_id": _pid,
+                                            "title": _title,
+                                            "project_key": linked.get("project_key", "") or "",
+                                        })
+                                    await emit_plan_state(_send_server_msg, linked)
+                                    logger.info(
+                                        f"NOVA_PLANNER | page_linked | "
+                                        f"plan_id={_turn_state.active_plan_id} page_id={_pid}"
+                                    )
+                                    # ── P2a: auto-populate plan steps from heading_2 blocks ──
+                                    try:
+                                        from nova.task_plan import (
+                                            add_step as _add_step,
+                                            get_plan as _get_plan,
+                                        )
+                                        _plan_full = await _get_plan(linked["plan_id"])
+                                        # Only seed steps if the plan currently has none
+                                        if _plan_full and not _plan_full.get("steps"):
+                                            _blocks = []
+                                            _props = (args or {}).get("properties") or {}
+                                            if isinstance(_props, dict):
+                                                _blocks = _props.get("blocks") or []
+                                            if not _blocks:
+                                                _blocks = (args or {}).get("blocks") or []
+                                            _step_count = 0
+                                            for _i, _b in enumerate(_blocks):
+                                                if not isinstance(_b, dict):
+                                                    continue
+                                                if _b.get("type") == "heading_2":
+                                                    _step_title = (_b.get("content") or "").strip()[:140]
+                                                    if _step_title:
+                                                        await _add_step(
+                                                            linked["plan_id"],
+                                                            _step_title,
+                                                            order_num=_i,
+                                                        )
+                                                        _step_count += 1
+                                                        if _step_count >= 12:
+                                                            break
+                                            if _step_count:
+                                                logger.info(
+                                                    f"NOVA_PLANNER | auto_seeded_steps | "
+                                                    f"plan_id={linked['plan_id']} count={_step_count}"
+                                                )
+                                                # Re-emit plan_state so iOS planner panel shows steps
+                                                _plan_full = await _get_plan(linked["plan_id"])
+                                                if _plan_full:
+                                                    await emit_plan_state(_send_server_msg, _plan_full)
+                                    except Exception as _se:
+                                        logger.warning(f"NOVA_PLANNER_AUTO_STEPS_FAILED | {_se}")
+                                    # ── P2c: bidirectional plan↔page indexing ──
+                                    # Write properties.plan_id and properties.project_key onto
+                                    # the workspace page so search/filter by project works.
+                                    try:
+                                        import aiohttp as _aiohttp
+                                        _pkey_for_index = linked.get("project_key", "") or ""
+                                        _pi_ws_base = os.environ.get(
+                                            "PI_WORKSPACE_URL", "http://localhost:8762"
+                                        ).rstrip("/")
+                                        _index_payload = {
+                                            "properties": {
+                                                "plan_id": linked["plan_id"],
+                                                "project_key": _pkey_for_index,
+                                            }
+                                        }
+                                        _index_url = f"{_pi_ws_base}/api/pages/{_pid}"
+                                        async with _aiohttp.ClientSession() as _sess:
+                                            async with _sess.patch(
+                                                _index_url,
+                                                json=_index_payload,
+                                                timeout=_aiohttp.ClientTimeout(total=5),
+                                            ) as _resp:
+                                                if _resp.status >= 400:
+                                                    _txt = await _resp.text()
+                                                    logger.warning(
+                                                        f"NOVA_PLANNER_INDEX_FAILED | "
+                                                        f"page_id={_pid} status={_resp.status} body={_txt[:200]}"
+                                                    )
+                                                else:
+                                                    logger.info(
+                                                        f"NOVA_PLANNER | page_indexed | "
+                                                        f"page_id={_pid} plan_id={linked['plan_id']} "
+                                                        f"project_key={_pkey_for_index!r}"
+                                                    )
+                                    except Exception as _ie:
+                                        logger.warning(f"NOVA_PLANNER_INDEX_EXC | {_ie}")
+                            except Exception as _le:
+                                logger.warning(f"NOVA_PLANNER_LINK_FAILED | {_le}")
+                        asyncio.create_task(_link_page_hook())
+
             if not tool_success:
                 failure_notice = (
-                    f"I tried to use {tool_name}, but it failed: "
-                    f"{final_result_str[:240].strip() or 'no usable result was returned'}"
+                    f"TOOL_ERROR [{tool_name}]: "
+                    f"{final_result_str[:240].strip() or 'no usable result was returned'}\n"
+                    "SYSTEM: The above tool failed. Assess the error and decide: "
+                    "(a) retry with corrected arguments, "
+                    "(b) try an alternative tool, or "
+                    "(c) answer the user directly from what you already know. "
+                    "Do NOT repeat the exact same call that just failed."
                 )
-                if _active_voice_turn[0] is not None:
-                    await _active_voice_turn[0].tool_failed(tool_name, failure_notice)
-                    await _active_voice_turn[0].complete_with_error(failure_notice)
+                _tool_failures_this_turn[0] += 1
+                # ── M2.7 agentic recovery ────────────────────────────────────
+                # Tools that warrant agentic retry (non-destructive, no approval gate)
+                _RECOVERABLE_TOOLS = {
+                    "manage_task_plan", "search_past_conversations", "query_cig",
+                    "manage_workspace", "recall_memory", "web_search", "get_weather",
+                    "service_status", "service_logs", "check_studio",
+                    "tesla_control", "tesla_navigation", "tesla_wake",
+                    "get_time", "manage_timer", "get_workstation_status",
+                }
+                _allow_agentic_recovery = (
+                    tool_name in _RECOVERABLE_TOOLS
+                    and _tool_failures_this_turn[0] <= _MAX_AGENTIC_RECOVERIES
+                )
+                if _allow_agentic_recovery:
+                    logger.warning(
+                        f"NOVA_AGENTIC_RECOVERY | tool={tool_name} "
+                        f"failure_num={_tool_failures_this_turn[0]} "
+                        f"max={_MAX_AGENTIC_RECOVERIES} | passing error to M2.7"
+                    )
+                    if _active_voice_turn[0] is not None:
+                        await _active_voice_turn[0].tool_failed(tool_name, f"{tool_name} failed — M2.7 deciding recovery")
+                    await _record_learning_event(
+                        event_type="tool_call_completed",
+                        source_layer="llm_tool_loop",
+                        raw_text=_latest_user_event.get("raw_text", ""),
+                        canonical_text=_latest_user_event.get("canonical_text", ""),
+                        location=_latest_user_event.get("location", ""),
+                        mode_policy=_latest_user_event.get("mode_policy", ""),
+                        tool_name=tool_name,
+                        tool_args=args,
+                        success=False,
+                        latency_ms=locals().get("_latency_ms", 0),
+                        outcome="failed_agentic_recovery",
+                        payload={"provider_class": provider_class, "result_preview": final_result_str[:200]},
+                    )
+                    # Pass failure to M2.7 with run_llm=True — let it self-recover
+                    try:
+                        await params.result_callback(failure_notice)  # default run_llm=True
+                    except Exception as cb_exc:
+                        logger.warning(f"NOVA_AGENTIC_RECOVERY_CALLBACK_FAILED | {cb_exc}")
+                    logger.info(f"🔥 HANDLER COMPLETE for {tool_name} (agentic recovery handed to M2.7)")
+                    return
                 else:
-                    logger.warning(f"NOVA_TOOL_ERROR_FINAL_WITHOUT_RUNTIME | tool={tool_name}")
-                    await _complete_orphaned_tool_failure(tool_name, failure_notice)
+                    # Hard-surface: exceeded recovery budget or non-recoverable tool
+                    _surfaced_failure = (
+                        f"I tried to use {tool_name}, but it failed: "
+                        f"{final_result_str[:240].strip() or 'no usable result was returned'}"
+                    )
+                    if _active_voice_turn[0] is not None:
+                        await _active_voice_turn[0].tool_failed(tool_name, _surfaced_failure)
+                        await _active_voice_turn[0].complete_with_error(_surfaced_failure)
+                    else:
+                        logger.warning(f"NOVA_TOOL_ERROR_FINAL_WITHOUT_RUNTIME | tool={tool_name}")
+                        await _complete_orphaned_tool_failure(tool_name, _surfaced_failure)
+                    failure_notice = _surfaced_failure  # use clean version for callback below
             await _record_learning_event(
                 event_type="tool_call_completed",
                 source_layer="llm_tool_loop",
@@ -1425,6 +1805,23 @@ async def run_bot(
                 _last_tool_call["result"] = result
 
             result = _trim_tool_result_for_llm(tool_name, result)
+
+            # ── M2.7 synthesis nudge ────────────────────────────────────────
+            # Once we've crossed _SOFT_SYNTHESIS_NUDGE_AT calls in this turn,
+            # append a SYSTEM hint to every subsequent tool result so the model
+            # is repeatedly reminded to synthesize rather than chain more
+            # lookups. This aligns with M2.7's fan-out-then-synthesize design.
+            if _soft_synthesis_nudged_this_turn[0]:
+                result_str = str(result) if result is not None else ""
+                synthesis_hint = (
+                    "\n\nSYSTEM: You have made several lookups this turn "
+                    f"({_tool_calls_this_turn[0]} so far). Per M2.7 protocol, "
+                    "synthesize a final response now using the data you already "
+                    "have. Only call another tool if it is strictly required to "
+                    "complete a user-requested action."
+                )
+                if not result_str.endswith(synthesis_hint):
+                    result = result_str + synthesis_hint
 
             # ── Reasoning scaffold: unified injection (shared with text_chat.py) ──
             tc = _active_turn_context[0]
@@ -1633,7 +2030,48 @@ async def run_bot(
                 elif _pi_buffer:
                     full_text = "".join(_pi_buffer)
                     _pi_buffer.clear()
-                    if full_text.strip():
+                    # ── Stream-truncation detection (finish_reason=length) ────
+                    # M2.7 truncates mid-response when the generation runs out
+                    # of token budget. Signs: substantial text (>150 chars) that
+                    # ends without terminal punctuation. Retry with a nudge rather
+                    # than silently deliver a half-finished answer.
+                    _TRUNCATION_MIN_CHARS = 150
+                    _terminal_punct = (".", "!", "?", ":", "```", "*", ">")
+                    _looks_truncated = (
+                        len(full_text.strip()) >= _TRUNCATION_MIN_CHARS
+                        and not any(full_text.rstrip().endswith(p) for p in _terminal_punct)
+                    )
+                    if _looks_truncated and _active_voice_turn[0] is not None:
+                        logger.warning(
+                            f"NOVA_STREAM_TRUNCATION_DETECTED | turn_id={_current_turn_id[0]} "
+                            f"chars={len(full_text)} last50={full_text[-50:]!r}"
+                        )
+                        _plan_anchor = ""
+                        if _turn_state.active_plan_id:
+                            _plan_anchor = (
+                                f" (Active plan: {_turn_state.active_plan_topic or _turn_state.active_plan_id})"
+                            )
+                        recovery_hint = (
+                            f"SYSTEM: Your last response was cut off due to token limit.{_plan_anchor} "
+                            "Please continue from where you left off and complete your response. "
+                            "Keep the response concise — summarize if needed."
+                        )
+                        try:
+                            await context.add_message({"role": "assistant", "content": full_text})
+                            await context.add_message({"role": "user", "content": recovery_hint})
+                            await task.queue_frame(LLMRunFrame())
+                            logger.info(f"NOVA_STREAM_TRUNCATION_RETRY | turn_id={_current_turn_id[0]}")
+                        except Exception as _tre:
+                            logger.warning(f"NOVA_STREAM_TRUNCATION_RETRY_FAILED | {_tre}")
+                            from nova.text_utils import strip_markdown_for_speech
+                            speech_text = strip_markdown_for_speech(full_text)
+                            await _active_voice_turn[0].complete_with_text(
+                                full_text,
+                                speech_text=speech_text,
+                                result="direct",
+                                suppress_speech=True,
+                            )
+                    elif full_text.strip():
                         logger.info(f"Persisted assistant turn ({len(full_text)} chars)")
                         from nova.text_utils import strip_markdown_for_speech
                         speech_text = strip_markdown_for_speech(full_text)
@@ -1753,18 +2191,27 @@ async def run_bot(
                 _orchestrator_consumed_turn_id[0] = ""
                 _ack_sent_this_turn[0] = False
                 _tool_calls_this_turn[0] = 0
+                _soft_synthesis_nudged_this_turn[0] = False
+                _tool_failures_this_turn[0] = 0
+                _tool_read_cache_this_turn.clear()
                 _per_tool_call_counts.clear()
                 _consecutive_dedup_counts.clear()
                 _last_tool_call.clear()
                 _last_tool_call.update({"name": None, "args": None, "result": None})
                 _search_tools_exhausted[0] = False
-                from nova.hypothesis import get_hypothesis_validator as _get_hv
-                _hv = _get_hv()
-                if _hv is not None:
-                    _hv.set_turn_id(_current_turn_id[0])
                 # Persist previous turn summary before resetting — cross-turn memory layer
                 asyncio.create_task(finalize_and_persist(_active_turn_context[0], user_id, conversation_id))
+                # ── P2b: Auto add_session if active plan was touched this turn ──
+                _prev_plan_id = getattr(_turn_state, "active_plan_id", "") or ""
+                _prev_tc = _active_turn_context[0]
+                if _prev_plan_id and _prev_tc is not None:
+                    asyncio.create_task(_auto_add_session_for_plan(
+                        plan_id=_prev_plan_id,
+                        tc=_prev_tc,
+                        conversation_id=conversation_id,
+                    ))
                 _active_turn_context[0] = None  # will be created after decide_turn
+                _active_voice_turn[0] = None  # force fresh runtime for this turn
                 runtime = _ensure_voice_turn_runtime(_current_turn_id[0])
                 try:
                     canonical = canonicalize_turn_text(text)
@@ -1816,14 +2263,211 @@ async def run_bot(
                         user_text=canonical.canonical_text or text,
                         goal=derive_goal(canonical.canonical_text or text, getattr(plan, "goal", "") or "", plan.intent.value),
                         intent=plan.intent.value,
-                        evidence_budget=derive_evidence_budget(getattr(plan, "evidence_budget", 0) or 0, plan.intent.value),
+                        evidence_budget=derive_evidence_budget(_eb if isinstance(_eb := (getattr(plan, "evidence_budget", 0) or 0), int) else sum(_eb.values()) if isinstance(_eb, dict) else 0, plan.intent.value),
                     )
                     logger.info(
                         f"NOVA_TURN_CONTEXT_INIT | turn_id={_current_turn_id[0]} "
                         f"intent={plan.intent.value} goal={_active_turn_context[0].goal[:80]!r} "
                         f"evidence_budget={_active_turn_context[0].evidence_budget}"
                     )
+
+                    # ── Session planner hook ─────────────────────────────────
+                    # Best-effort, non-blocking. Creates a plan spine when the
+                    # user's turn looks like multi-step work AND no plan is
+                    # active yet. Emits plan_state to iOS so the planner panel
+                    # populates immediately, before the LLM even starts.
+                    async def _planner_hook(
+                        _text=canonical.canonical_text or text,
+                        _intent=plan.intent.value,
+                        _goal=getattr(plan, "goal", "") or "",
+                        _uid=user_id,
+                        _conv=conversation_id,
+                        _sid=session.session_id,
+                    ):
+                        try:
+                            if _turn_state.active_plan_id:
+                                # Plan already known this session — skip creation, just emit
+                                from nova.task_plan import get_plan as _get_plan
+                                existing = await _get_plan(_turn_state.active_plan_id)
+                                if existing:
+                                    await emit_plan_state(_send_server_msg, existing)
+                                    return
+                            active_plan = await ensure_active_plan_for_turn(
+                                text=_text,
+                                plan_intent=_intent,
+                                plan_goal=_goal,
+                                user_id=_uid,
+                                conversation_id=_conv,
+                                session_id=_sid,
+                            )
+                            if active_plan:
+                                _turn_state.active_plan_id = active_plan.get("plan_id", "")
+                                _turn_state.active_plan_topic = active_plan.get("topic", "")
+                                _turn_state.active_plan_page_id = active_plan.get("workspace_page_id", "")
+                                await emit_plan_state(_send_server_msg, active_plan)
+                                # Patch the live system message with a concise plan anchor
+                                # so M2.7 sees the active goal on every LLM pass this turn.
+                                try:
+                                    # P0a: Show FULL UUID — never truncate. M2.7 was
+                                    # pattern-completing a hallucinated UUID when it saw
+                                    # `plan_id: 04244a45-749c-47...` in the anchor.
+                                    _ap_id = active_plan.get("plan_id", "")
+                                    _ap_topic = active_plan.get("topic", "")
+                                    _ap_pkey = active_plan.get("project_key", "") or ""
+                                    _ap_page = active_plan.get("workspace_page_id", "") or ""
+                                    _anchor_lines = [
+                                        "",
+                                        "",
+                                        "[SESSION PLAN ACTIVE]",
+                                        f"  topic: {_ap_topic}",
+                                        f"  plan_id: {_ap_id}",
+                                    ]
+                                    if _ap_pkey:
+                                        _anchor_lines.append(f"  project_key: {_ap_pkey}")
+                                    if _ap_page:
+                                        _anchor_lines.append(f"  workspace_page_id: {_ap_page}")
+                                    _anchor_lines.extend([
+                                        "  To reload full step history and session entries, "
+                                        f"call: manage_task_plan(action='get', plan_id='{_ap_id}')",
+                                        "  Do not abandon this goal. Do not create a new plan; "
+                                        "this plan is already active for this work.",
+                                    ])
+
+                                    # Build the known-pages dictionary from two sources:
+                                    # 1. DB: pages linked to this project via project_key
+                                    # 2. Session: pages discovered/created this session
+                                    try:
+                                        _db_pages = await fetch_project_pages(
+                                            user_id=_uid,
+                                            plan_id=_ap_id,
+                                            project_key=_ap_pkey or None,
+                                        )
+                                        # Merge DB pages into session state (deduplicate by page_id)
+                                        _existing_ids = {
+                                            p["page_id"]
+                                            for p in _turn_state.known_workspace_pages
+                                        }
+                                        for _dbp in _db_pages:
+                                            if _dbp["page_id"] not in _existing_ids:
+                                                _turn_state.known_workspace_pages.append(_dbp)
+                                                _existing_ids.add(_dbp["page_id"])
+                                    except Exception as _fpe:
+                                        logger.warning(f"NOVA_PLANNER_PAGE_FETCH | {_fpe}")
+
+                                    # Render the page dictionary block
+                                    if _turn_state.known_workspace_pages:
+                                        _anchor_lines.append("")
+                                        _anchor_lines.append("## Known Workspace Pages")
+                                        _anchor_lines.append(
+                                            "Use these real page_ids directly. "
+                                            "If the page you need is not listed, call "
+                                            "manage_workspace(action='search', query='...') first."
+                                        )
+                                        for _kp in _turn_state.known_workspace_pages[-15:]:
+                                            _kp_title = (_kp.get("title") or "untitled")[:60]
+                                            _anchor_lines.append(
+                                                f"  - {_kp['page_id']}  \"{_kp_title}\""
+                                            )
+
+                                    _anchor_line = "\n".join(_anchor_lines)
+                                    if context.messages and context.messages[0].get("role") == "system":
+                                        existing = context.messages[0].get("content", "")
+                                        if "[SESSION PLAN ACTIVE]" not in existing:
+                                            context.messages[0]["content"] = existing + _anchor_line
+                                        else:
+                                            # Plan anchor already present — refresh only the pages block
+                                            import re as _re_patch
+                                            _pages_marker = "## Known Workspace Pages"
+                                            if _turn_state.known_workspace_pages:
+                                                _pages_block = "\n".join(
+                                                    _anchor_lines[
+                                                        next(
+                                                            (i for i, l in enumerate(_anchor_lines) if _pages_marker in l),
+                                                            len(_anchor_lines),
+                                                        ):
+                                                    ]
+                                                )
+                                                if _pages_marker in existing:
+                                                    context.messages[0]["content"] = _re_patch.sub(
+                                                        rf"{_re_patch.escape(_pages_marker)}.*",
+                                                        _pages_block,
+                                                        existing,
+                                                        flags=_re_patch.DOTALL,
+                                                    )
+                                                else:
+                                                    context.messages[0]["content"] = existing + "\n" + _pages_block
+                                except Exception as _pe:
+                                    logger.warning(f"NOVA_PLANNER_SYSTEM_PATCH_FAILED | {_pe}")
+                        except Exception as _e:
+                            logger.warning(f"NOVA_PLANNER_HOOK_FAILED | {_e}")
+                    asyncio.create_task(_planner_hook())
+
                     context.set_tools(_build_tools_schema(tool_budget.names))
+
+                    # ── M2.7 thinking level per intent ───────────────────────
+                    # MoE models perform significantly better on multi-step
+                    # planning/research when the reasoning budget is unlocked.
+                    # low  → fast, for simple queries and casual conversation
+                    # medium → balanced, for research, workspace, and planning
+                    # (high is too slow for real-time voice — reserved for
+                    #  background/async tasks only)
+                    _MEDIUM_THINKING_INTENTS = {
+                        "workspace_creation", "workspace_context_continuation",
+                        "lookup_then_workspace_creation", "workspace_management",
+                        "web_research_request", "email_lookup",
+                        "calendar_lookup", "conversation_recall",
+                        "tesla_navigation_plan", "active_action_status",
+                    }
+                    _intent_val = plan.intent.value
+                    _thinking_level = (
+                        "medium"
+                        if _intent_val in _MEDIUM_THINKING_INTENTS
+                        else "low"
+                    )
+                    # Also elevate to medium for pass_through when active plan
+                    # exists — this is a planning/work session continuation
+                    if _intent_val == "pass_through" and _turn_state.active_plan_id:
+                        _thinking_level = "medium"
+                    llm.set_thinking(_thinking_level)
+                    logger.info(
+                        f"NOVA_M2.7_THINKING | intent={_intent_val} "
+                        f"thinking={_thinking_level} active_plan={bool(_turn_state.active_plan_id)}"
+                    )
+
+                    # ── P1a: Parallel tool-call instruction for fan-out work ──
+                    # M2.7 supports parallel_tool_calls but defaults to serial
+                    # narrative reasoning ("Now let me…"). Without this hint we
+                    # observed 14 sequential calls where 8 could have been one
+                    # batch. This unlock cuts LLM round-trips 3-5× on workspace
+                    # building and multi-source research.
+                    _PARALLEL_BATCH_INTENTS = {
+                        "workspace_creation", "workspace_management",
+                        "workspace_context_continuation",
+                        "lookup_then_workspace_creation",
+                        "web_research_request", "email_lookup",
+                        "calendar_lookup", "conversation_recall",
+                    }
+                    _wants_parallel = (
+                        _intent_val in _PARALLEL_BATCH_INTENTS
+                        or (_intent_val == "pass_through" and _turn_state.active_plan_id)
+                    )
+                    if _wants_parallel and context.messages and context.messages[0].get("role") == "system":
+                        _parallel_hint = (
+                            "\n\n[PARALLEL TOOL CALLS]\n"
+                            "When you need to perform multiple INDEPENDENT operations "
+                            "(e.g. adding 5 blocks to the same page, fetching 3 different "
+                            "pages, running 2 web searches with different queries, looking "
+                            "up the same fact in CIG and PCG simultaneously), emit them ALL "
+                            "in a single response as a parallel `tool_calls` array. Do NOT "
+                            "narrate \"Now let me add the next block\" between each call \u2014 "
+                            "that turns 8 parallelizable operations into 8 sequential round-trips. "
+                            "Only chain serially when a later call genuinely needs a prior "
+                            "call's result (e.g. needing a page_id from create before add_block)."
+                        )
+                        existing = context.messages[0].get("content", "")
+                        if "[PARALLEL TOOL CALLS]" not in existing:
+                            context.messages[0]["content"] = existing + _parallel_hint
+
                     await runtime.routed(plan.intent.value, len(tool_budget.names))
                     logger.info(
                         f"NOVA_TOOL_BUDGET | intent={plan.intent.value} reason={tool_budget.reason} "
@@ -1894,6 +2538,42 @@ async def run_bot(
                         conversation_id, user_id, role, content,
                         model=LLM_MODEL if role == "assistant" else None,
                     ))
+
+                lower_turn_text = (canonical.canonical_text or text or "").lower()
+                if (
+                    ("weather" in lower_turn_text or "temperature" in lower_turn_text or "outside" in lower_turn_text)
+                    and not any(term in lower_turn_text for term in ("tomorrow", "week", "weekend", "forecast", "rain later"))
+                ):
+                    try:
+                        await runtime.send_server_msg({"phase": "thinking"})
+                        await runtime.send_server_msg({"type": "thinking", "text": "Checking the current outdoor weather..."})
+                        weather_result = await dispatch_tool(
+                            "get_weather",
+                            {"location": live_location or "Humble, TX", "query": canonical.canonical_text or text},
+                        )
+                        weather_data = weather_result
+                        if isinstance(weather_result, str):
+                            try:
+                                weather_data = json.loads(weather_result)
+                            except json.JSONDecodeError:
+                                weather_data = weather_result
+                        if isinstance(weather_data, dict) and weather_data.get("display"):
+                            await runtime.complete_with_text(
+                                str(weather_data.get("display") or ""),
+                                speech_text=str(weather_data.get("speech") or weather_data.get("speakable") or weather_data.get("display") or ""),
+                                result="get_weather_fast_path",
+                                suppress_speech=False,
+                            )
+                        else:
+                            await runtime.complete_with_text(
+                                str(weather_data or "I couldn't get the weather right now."),
+                                result="get_weather_fast_path",
+                                suppress_speech=False,
+                            )
+                        await _persist("user", canonical.canonical_text or text)
+                        return
+                    except Exception:
+                        logger.exception(f"NOVA_WEATHER_FAST_PATH_FAILED | turn_id={_current_turn_id[0]}")
 
                 try:
                     orchestrator_result = await execute_turn_plan_result(
@@ -2017,8 +2697,15 @@ async def run_bot(
             device="cuda",
             compute_type="float16",
         )
+        _voice_pref_path = os.path.expanduser("~/.config/nova/voice-preference.json")
+        try:
+            import json as _pref_json
+            _selected_voice = _pref_json.load(open(_voice_pref_path)).get("voice_id", "american_female_warm")
+        except Exception:
+            _selected_voice = "american_female_warm"
+        logger.info(f"NOVA_TTS | using voice: {_selected_voice}")
         tts = QwenTTSService(
-            voice="american_female_warm",
+            voice=_selected_voice,
         )
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context,
@@ -2253,6 +2940,9 @@ async def run_bot(
                         # New user turn — reset per-turn dedup, tool counter, per-tool counts, and dedup cache
                         _ack_sent_this_turn[0] = False
                         _tool_calls_this_turn[0] = 0
+                        _soft_synthesis_nudged_this_turn[0] = False
+                        _tool_failures_this_turn[0] = 0
+                        _tool_read_cache_this_turn.clear()
                         _per_tool_call_counts.clear()
                         _consecutive_dedup_counts.clear()
                         _last_tool_call.clear()
@@ -2260,6 +2950,15 @@ async def run_bot(
                         _search_tools_exhausted[0] = False
                         # Persist previous turn summary before resetting — cross-turn memory layer
                         asyncio.create_task(finalize_and_persist(_active_turn_context[0], user_id, conversation_id))
+                        # ── P2b: Auto add_session if active plan was touched this turn ──
+                        _prev_plan_id_ctx = getattr(_turn_state, "active_plan_id", "") or ""
+                        _prev_tc_ctx = _active_turn_context[0]
+                        if _prev_plan_id_ctx and _prev_tc_ctx is not None:
+                            asyncio.create_task(_auto_add_session_for_plan(
+                                plan_id=_prev_plan_id_ctx,
+                                tc=_prev_tc_ctx,
+                                conversation_id=conversation_id,
+                            ))
                         _active_turn_context[0] = None
                         await append_turn(session.session_id, "user", content)
                         await _sync_message_to_backend(
@@ -2300,11 +2999,38 @@ async def run_bot(
         while True:
             await asyncio.sleep(10)  # Every 10 seconds
             try:
-                await _send_server_msg({"type": "ping"})
-                logger.debug("Sent keepalive ping")
+                await _send_server_msg({"type": "heartbeat", "text": ""})
+                logger.debug("Sent keepalive heartbeat")
             except Exception as e:
-                logger.warning(f"Keepalive ping failed: {e}")
+                logger.warning(f"Keepalive heartbeat failed: {e}")
                 break
+
+    async def _warm_llm_kv_cache() -> None:
+        """Fire a 1-token completion through the full system prompt + history to
+        pre-build the llama-server KV cache.  With --cache-reuse 256 this drops
+        first-turn TTFT from 30-120 s to 2-5 s."""
+        try:
+            import aiohttp
+            warm_messages = list(messages) + [
+                {"role": "user", "content": "[SYSTEM: KV cache warm — discard this]"}
+            ]
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    f"{AI_GATEWAY_URL}/chat/completions",
+                    json={
+                        "model": "minimax-m2.7",
+                        "messages": warm_messages,
+                        "max_tokens": 1,
+                        "stream": False,
+                        "temperature": 0,
+                    },
+                    headers={"Authorization": f"Bearer {AI_GATEWAY_API_KEY}"},
+                    timeout=aiohttp.ClientTimeout(total=180),
+                ) as resp:
+                    await resp.read()
+            logger.info("NOVA_LLM_KV_WARM | KV cache pre-built for first user turn")
+        except Exception as e:
+            logger.warning(f"NOVA_LLM_KV_WARM | non-fatal warm-up failed: {e}")
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -2314,9 +3040,9 @@ async def run_bot(
         set_progress_context(on_hub_progress, user_id, conversation_id=conversation_id)
         # Start keepalive to prevent iOS from closing idle connections
         _keepalive_task[0] = asyncio.create_task(_keepalive_loop())
-        # Skip LLM-generated greeting (MiniMax calls tools unprompted on
-        # system-only prompts). iOS client already shows its own greeting.
-        # The LLM will activate on the first real user message.
+        # Pre-warm the LLM KV cache so the first real user turn hits the cache
+        # instead of processing ~30K tokens cold (30-120s TTFT → 2-5s).
+        asyncio.create_task(_warm_llm_kv_cache())
         if prior_turns:
             logger.info(f"Resuming conversation with {len(prior_turns)} prior turns")
 
@@ -2681,6 +3407,32 @@ if __name__ == "__main__":
         )
         await request_handler.handle_patch_request(patch_request)
         return {"status": "ok"}
+
+    @webrtc_app.post("/disconnect")
+    async def disconnect_session(request: Request):
+        """
+        iOS explicit disconnect endpoint.
+        Body: {"pc_id": "SmallWebRTCConnection#N-..."}
+        Closes the peer connection server-side so the iOS doesn't loop on 404.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        pc_id = body.get("pc_id", "")
+        if pc_id and pc_id in request_handler._pcs_map:
+            conn = request_handler._pcs_map.get(pc_id)
+            if conn:
+                try:
+                    await conn.disconnect()
+                except Exception as e:
+                    logger.warning(f"Disconnect cleanup error for {pc_id}: {e}")
+            request_handler._pcs_map.pop(pc_id, None)
+            logger.info(f"Disconnected session: {pc_id}")
+            return {"status": "ok", "pc_id": pc_id}
+        # Already gone — still return 200 so iOS doesn't retry
+        logger.info(f"Disconnect requested for unknown/expired pc_id: {pc_id!r}")
+        return {"status": "ok", "pc_id": pc_id, "note": "session already closed"}
 
     @webrtc_app.get("/health")
     async def health():
